@@ -352,3 +352,332 @@ def test_client_roundtrip_over_real_socket() -> None:
         assert server.received[0]["params"] == {"autoAttach": True}
     finally:
         client.stop()
+
+
+# --- добивающие тесты после мутационного прогона ---
+
+
+def test_read_devtools_active_port_boundary_ports_ok(tmp_path: Path) -> None:
+    (tmp_path / "DevToolsActivePort").write_text("1\n/devtools/browser/min\n", encoding="utf-8")
+    assert read_devtools_active_port(tmp_path) == (1, "/devtools/browser/min")
+    (tmp_path / "DevToolsActivePort").write_text("65535\n/devtools/browser/max\n", encoding="utf-8")
+    assert read_devtools_active_port(tmp_path) == (65535, "/devtools/browser/max")
+
+
+def test_read_devtools_active_port_zero_port_rejected(tmp_path: Path) -> None:
+    (tmp_path / "DevToolsActivePort").write_text("0\n/devtools/browser/zero\n", encoding="utf-8")
+    with pytest.raises(CdpError, match="bad port"):
+        read_devtools_active_port(tmp_path)
+
+
+def test_read_devtools_active_port_unreadable(tmp_path: Path) -> None:
+    (tmp_path / "DevToolsActivePort").mkdir()
+    with pytest.raises(CdpError, match="unreadable"):
+        read_devtools_active_port(tmp_path)
+
+
+def test_ws_url_from_json_version_non_string_url(version_server: HTTPServer) -> None:
+    _VersionHandler.payload = {"webSocketDebuggerUrl": 12345}
+    with pytest.raises(CdpError, match="webSocketDebuggerUrl"):
+        ws_url_from_json_version(version_server.server_address[1])
+
+
+def test_ws_url_from_json_version_unreachable_mentions_cause() -> None:
+    probe = socket.socket()
+    probe.bind(("127.0.0.1", 0))
+    free_port = probe.getsockname()[1]
+    probe.close()
+    with pytest.raises(CdpError, match="URLError"):
+        ws_url_from_json_version(free_port)
+
+
+def test_resolve_without_sources_message() -> None:
+    with pytest.raises(CdpError, match="no DevTools source"):
+        resolve_browser_ws_url()
+
+
+def test_resolve_bad_debugger_address() -> None:
+    with pytest.raises(CdpError, match="gave no DevTools endpoint"):
+        resolve_browser_ws_url(debugger_address="127.0.0.1:notaport")
+
+
+def test_resolve_respects_custom_host(tmp_path: Path) -> None:
+    (tmp_path / "DevToolsActivePort").write_text("19233\n/devtools/browser/h\n", encoding="utf-8")
+    assert (
+        resolve_browser_ws_url(user_data_dir=tmp_path, host="10.9.9.9")
+        == "ws://10.9.9.9:19233/devtools/browser/h"
+    )
+
+
+def test_send_includes_session_id() -> None:
+    ws = FakeWs()
+    client = _make_client(ws)
+    client.start(timeout=2.0)
+    try:
+        client.send("Fetch.enable", {"handleAuthRequests": True}, session_id="S1")
+        assert ws.sent_json() == [
+            {
+                "id": 1,
+                "method": "Fetch.enable",
+                "params": {"handleAuthRequests": True},
+                "sessionId": "S1",
+            }
+        ]
+    finally:
+        client.stop()
+
+
+def test_send_without_session_id_omits_field() -> None:
+    ws = FakeWs()
+    client = _make_client(ws)
+    client.start(timeout=2.0)
+    try:
+        command_id = client.send("Target.setAutoAttach", {"autoAttach": True})
+        assert command_id == 1
+        assert ws.sent_json() == [
+            {"id": 1, "method": "Target.setAutoAttach", "params": {"autoAttach": True}}
+        ]
+    finally:
+        client.stop()
+
+
+class _BreakingSendWs(FakeWs):
+    def send(self, data: str) -> None:
+        raise RuntimeError("pipe broken")
+
+
+def test_send_failure_mentions_method_and_cause() -> None:
+    client = CdpClient("ws://127.0.0.1:1/x", ws_factory=lambda url, timeout: _BreakingSendWs())
+    client.start(timeout=2.0)
+    try:
+        with pytest.raises(CdpError, match=r"CDP send Target\.X failed: RuntimeError"):
+            client.send("Target.X")
+    finally:
+        client.stop()
+
+
+def test_send_command_forwards_session_id() -> None:
+    ws = FakeWs()
+    client = _make_client(ws)
+    client.start(timeout=2.0)
+    try:
+        result_box: list[object] = []
+        worker = threading.Thread(
+            target=lambda: result_box.append(client.send_command("Target.ping", session_id="S7", timeout=2.0)),
+            daemon=True,
+        )
+        worker.start()
+        assert _wait_until(lambda: len(ws.sent_json()) == 1), ws.sent_json()
+        request = ws.sent_json()[0]
+        ws.incoming.put(json.dumps({"id": request["id"], "result": {}}))
+        worker.join(timeout=2.0)
+        assert result_box == [{}]
+        assert request.get("sessionId") == "S7"
+    finally:
+        client.stop()
+
+
+def test_send_command_error_response_raises() -> None:
+    ws = FakeWs()
+    client = _make_client(ws)
+    client.start(timeout=2.0)
+    try:
+        ws.incoming.put(json.dumps({"id": 1, "error": {"code": -32000, "message": "nope"}}))
+        with pytest.raises(CdpError, match="CDP err-cmd error"):
+            client.send_command("err-cmd", timeout=2.0)
+    finally:
+        client.stop()
+
+
+def test_send_command_timeout() -> None:
+    ws = FakeWs()
+    client = _make_client(ws)
+    client.start(timeout=2.0)
+    try:
+        with pytest.raises(CdpError, match="timed out"):
+            client.send_command("Target.hang", timeout=0.2)
+    finally:
+        client.stop()
+
+
+def test_dispatch_event_with_id_goes_to_handler() -> None:
+    ws = FakeWs()
+    client = _make_client(ws)
+    client.start(timeout=2.0)
+    try:
+        got: list[dict] = []
+        client.on("Fetch.authRequired", got.append)
+        ws.incoming.put(
+            json.dumps({"id": 999, "method": "Fetch.authRequired", "params": {"requestId": "1"}})
+        )
+        assert _wait_until(lambda: len(got) == 1), got
+        assert got[0]["params"] == {"requestId": "1"}
+    finally:
+        client.stop()
+
+
+def test_unknown_method_event_ignored_and_client_survives() -> None:
+    ws = FakeWs()
+    client = _make_client(ws)
+    client.start(timeout=2.0)
+    try:
+        got: list[dict] = []
+        client.on("Fetch.authRequired", got.append)
+        ws.incoming.put(json.dumps({"method": "Nope.unknown", "params": {}}))
+        ws.incoming.put(json.dumps({"method": "Fetch.authRequired", "params": {"requestId": "1"}}))
+        assert _wait_until(lambda: len(got) == 1), got
+    finally:
+        client.stop()
+
+
+def test_unsubscribe_stops_delivery() -> None:
+    ws = FakeWs()
+    client = _make_client(ws)
+    client.start(timeout=2.0)
+    try:
+        got: list[dict] = []
+        unsubscribe = client.on("Fetch.authRequired", got.append)
+        unsubscribe()
+        ws.incoming.put(json.dumps({"method": "Fetch.authRequired", "params": {"requestId": "1"}}))
+        time.sleep(0.3)
+        assert got == []
+    finally:
+        client.stop()
+
+
+def test_start_timeout_raises() -> None:
+    def never(url: str, timeout: float) -> FakeWs:
+        raise ConnectionError("down")
+
+    client = CdpClient("ws://127.0.0.1:1/x", ws_factory=never, initial_backoff=0.01, max_backoff=0.02)
+    try:
+        with pytest.raises(CdpError, match="timed out"):
+            client.start(timeout=0.2)
+    finally:
+        client.stop()
+
+
+def test_no_reconnect_churn_while_healthy() -> None:
+    calls: list[str] = []
+    ws = FakeWs()
+
+    def counting(url: str, timeout: float) -> FakeWs:
+        calls.append(url)
+        return ws
+
+    client = CdpClient("ws://127.0.0.1:1/x", ws_factory=counting)
+    client.start(timeout=2.0)
+    try:
+        time.sleep(0.3)
+        assert calls == ["ws://127.0.0.1:1/x"]
+    finally:
+        client.stop()
+
+
+def test_backoff_grows_on_connect_failures(monkeypatch: pytest.MonkeyPatch) -> None:
+    import time as time_module
+
+    sleeps: list[float] = []
+    monkeypatch.setattr(time_module, "sleep", sleeps.append)
+
+    def never(url: str, timeout: float) -> FakeWs:
+        raise ConnectionError("down")
+
+    client = CdpClient(
+        "ws://127.0.0.1:1/x", ws_factory=never, initial_backoff=0.05, max_backoff=10.0
+    )
+    try:
+        with pytest.raises(CdpError, match="timed out"):
+            client.start(timeout=0.5)
+    finally:
+        client.stop()
+    assert sleeps[:3] == [0.05, 0.1, 0.2]
+
+
+class _BreakingRecvWs(FakeWs):
+    def __init__(self, calls: list[str]) -> None:
+        super().__init__()
+        self._calls = calls
+
+    def recv(self, timeout: float | None = None) -> str:
+        self._calls.append("recv")
+        raise ConnectionError("lost")
+
+
+class _FlakyRecvWs(FakeWs):
+    """Сокет, который начинает рвать соединение по команде."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.fail = False
+
+    def recv(self, timeout: float | None = None) -> str:
+        if self.fail:
+            raise ConnectionError("lost")
+        return super().recv(timeout)
+
+
+def test_backoff_grows_on_recv_failures(monkeypatch: pytest.MonkeyPatch) -> None:
+    import time as time_module
+
+    ws = _FlakyRecvWs()
+    factory_calls: list[str] = []
+
+    def factory(url: str, timeout: float) -> FakeWs:
+        # Первое подключение успешно (backoff сбрасывается), дальше — обрывы:
+        # рост виден на стыке recv-ветви и factory-ветви.
+        factory_calls.append(url)
+        if len(factory_calls) == 1:
+            return ws
+        raise ConnectionError("down")
+
+    client = CdpClient(
+        "ws://127.0.0.1:1/x", ws_factory=factory, initial_backoff=0.05, max_backoff=10.0
+    )
+    client.start(timeout=2.0)
+    try:
+        assert client.connected
+        sleeps: list[float] = []
+        monkeypatch.setattr(time_module, "sleep", sleeps.append)
+        ws.fail = True
+        deadline = time.monotonic() + 2.0
+        while len(sleeps) < 3 and time.monotonic() < deadline:
+            threading.Event().wait(0.01)
+        assert sleeps[:3] == [0.05, 0.1, 0.2]
+    finally:
+        client.stop()
+
+
+def test_client_recovers_after_recv_failure() -> None:
+    factory_calls: list[str] = []
+
+    def factory(url: str, timeout: float) -> _BreakingRecvWs:
+        factory_calls.append(url)
+        return _BreakingRecvWs(factory_calls)
+
+    client = CdpClient(
+        "ws://127.0.0.1:1/x", ws_factory=factory, initial_backoff=0.01, max_backoff=0.02
+    )
+    client.start(timeout=2.0)
+    try:
+        assert _wait_until(lambda: len(factory_calls) >= 2, timeout=3.0), factory_calls
+    finally:
+        client.stop()
+
+
+def test_poll_timeout_does_not_kill_loop() -> None:
+    ws = FakeWs()
+    client = _make_client(ws)
+    client.start(timeout=2.0)
+    try:
+        got: list[dict] = []
+        client.on("Fetch.authRequired", got.append)
+        time.sleep(0.7)
+        ws.incoming.put(json.dumps({"method": "Fetch.authRequired", "params": {"requestId": "late"}}))
+        assert _wait_until(lambda: len(got) == 1), got
+    finally:
+        client.stop()
+
+
+def test_stop_without_start_is_safe() -> None:
+    CdpClient("ws://127.0.0.1:1/x", ws_factory=lambda url, timeout: FakeWs()).stop()
