@@ -319,7 +319,7 @@ def test_mask_secret_boundary_lengths() -> None:
     ],
 )
 def test_parse_proxy_credentials_rejects_malformed(bad_proxy: str) -> None:
-    with pytest.raises(ValueError, match="invalid proxy format"):
+    with pytest.raises(ValueError, match="^invalid proxy format"):
         parse_proxy_credentials(bad_proxy)
 
 
@@ -327,7 +327,7 @@ def test_parse_proxy_credentials_rejects_non_string() -> None:
     from typing import Any
 
     bad: Any = None
-    with pytest.raises(ValueError, match="invalid proxy format"):
+    with pytest.raises(ValueError, match="^invalid proxy format"):
         parse_proxy_credentials(bad)
 
 
@@ -338,7 +338,7 @@ def test_parse_proxy_credentials_allows_colon_in_password() -> None:
 def test_manager_rejects_bad_max_failures() -> None:
     ws = FakeWs()
     client = _make_client(ws)
-    with pytest.raises(ValueError, match="max_failures"):
+    with pytest.raises(ValueError, match="^max_failures"):
         ProxyAuthManager(client, USERNAME, PASSWORD, max_failures=0)
     ProxyAuthManager(client, USERNAME, PASSWORD, max_failures=1)
 
@@ -348,6 +348,24 @@ def test_manager_dead_initially_false() -> None:
     manager = ProxyAuthManager(_make_client(ws), USERNAME, PASSWORD)
     assert manager.dead is False
     assert manager.fail_count == 0
+
+
+def test_manager_default_max_failures_is_three() -> None:
+    ws = FakeWs()
+    manager = _started_manager(ws)
+    try:
+        answered = 0
+        for request_id, expected_fails, expected_dead in (("D-A", 1, False), ("D-B", 2, False), ("D-C", 3, True)):
+            ws.incoming.put(json.dumps(_auth_event(request_id)))
+            ws.incoming.put(json.dumps(_auth_event(request_id)))
+            answered += 2
+            assert _wait_until(
+                lambda: len(_sent_methods(ws, "Fetch.continueWithAuth")) == answered
+            )
+            assert _wait_until(lambda: manager.fail_count == expected_fails)
+            assert manager.dead is expected_dead
+    finally:
+        manager.stop()
 
 
 def test_start_twice_sends_commands_once() -> None:
@@ -440,7 +458,7 @@ def test_auth_required_without_challenge_cancels() -> None:
 
 
 def test_create_proxy_auth_without_source_raises() -> None:
-    with pytest.raises(ValueError, match="need ws_url"):
+    with pytest.raises(ValueError, match="^need ws_url"):
         create_proxy_auth(username=USERNAME, password=PASSWORD)
 
 
@@ -519,6 +537,26 @@ def test_create_proxy_auth_via_debugger_address() -> None:
             manager.stop()
     finally:
         server.shutdown()
+
+
+def test_create_proxy_auth_forwards_max_failures() -> None:
+    ws = FakeWs()
+
+    def fake_client(url: str, **kwargs) -> CdpClient:
+        return _make_client(ws)
+
+    manager = create_proxy_auth(
+        ws_url="ws://127.0.0.1:1/x", username=USERNAME, password=PASSWORD, max_failures=1,
+        client_factory=fake_client,
+    )
+    try:
+        assert _wait_until(lambda: len(ws.sent_json()) == 2)
+        ws.incoming.put(json.dumps(_auth_event("F-1")))
+        ws.incoming.put(json.dumps(_auth_event("F-1")))
+        assert _wait_until(lambda: manager.dead is True, timeout=3.0)
+        assert manager.fail_count == 1
+    finally:
+        manager.stop()
 
 
 def test_manager_default_does_not_own_client() -> None:

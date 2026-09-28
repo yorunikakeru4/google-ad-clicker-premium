@@ -392,13 +392,36 @@ def test_ws_url_from_json_version_unreachable_mentions_cause() -> None:
 
 
 def test_resolve_without_sources_message() -> None:
-    with pytest.raises(CdpError, match="no DevTools source"):
+    with pytest.raises(CdpError, match="^no DevTools source"):
         resolve_browser_ws_url()
 
 
 def test_resolve_bad_debugger_address() -> None:
     with pytest.raises(CdpError, match="gave no DevTools endpoint"):
         resolve_browser_ws_url(debugger_address="127.0.0.1:notaport")
+
+
+def test_resolve_uses_custom_host_for_json_version() -> None:
+    from http.server import HTTPServer
+
+    server = HTTPServer(("127.0.0.2", 0), _VersionHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        port = server.server_address[1]
+        _VersionHandler.payload = {
+            "webSocketDebuggerUrl": f"ws://127.0.0.2:{port}/devtools/browser/alt"
+        }
+        assert (
+            resolve_browser_ws_url(debugger_address=f"127.0.0.2:{port}", host="127.0.0.2")
+            == f"ws://127.0.0.2:{port}/devtools/browser/alt"
+        )
+        assert (
+            resolve_browser_ws_url(port=port, host="127.0.0.2")
+            == f"ws://127.0.0.2:{port}/devtools/browser/alt"
+        )
+    finally:
+        server.shutdown()
 
 
 def test_resolve_respects_custom_host(tmp_path: Path) -> None:
@@ -568,7 +591,7 @@ def test_no_reconnect_churn_while_healthy() -> None:
     client = CdpClient("ws://127.0.0.1:1/x", ws_factory=counting)
     client.start(timeout=2.0)
     try:
-        time.sleep(0.3)
+        time.sleep(0.6)
         assert calls == ["ws://127.0.0.1:1/x"]
     finally:
         client.stop()
