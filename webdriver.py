@@ -7,20 +7,10 @@ from pathlib import Path
 from time import sleep
 from typing import Optional, Union
 
-try:
-    import pyautogui
-    import requests
-    import seleniumbase
-    import undetected_chromedriver
-
-except ImportError:
-    packages_path = Path.cwd() / "env" / "Lib" / "site-packages"
-    sys.path.insert(0, f"{packages_path}")
-
-    import pyautogui
-    import requests
-    import seleniumbase
-    import undetected_chromedriver
+import pyautogui
+import requests
+import seleniumbase
+import undetected_chromedriver
 
 from config_reader import config
 from geolocation_db import GeolocationDB
@@ -48,8 +38,11 @@ class CustomChrome(undetected_chromedriver.Chrome):
             pass
         except TimeoutError as e:
             logger.debug(e, exc_info=True)
-        except Exception:
-            pass
+        except Exception as e:
+            # quit() не должен ронять завершение, но молча глотать ошибку
+            # нельзя: без записи в лог падение браузера при выходе
+            # недиагностируемо.
+            logger.debug(e, exc_info=True)
 
         if hasattr(self, "service") and getattr(self.service, "process", None):
             # logger.debug("Stopping webdriver service")
@@ -59,8 +52,8 @@ class CustomChrome(undetected_chromedriver.Chrome):
             if self.reactor:
                 # logger.debug("Shutting down Reactor")
                 self.reactor.event.set()
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug(e, exc_info=True)
 
         if (
             hasattr(self, "keep_user_data_dir")

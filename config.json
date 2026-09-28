@@ -1,7 +1,7 @@
 {
     "paths": {
-        "query_file": "/home/coskun/queries.txt",
-        "proxy_file": "/home/coskun/proxies.txt",
+        "query_file": "queries.txt",
+        "proxy_file": "proxies.txt",
         "user_agents": "user_agents.txt",
         "filtered_domains": "domains.txt"
     },

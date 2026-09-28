@@ -5,3 +5,4 @@ python-telegram-bot==20.6
 selenium==4.35.0
 seleniumbase==4.41.1
 undetected-chromedriver==3.5.5
+websocket-client==1.9.2

@@ -8,6 +8,7 @@ proxy.py не разбирает строку прокси — это делае
 import http.client
 import json
 import re
+import tempfile
 import time
 import urllib.request
 
@@ -110,6 +111,24 @@ def test_get_proxies_exits_when_file_is_missing(set_paths, tmp_path):
 
 
 # --- install_plugin ---------------------------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def plugin_dirs_under_isolated_cwd(isolated_cwd, monkeypatch):
+    """Класть расширения в isolated_cwd вместо системного tempdir.
+
+    По умолчанию install_plugin пишет в системный tempdir, чтобы не мусорить
+    в cwd. Старые тесты читают файлы через isolated_cwd, поэтому шов
+    _plugins_base_dir перенаправляется одной фикстурой, а не правкой 13
+    вызовов. Настоящее поведение шва проверяют новые тесты ниже — они
+    вызывают его напрямую, без этой подмены.
+    """
+
+    monkeypatch.setattr(
+        proxy,
+        "_plugins_base_dir",
+        lambda plugins_dir=None: isolated_cwd / "proxy_auth_plugin",
+    )
 
 
 def test_install_plugin_creates_extension_files(isolated_cwd):
@@ -270,4 +289,47 @@ def test_close_credentials_services_stops_endpoints_nobody_read(isolated_cwd):
 
     with pytest.raises(OSError):
         read_credentials(port)
+
+
+# --- расположение расширений: tempdir вместо cwd -----------------------------------
+#
+# Настоящий шов _plugins_base_dir захвачен на уровне модуля, до того как
+# фикстура plugin_dirs_under_isolated_cwd его подменит: monkeypatch действует
+# только внутри тестов, поэтому здесь лежит оригинал.
+
+
+_real_plugins_base_dir = proxy._plugins_base_dir
+
+
+def test_default_plugins_dir_is_system_tempdir_not_cwd(tmp_path, monkeypatch):
+    # Расширения больше не мусорят в cwd: по умолчанию это системный tempdir.
+    monkeypatch.chdir(tmp_path)
+
+    created = _real_plugins_base_dir()
+    try:
+        assert tempfile.gettempdir() in [str(p) for p in created.parents]
+        assert tmp_path not in created.parents
+        assert created.is_dir()
+    finally:
+        proxy._cleanup_auto_plugin_dirs()
+
+
+def test_explicit_plugins_dir_is_honoured(tmp_path):
+    # Явно переданный каталог используется как есть — для тестов и диагностики.
+    wanted = tmp_path / "custom-plugins"
+
+    assert _real_plugins_base_dir(wanted) == wanted
+
+
+def test_cleanup_removes_only_auto_created_dirs(tmp_path):
+    # Чистка при выходе не должна трогать каталог, переданный явно.
+    auto = _real_plugins_base_dir()
+    manual = tmp_path / "manual"
+    manual.mkdir()
+    _real_plugins_base_dir(manual)
+
+    proxy._cleanup_auto_plugin_dirs()
+
+    assert not auto.exists(), "автосозданный tempdir должен быть удалён"
+    assert manual.is_dir(), "явно переданный каталог трогать нельзя"
 

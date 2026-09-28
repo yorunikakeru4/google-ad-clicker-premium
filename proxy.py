@@ -1,18 +1,15 @@
 import atexit
 import json
+import shutil
+import tempfile
 import threading
 from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 
-try:
-    from selenium.webdriver import ChromeOptions
-except ImportError:
-    import sys
-
-    packages_path = Path.cwd() / "env" / "Lib" / "site-packages"
-    sys.path.insert(0, f"{packages_path}")
-
-    from selenium.webdriver import ChromeOptions
+# Зависимости ставятся через nix develop (flake.nix). Windows-хак с
+# подкладыванием env/Lib/site-packages в sys.path удалён: на macOS-venv путь
+# не сходится, а голый ImportError с именем пакета — уже диагностика.
+from selenium.webdriver import ChromeOptions
 
 from config_reader import config
 from logger import logger
@@ -122,6 +119,39 @@ def _close_credentials_services() -> None:
 atexit.register(_close_credentials_services)
 
 
+# Каталоги расширений, созданные в системном tempdir: их можно безопасно
+# чистить при выходе. Явно переданный plugins_dir сюда не попадает и никогда
+# не удаляется автоматически — там могут лежать чужие файлы.
+_auto_plugin_dirs: list[Path] = []
+
+
+def _plugins_base_dir(plugins_dir: str | Path | None = None) -> Path:
+    """Каталог под расширения: явный или свежий в системном tempdir.
+
+    Расширения больше не создаются в cwd: папка proxy_auth_plugin в рабочем
+    каталоге переживала перезапуски и светилась в бэкапах. Chrome читает
+    расширение с диска всё время работы, поэтому автосозданный tempdir живёт
+    до выхода из процесса и чистится в _cleanup_auto_plugin_dirs.
+    """
+
+    if plugins_dir is not None:
+        return Path(plugins_dir)
+
+    created = Path(tempfile.mkdtemp(prefix="proxy_auth_plugin_"))
+    _auto_plugin_dirs.append(created)
+    return created
+
+
+def _cleanup_auto_plugin_dirs() -> None:
+    """Удалить автосозданные tempdir'ы. Явно переданные каталоги не трогает."""
+
+    while _auto_plugin_dirs:
+        shutil.rmtree(_auto_plugin_dirs.pop(), ignore_errors=True)
+
+
+atexit.register(_cleanup_auto_plugin_dirs)
+
+
 def install_plugin(
     chrome_options: ChromeOptions,
     proxy_host: str,
@@ -129,6 +159,7 @@ def install_plugin(
     username: str,
     password: str,
     plugin_folder_name: str,
+    plugins_dir: str | Path | None = None,
 ) -> None:
     """Install plugin on the fly for proxy authentication
 
@@ -148,6 +179,10 @@ def install_plugin(
     :param password: Proxy password
     :type plugin_folder_name: str
     :param plugin_folder_name: Plugin folder name for proxy
+    :type plugins_dir: str | Path | None
+    :param plugins_dir: Base directory for extensions. When omitted, a fresh
+        directory under the system tempdir is used instead of cwd, so repeated
+        runs stop polluting the working directory.
     """
 
     manifest_json = """
@@ -237,8 +272,8 @@ chrome.webRequest.onAuthRequired.addListener(
         _open_credentials_service(username, password),
     )
 
-    plugins_folder = Path.cwd() / "proxy_auth_plugin"
-    plugins_folder.mkdir(exist_ok=True)
+    plugins_folder = _plugins_base_dir(plugins_dir)
+    plugins_folder.mkdir(parents=True, exist_ok=True)
 
     plugin_folder = plugins_folder / plugin_folder_name
 

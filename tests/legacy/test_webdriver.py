@@ -75,3 +75,47 @@ def test_create_webdriver_validation_message_mentions_supported_format(
     assert str(excinfo.value) == (
         "Invalid proxy format! Should be in 'username:password@host:port' format"
     )
+
+
+def _bare_chrome():
+    """Экземпляр CustomChrome без запуска браузера: только поля, которые трогает quit()."""
+
+    driver = object.__new__(webdriver.CustomChrome)
+    driver.browser_pid = 999999999
+    driver.service = None
+    driver.reactor = None
+    driver.keep_user_data_dir = True
+    return driver
+
+
+def test_quit_does_not_raise_when_browser_kill_fails_unexpectedly(monkeypatch):
+    """quit() обязан завершаться, даже если os.kill упал нештатно."""
+
+    driver = _bare_chrome()
+
+    def boom(*args, **kwargs):
+        raise ValueError("unexpected kill failure")
+
+    monkeypatch.setattr(webdriver.os, "kill", boom)
+    monkeypatch.setattr(webdriver.logger, "debug", lambda *args, **kwargs: None)
+
+    driver.quit()
+
+
+def test_quit_logs_swallowed_kill_error_instead_of_silencing_it(monkeypatch):
+    """Проглоченная при завершении ошибка должна попадать в debug-лог, а не в /dev/null."""
+
+    driver = _bare_chrome()
+    records = []
+
+    def boom(*args, **kwargs):
+        raise ValueError("unexpected kill failure")
+
+    monkeypatch.setattr(webdriver.os, "kill", boom)
+    monkeypatch.setattr(webdriver.logger, "debug", lambda *args, **kwargs: records.append((args, kwargs)))
+
+    driver.quit()
+
+    assert records, "проглоченная ошибка нигде не залогирована"
+    assert any("unexpected kill failure" in str(args) for args, _ in records)
+    assert any(call[1].get("exc_info") for call in records)
