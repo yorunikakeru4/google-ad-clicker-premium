@@ -303,11 +303,10 @@ class _FakeCdpServer(threading.Thread):
 
     def _send_text(self, conn: socket.socket, text: str) -> None:
         payload = text.encode()
-        head = b"\x81" + ((len(payload),) if len(payload) < 126 else (126, struct.pack(">H", len(payload))))
-        if len(payload) >= 126:
-            conn.sendall(head[0:1] + head[1:2] + head[2])
+        if len(payload) < 126:
+            conn.sendall(b"\x81" + bytes([len(payload)]) + payload)
         else:
-            conn.sendall(head[0:1] + bytes([head[1]]) + payload)
+            conn.sendall(b"\x81" + bytes([126]) + struct.pack(">H", len(payload)) + payload)
 
     def run(self) -> None:
         self.ready.set()
