@@ -69,3 +69,13 @@ typeCheckingMode = "standard"
 # Legacy-модули в корне не типизированы и ещё не перенесены в engine/
 reportMissingImports = "warning"
 reportMissingTypeStubs = false
+
+[tool.mutmut]
+# Только код, который переписывается и покрыт тестами. Legacy-модули в корне
+# сознательно не мутируются: они удаляются по плану, и поддерживать для них
+# мутационный скор незачем.
+source_paths = ["engine/"]
+# Прогоняются только тесты engine/: мутируется engine/, значит и проверяет
+# его. Полный tests/ тащит legacy-набор, которому нужны seleniumbase-заглушка
+# и pytest-mock, и падение там не related к мутанту.
+pytest_add_cli_args_test_selection = ["tests/engine"]
