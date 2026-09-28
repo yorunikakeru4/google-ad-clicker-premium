@@ -121,3 +121,21 @@ def test_overnight_interval_should_be_supported(monkeypatch, behavior):
     set_interval(monkeypatch, behavior, "23:00", "06:00")
 
     assert run_in_loop._inside_running_interval() is False
+
+
+@pytest.mark.xfail(
+    reason=(
+        "Баг legacy-кода: проверка 'минимум 10 минут' выполняется только когда "
+        "начало и конец попали в один час, поэтому короткое окно через границу "
+        "часа (12:59-13:04 = 5 минут) принимается, хотя такое же окно внутри часа "
+        "отвергается"
+    ),
+    strict=True,
+)
+def test_short_interval_across_hour_boundary_should_be_rejected(monkeypatch, behavior):
+    set_interval(monkeypatch, behavior, "12:59", "13:04")
+
+    with pytest.raises(SystemExit) as excinfo:
+        run_in_loop._inside_running_interval()
+
+    assert "There should be at least 10 minutes between the start and end!" in str(excinfo.value)
