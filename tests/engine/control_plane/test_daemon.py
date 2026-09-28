@@ -9,7 +9,6 @@ import json
 import os
 import signal
 import threading
-import time
 import urllib.error
 import urllib.request
 

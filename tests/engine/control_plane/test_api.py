@@ -22,7 +22,6 @@ from engine.control_plane import api
 from engine.control_plane.api import (
     TOKEN_ENV_VAR,
     TOKEN_HEADER,
-    AuthError,
     ControlPlaneServer,
     MissingTokenError,
     token_from_environ,

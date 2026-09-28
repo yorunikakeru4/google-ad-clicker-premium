@@ -11,7 +11,6 @@ terminate, kill, код возврата.
 """
 
 import threading
-import time
 
 import pytest
 

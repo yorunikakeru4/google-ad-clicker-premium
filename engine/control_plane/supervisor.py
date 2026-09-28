@@ -682,14 +682,13 @@ class Supervisor:
             else:
                 self._clock.sleep(self.settings.heartbeat_interval)
 
-    def start_background(self, interval: float | None = None) -> threading.Thread:
+    def start_background(self) -> threading.Thread:
         """Запускает тики в отдельном потоке и возвращает его вместе с stop_event.
 
         HTTP-сервер живёт в своих потоках (ThreadingHTTPServer), и без
         отдельного потока супервизора демон не заметил бы упавший воркер, пока
         кто-нибудь не дёрнул /state.
         """
-        wait_for = interval if interval is not None else self.settings.heartbeat_interval
         stop_event = threading.Event()
         thread = threading.Thread(
             target=self.run_idle,
