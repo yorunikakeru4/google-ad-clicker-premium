@@ -97,7 +97,7 @@
                 # поэтому pytest ставится сюда же: системный из nix-среды
                 # сюда не попадает.
                 uv run --no-project --python 3.12 --with mutmut --with pytest \
-                  mutmut run --simple-output
+                  mutmut run
               '';
             }
           }/bin/mutation";
