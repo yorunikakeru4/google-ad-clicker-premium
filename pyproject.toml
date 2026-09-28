@@ -1,0 +1,68 @@
+[project]
+name = "ad-clicker-engine"
+version = "0.1.0"
+description = "Движок Google Ad Clicker: демон, супервизор воркеров, CDP-авторизация прокси"
+requires-python = ">=3.11"
+
+# Зависимости окружения приходят из flake.nix (nix develop), а не из pip.
+# Список ниже — документация и основа для будущей сборки в wheel/pyinstaller.
+dependencies = [
+    "selenium>=4.35",
+    "undetected-chromedriver>=3.5.5",
+    "websocket-client>=1.8",  # CDP-авторизация прокси, см. план.md §2.1
+    "openpyxl>=3.1.2",
+    "pyautogui>=0.9.53",
+    "psutil>=5.9",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+    "pytest-mock>=3.14",
+    "pytest-asyncio>=0.24",
+    "ruff>=0.6",
+    "basedpyright>=1.20",
+]
+# Нет в nixpkgs, ставится в venv поверх dev-shell. Нужен только для
+# webdriver.use_seleniumbase и интеграционных тестов на стенде.
+seleniumbase = ["seleniumbase>=4.41.1"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = [
+    "-ra",
+    "--strict-markers",
+    "--strict-config",
+]
+markers = [
+    "integration: требует браузер, прокси или сеть; по умолчанию пропускается",
+    "stand: требует стенда с реальным Chrome",
+]
+filterwarnings = ["error::DeprecationWarning:engine.*"]
+
+[tool.ruff]
+line-length = 100
+target-version = "py311"
+extend-exclude = [".worktrees", "ui", "env", "venv"]
+
+[tool.ruff.lint]
+# Legacy-код в корне пока не чищен (план.md, фаза 0), поэтому правила
+# включаем постепенно: E/F/W — базовые ошибки, остальное опционально.
+select = ["E", "F", "W"]
+ignore = [
+    "E501",  # длину строк контролирует ruff format
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Тесты допускают длинные фикстуры и магические значения в assert'ах
+"tests/**" = ["E731"]
+
+[tool.basedpyright]
+include = ["engine", "tests"]
+exclude = ["**/__pycache__", ".worktrees", "env", "venv"]
+pythonVersion = "3.11"
+typeCheckingMode = "standard"
+# Legacy-модули в корне не типизированы и ещё не перенесены в engine/
+reportMissingImports = "warning"
+reportMissingTypeStubs = false

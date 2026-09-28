@@ -143,3 +143,30 @@ downloaded_files/
 
 .MULTI_BROWSERS_IN_USE
 .TELEGRAM_CHAT_ID
+
+# --- project: worktrees, SQLite, Tauri/Node ---
+
+# git worktree'ы фич (ветки feat/*), см. план.md §9.4
+.worktrees/
+
+# SQLite: основной файл + WAL-объекты. WAL-файлы образуются рядом с базой
+# при первом же подключении, поэтому игнорируются по маске, а не по имени
+*.db
+*.db-wal
+*.db-shm
+*.sqlite
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm
+
+# Tauri / Node
+node_modules/
+ui/dist/
+ui/target/
+ui/src-tauri/target/
+ui/gen/
+
+# движок
+engine/logs/
+engine/screenshots/
+engine/profiles/
