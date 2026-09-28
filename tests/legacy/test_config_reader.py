@@ -177,13 +177,65 @@ def test_malformed_json_terminates_with_readable_error(make_config, caplog):
     assert "Failed to read config file. Check format and try again." in caplog.text
 
 
-def test_missing_key_raises_bare_keyerror(make_config, base_config):
+def test_missing_key_in_behavior_exits_with_readable_error(make_config, caplog, base_config):
     del base_config["behavior"]["click_order"]
 
-    with pytest.raises(KeyError) as excinfo:
+    with pytest.raises(SystemExit):
         make_config(base_config)
 
-    assert "click_order" in str(excinfo.value)
+    assert (
+        "Failed to read config file. Missing 'click_order' parameter in 'behavior' section."
+        in caplog.text
+    )
+
+
+def test_missing_key_in_webdriver_exits_with_readable_error(make_config, caplog, base_config):
+    del base_config["webdriver"]["auth"]
+
+    with pytest.raises(SystemExit):
+        make_config(base_config)
+
+    assert (
+        "Failed to read config file. Missing 'auth' parameter in 'webdriver' section."
+        in caplog.text
+    )
+
+
+def test_missing_key_in_paths_exits_with_readable_error(make_config, caplog, base_config):
+    del base_config["paths"]["query_file"]
+
+    with pytest.raises(SystemExit):
+        make_config(base_config)
+
+    assert (
+        "Failed to read config file. Missing 'query_file' parameter in 'paths' section."
+        in caplog.text
+    )
+
+
+def test_missing_section_exits_with_readable_error(make_config, caplog, base_config):
+    del base_config["webdriver"]
+
+    with pytest.raises(SystemExit):
+        make_config(base_config)
+
+    assert "Failed to read config file. Missing 'webdriver' section." in caplog.text
+
+
+def test_section_of_wrong_type_exits_with_readable_error(make_config, caplog, base_config):
+    base_config["webdriver"] = ["proxy", "127.0.0.1:8080"]
+
+    with pytest.raises(SystemExit):
+        make_config(base_config)
+
+    assert "Failed to read config file. 'webdriver' must be a JSON object." in caplog.text
+
+
+def test_top_level_json_list_exits_with_readable_error(make_config, caplog):
+    with pytest.raises(SystemExit):
+        make_config(raw='["paths", "webdriver", "behavior"]')
+
+    assert "Failed to read config file. Check format and try again." in caplog.text
 
 
 def test_empty_paths_and_query_are_allowed(make_config, base_config):
@@ -208,20 +260,3 @@ def test_read_parameters_can_be_repeated_on_same_reader(make_config, base_config
     assert reader.paths is not first_paths
     assert reader.paths.query_file == first_paths.query_file
     assert reader.behavior is not None
-
-
-@pytest.mark.xfail(
-    reason=(
-        "Баг legacy-кода: отсутствующий ключ в config.json приводит к "
-        "необработанному KeyError с трейсбеком вместо понятного сообщения "
-        "и выхода, тогда как ошибки формата обрабатываются (SystemExit)"
-    ),
-    strict=True,
-)
-def test_missing_key_should_exit_with_readable_error(make_config, caplog, base_config):
-    del base_config["webdriver"]["auth"]
-
-    with pytest.raises(SystemExit):
-        make_config(base_config)
-
-    assert "Failed to read config file" in caplog.text

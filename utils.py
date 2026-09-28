@@ -97,7 +97,8 @@ def _get_user_agents(user_agent_file: Path) -> list[str]:
             for user_agent in useragentfile.read().splitlines()
         ]
 
-    return user_agents
+    # blank lines would become empty user agents
+    return [user_agent for user_agent in user_agents if user_agent]
 
 
 def get_location(geolocation_db_client: GeolocationDB, proxy: str) -> tuple[float, float, str, str]:
@@ -309,7 +310,8 @@ def get_queries() -> list[str]:
             for query in queryfile.read().splitlines()
         ]
 
-    return queries
+    # blank lines would become empty search queries
+    return [query for query in queries if query]
 
 
 def get_domains() -> list[str]:
@@ -332,7 +334,8 @@ def get_domains() -> list[str]:
 
     logger.debug(f"Domains: {domains}")
 
-    return domains
+    # blank lines would match any domain
+    return [domain for domain in domains if domain]
 
 
 def add_cookies(driver: undetected_chromedriver.Chrome) -> None:

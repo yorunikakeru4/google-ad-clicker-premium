@@ -165,12 +165,60 @@ def test_get_queries_strips_whitespace_and_quotes(set_paths, tmp_path):
     assert utils.get_queries() == ["wireless keyboard", "bluetooth headphones"]
 
 
-def test_get_queries_keeps_blank_lines_as_empty_strings(set_paths, tmp_path):
+def test_get_queries_skips_blank_lines(set_paths, tmp_path):
+    # Пустая строка в файле запросов стала бы пустым поисковым запросом:
+    # кликер бы искал по пустой строке и впустую тратил трафик.
     query_file = tmp_path / "queries.txt"
-    query_file.write_text("usb hub\n\nwebcam\n", "utf-8")
+    query_file.write_text("usb hub\n\n\nwebcam\n", "utf-8")
     set_paths(query_file=query_file)
 
-    assert utils.get_queries() == ["usb hub", "", "webcam"]
+    assert utils.get_queries() == ["usb hub", "webcam"]
+
+
+def test_get_queries_skips_lines_of_whitespace_and_quotes(set_paths, tmp_path):
+    query_file = tmp_path / "queries.txt"
+    query_file.write_text("usb hub\n   \n''\n\"\"\nwebcam\n", "utf-8")
+    set_paths(query_file=query_file)
+
+    assert utils.get_queries() == ["usb hub", "webcam"]
+
+
+def test_get_queries_returns_empty_list_when_file_has_only_blank_lines(set_paths, tmp_path):
+    query_file = tmp_path / "queries.txt"
+    query_file.write_text("\n\n \n", "utf-8")
+    set_paths(query_file=query_file)
+
+    assert utils.get_queries() == []
+
+
+def test_get_domains_skips_blank_lines(set_paths, tmp_path):
+    domains_file = tmp_path / "domains.txt"
+    domains_file.write_text("www.booking.com\n\n  \nwww.sixt.com\n", "utf-8")
+    set_paths(filtered_domains=domains_file)
+
+    assert utils.get_domains() == ["www.booking.com", "www.sixt.com"]
+
+
+def test_get_domains_returns_empty_list_when_file_has_only_blank_lines(set_paths, tmp_path):
+    domains_file = tmp_path / "domains.txt"
+    domains_file.write_text("\n''\n", "utf-8")
+    set_paths(filtered_domains=domains_file)
+
+    assert utils.get_domains() == []
+
+
+def test_get_user_agents_skips_blank_lines(tmp_path):
+    ua_file = tmp_path / "user_agents.txt"
+    ua_file.write_text("Mozilla/5.0 Windows\n\n  \nMozilla/5.0 Linux\n", "utf-8")
+
+    assert utils._get_user_agents(ua_file) == ["Mozilla/5.0 Windows", "Mozilla/5.0 Linux"]
+
+
+def test_get_user_agents_returns_empty_list_when_file_has_only_blank_lines(tmp_path):
+    ua_file = tmp_path / "user_agents.txt"
+    ua_file.write_text("\n\"\"\n", "utf-8")
+
+    assert utils._get_user_agents(ua_file) == []
 
 
 def test_get_queries_exits_when_file_is_missing(set_paths, tmp_path):
@@ -211,22 +259,6 @@ def test_get_user_agents_exits_when_file_is_missing(tmp_path):
         utils._get_user_agents(tmp_path / "nope.txt")
 
     assert "Couldn't find user agents file" in str(excinfo.value)
-
-
-@pytest.mark.xfail(
-    reason=(
-        "Баг legacy-кода: get_queries/get_domains/_get_user_agents не отбрасывают "
-        "пустые строки, поэтому пустая строка в queries.txt становится пустым "
-        "поисковым запросом и кликер ищет по пустой строке"
-    ),
-    strict=True,
-)
-def test_get_queries_should_skip_blank_lines(set_paths, tmp_path):
-    query_file = tmp_path / "queries.txt"
-    query_file.write_text("usb hub\n\n\nwebcam\n", "utf-8")
-    set_paths(query_file=query_file)
-
-    assert utils.get_queries() == ["usb hub", "webcam"]
 
 
 # --- get_locale_language ----------------------------------------------------------
