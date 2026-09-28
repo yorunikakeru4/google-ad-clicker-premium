@@ -53,6 +53,34 @@ class BehaviorParams:
     request_boost: Optional[bool] = False
 
 
+class _ConfigSection(dict):
+    """Раздел конфига, который вместо голого KeyError называет недостающий параметр"""
+
+    def __init__(self, data: dict, section: str) -> None:
+        super().__init__(data)
+        self.section = section
+
+    def __missing__(self, key: str) -> None:
+        logger.error(f"Failed to read config file. Missing '{key}' parameter in {self.section}.")
+        raise SystemExit()
+
+
+def _get_config_section(config: dict, section: str) -> _ConfigSection:
+    """Read a config section, reporting a readable error if it is not usable"""
+
+    data = config.get(section)
+
+    if data is None:
+        logger.error(f"Failed to read config file. Missing '{section}' section.")
+        raise SystemExit()
+
+    if not isinstance(data, dict):
+        logger.error(f"Failed to read config file. '{section}' must be a JSON object.")
+        raise SystemExit()
+
+    return _ConfigSection(data, f"'{section}' section")
+
+
 class ConfigReader:
     """Config file reader"""
 
@@ -70,6 +98,13 @@ class ConfigReader:
             except Exception:
                 logger.error("Failed to read config file. Check format and try again.")
                 raise SystemExit()
+
+        if not isinstance(config, dict):
+            logger.error("Failed to read config file. Check format and try again.")
+            raise SystemExit()
+
+        for section in ("paths", "webdriver", "behavior"):
+            config[section] = _get_config_section(config, section)
 
         self.paths = PathParams(
             query_file=config["paths"]["query_file"],

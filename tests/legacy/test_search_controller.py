@@ -87,6 +87,27 @@ def test_process_query_keeps_hash_without_at_sign_in_query():
     assert SearchController._process_query("usb#c hub") == ("usb#c hub", [])
 
 
+def test_process_query_ignores_dangling_at_sign():
+    # Пустой элемент фильтра содержится в любом тексте ("", in text - всегда
+    # True), поэтому висячий "@" должен исчезнуть, а не отфильтровать всё.
+    assert SearchController._process_query("wireless keyboard@") == ("wireless keyboard", [])
+
+
+def test_process_query_ignores_at_sign_followed_by_spaces():
+    assert SearchController._process_query("wireless keyboard@   ") == ("wireless keyboard", [])
+
+
+def test_process_query_ignores_empty_word_between_hashes():
+    assert SearchController._process_query("keyboard@amazon##ebay") == (
+        "keyboard",
+        ["amazon", "ebay"],
+    )
+
+
+def test_process_query_ignores_at_sign_with_empty_words():
+    assert SearchController._process_query("keyboard@ # ") == ("keyboard", [])
+
+
 # --- __init__: перенос настроек конфигурации --------------------------------------
 
 
@@ -534,19 +555,86 @@ def test_end_search_swallows_devtools_disconnect_error(make_search_controller):
     assert controller._driver is None
 
 
+class AdContainer:
+    """Контейнер объявлений, отдающий заранее подготовленный список."""
+
+    def __init__(self, ads):
+        self._ads = ads
+
+    def find_elements(self, by, value=None):
+        return self._ads
+
+
+class ScrolledAdsDriver(FakeDriver):
+    """Драйвер с одним объявлением, который прокручивается ровно один раз."""
+
+    def __init__(self, ad):
+        super().__init__()
+        self.ad = ad
+        self.scroll_checks = 0
+
+    def find_elements(self, by, value=None):
+        return [AdContainer([self.ad])]
+
+    def execute_script(self, script, *args):
+        # Первая проверка прокрутки сообщает "ещё не в конце", вторая - "в конце",
+        # поэтому цикл прокрутки отрабатывает ровно один раз.
+        self.scroll_checks += 1
+
+        if "scrollHeight" in script:
+            return 1000
+
+        return 0 if self.scroll_checks == 2 else 1000
+
+
+def make_ad(title, link="https://ads.example.com/kb"):
+    return FakeElement(attributes={"href": link, "data-pcu": "shop.example.com"}, text=title)
+
+
+# --- _get_ad_links: фильтрация объявлений по filter_words ------------------------
+
+
+def test_ad_links_pass_when_query_has_no_filter_words(make_search_controller):
+    driver = ScrolledAdsDriver(make_ad("Wireless Keyboard Sale"))
+    controller = make_search_controller(query="wireless keyboard", driver=driver)
+
+    assert controller._get_ad_links() == [
+        (driver.ad, "https://ads.example.com/kb", "Wireless Keyboard Sale")
+    ]
+    assert controller._stats.num_filtered_ads == 0
+
+
+def test_ad_links_are_kept_when_filter_word_matches(make_search_controller):
+    # Фильтр работает как белый список: кликаются объявления, в ссылке или
+    # заголовке которых есть слово из запроса.
+    driver = ScrolledAdsDriver(make_ad("Wireless Keyboard Sale"))
+    controller = make_search_controller(query="wireless keyboard@shop.example", driver=driver)
+
+    assert controller._get_ad_links() == [
+        (driver.ad, "https://ads.example.com/kb", "Wireless Keyboard Sale")
+    ]
+    assert controller._stats.num_filtered_ads == 1
+
+
+def test_ad_links_are_dropped_when_filter_word_does_not_match(make_search_controller):
+    driver = ScrolledAdsDriver(make_ad("Wireless Keyboard Sale"))
+    controller = make_search_controller(query="wireless keyboard@amazon", driver=driver)
+
+    assert controller._get_ad_links() == []
+    assert controller._stats.num_filtered_ads == 0
+
+
+def test_ad_links_are_dropped_when_query_ends_with_empty_filter_word(make_search_controller):
+    # Регрессия: пустой элемент в белом списке совпадает с любым текстом, поэтому
+    # висящий "#" превращал фильтр в "кликать всё".
+    driver = ScrolledAdsDriver(make_ad("Wireless Keyboard Sale"))
+    controller = make_search_controller(query="wireless keyboard@amazon#", driver=driver)
+
+    assert controller._get_ad_links() == []
+    assert controller._stats.num_filtered_ads == 0
+
+
 # --- Известные баги: тесты зафиксированы как xfail ---------------------------------
-
-
-@pytest.mark.xfail(
-    reason=(
-        "Баг legacy-кода: висячий '@' в конце запроса даёт filter_words == [''], "
-        "а пустая строка содержится в любом тексте, поэтому фильтр отбрасывает "
-        "все объявления и кликер ничего не кликает"
-    ),
-    strict=True,
-)
-def test_process_query_should_ignore_empty_filter_words():
-    assert SearchController._process_query("wireless keyboard@") == ("wireless keyboard", [])
 
 
 @pytest.mark.xfail(

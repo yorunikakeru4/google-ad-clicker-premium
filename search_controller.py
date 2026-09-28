@@ -1249,6 +1249,10 @@ class SearchController:
         if "@" in query:
             filter_words = [word.strip().lower() for word in query.split("@")[1].split("#")]
 
+            # Empty words (dangling "@" or "#") would filter out every ad,
+            # because an empty string is contained in any text
+            filter_words = [word for word in filter_words if word]
+
         if filter_words:
             logger.debug(f"Filter words: {filter_words}")
 
