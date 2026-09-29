@@ -459,6 +459,70 @@ class TestRunRecords:
         assert store.latest_run_id(worker_id) is None
 
 
+class TestActiveRunId:
+    """Активный запуск по browser_id: счётчики пишет сам воркер.
+
+    ``latest_run_id`` адресует по worker_id и не различает завершённые
+    запуски — воркер же знает только свой browser_id, а его счётчики
+    (``captcha_seen``) обязаны попадать в текущую строку ``runs``, а не в
+    предыдущую.
+    """
+
+    def test_returns_unfinished_run_of_the_worker(self, store):
+        worker_id = store.register_worker("br-1", pid=1)
+        run_id = store.start_run(worker_id)
+
+        assert store.active_run_id("br-1") == run_id
+
+    def test_returns_none_without_runs(self, store):
+        store.register_worker("br-1", pid=1)
+
+        assert store.active_run_id("br-1") is None
+
+    def test_returns_none_for_finished_run(self, store):
+        worker_id = store.register_worker("br-1", pid=1)
+        run_id = store.start_run(worker_id)
+        store.finish_run(run_id, "completed")
+
+        assert store.active_run_id("br-1") is None
+
+    def test_returns_none_for_unknown_browser(self, store):
+        assert store.active_run_id("br-ghost") is None
+
+    def test_returns_latest_when_several_runs_left_unfinished(self, store):
+        """Страховка после краша: старую недоконченную строку не трогаем.
+
+        Супервизор закрывает осиротевшие запуски, но между крашем и этим
+        закрытием может найтись две ``ended_at IS NULL`` строки — счётчики
+        идут в самую свежую, как и ``latest_run_id``.
+        """
+
+        worker_id = store.register_worker("br-1", pid=1)
+        store.start_run(worker_id)
+        latest = store.start_run(worker_id)
+
+        assert store.active_run_id("br-1") == latest
+
+    def test_counts_reach_the_active_run_of_that_worker_only(self, store, db_path):
+        worker_id = store.register_worker("br-1", pid=1)
+        run_id = store.start_run(worker_id)
+        other_worker = store.register_worker("br-2", pid=2)
+        other_run = store.start_run(other_worker)
+
+        active = store.active_run_id("br-1")
+        store.add_run_counts(active, captcha_seen=1)
+
+        rows = _read(
+            db_path,
+            "SELECT id, captcha_seen FROM runs WHERE id IN (?, ?) ORDER BY id",
+            (run_id, other_run),
+        )
+        assert [(row["id"], row["captcha_seen"]) for row in rows] == [
+            (run_id, 1),
+            (other_run, 0),
+        ]
+
+
 class TestSnapshot:
     """Снимок состояния для /state: один консистентный срез."""
 

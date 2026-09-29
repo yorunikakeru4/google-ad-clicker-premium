@@ -3,6 +3,7 @@ import multiprocessing
 from dataclasses import dataclass
 from typing import Optional
 
+from engine.captcha_policy import DEFAULT_CAPTCHA_POLICY
 from engine.proxy_transport import DEFAULT_PROXY_TRANSPORT
 from logger import logger
 
@@ -57,6 +58,8 @@ class BehaviorParams:
     telegram_enabled: Optional[bool] = False
     send_to_android: Optional[bool] = False
     request_boost: Optional[bool] = False
+    # Политика CAPTCHA (stop | solve | both), дефолт — engine.captcha_policy.
+    captcha_policy: Optional[str] = DEFAULT_CAPTCHA_POLICY
 
 
 class _ConfigSection(dict):
@@ -169,6 +172,11 @@ class ConfigReader:
             telegram_enabled=config["behavior"]["telegram_enabled"],
             send_to_android=config["behavior"]["send_to_android"],
             request_boost=config["behavior"]["request_boost"],
+            # .get, а не []: config.json прошлой версии без ключа обязан
+            # читаться, дефолт приходит из engine.captcha_policy.
+            captcha_policy=config["behavior"].get(
+                "captcha_policy", DEFAULT_CAPTCHA_POLICY
+            ),
         )
 
 

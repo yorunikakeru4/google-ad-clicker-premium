@@ -223,6 +223,9 @@ class _UnavailableStore:
     def record_diagnostic(self, **kwargs: Any) -> None:
         raise RuntimeError(self._error)
 
+    def record_captcha_event(self, **kwargs: Any) -> None:
+        raise RuntimeError(self._error)
+
     def flush(self) -> None:
         raise RuntimeError(self._error)
 
@@ -354,6 +357,27 @@ class StructuredLogger:
             return
         try:
             self._store.record_diagnostic(browser_id=target, **fields)
+        except Exception as exc:
+            with self._lock:
+                self._dropped += 1
+                self._last_error = str(exc)
+
+    def record_captcha_event(self, browser_id: str | None = None, **fields: Any) -> None:
+        """Записать событие CAPTCHA в ``captcha_events``.
+
+        Путь воркера тот же, что у :meth:`record_diagnostic`: общий логгер
+        процесса, немедленная запись, ошибки в ``dropped``/``last_error``,
+        без зеркалирования в legacy-лог (строка живёт в своей таблице).
+
+        Отличие: ``browser_id`` опционален и NULL-строка не отбрасывается —
+        событие CAPTCHA ценно само по себе (страница, sitekey, исход), а
+        потеря из-за CLI-прогона без ``--id`` хуже пустой привязки.
+        Явный аргумент, как обычно, перебивает биндинг.
+        """
+        with self._lock:
+            target = self._browser_id if browser_id is None else browser_id
+        try:
+            self._store.record_captcha_event(browser_id=target, **fields)
         except Exception as exc:
             with self._lock:
                 self._dropped += 1

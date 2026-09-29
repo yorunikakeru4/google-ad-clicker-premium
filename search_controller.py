@@ -1,7 +1,9 @@
 import sys
 import json
 import random
+import time
 from datetime import datetime
+from pathlib import Path
 from time import sleep
 from threading import Thread
 from typing import Any, Optional, Union
@@ -25,7 +27,10 @@ import hooks
 from adb import adb_controller
 from clicklogs_db import ClickLogsDB
 from config_reader import config
-from engine.log import get_logger
+from engine.captcha_policy import CAPTCHA_POLICIES, DEFAULT_CAPTCHA_POLICY
+from engine.control_plane.state import StateStore
+from engine.diagnostics import proxy_context
+from engine.log import get_logger, resolve_db_path
 from engine.profile_apply import (
     add_profile_cookies,
     current_profile,
@@ -46,6 +51,31 @@ from webdriver import execute_stealth_js_code
 
 
 log = get_logger()
+
+
+# --- CAPTCHA: константы политики solve -----------------------------------------
+
+# Общий таймаут на решение ОДНОЙ капчи, сек. solve_recaptcha сам ждёт ответ
+# сервиса (см. SOLVE_INITIAL_WAIT_S и опросы в utils), но сетевой код
+# синхронный и без ограничения мог бы держать сценарий сколько угодно —
+# вызов идёт в daemon-потоке с join ровно на столько. По истечении —
+# неудача и stop-ветка, заброшенный поток процесс не блокирует.
+CAPTCHA_SOLVE_TIMEOUT_S = 90
+
+# Ретраи решения на одно событие: столько попыток solve_recaptcha даётся,
+# прежде чем признать капчу нерешённой. Каждая попытка съедает единицу
+# сессионного лимита ниже.
+CAPTCHA_SOLVE_RETRIES = 2
+
+# Лимит попыток 2captcha на процесс воркера за сессию. Счётчик живёт на
+# классе, а не на инстансе: SearchController создаётся заново на каждый
+# сценарий, а лимит защищает кошелёк оператора от бесконечных решений при
+# сломанном детекте или мёртвом прокси. Исчерпан → stop-ветка с solved=false.
+CAPTCHA_SOLVE_SESSION_LIMIT = 5
+
+# Каталог скриншотов CAPTCHA — относительно текущего каталога (как и весь
+# legacy-ввод/вывод: config.json, logs/, clicklogs.db), уже в .gitignore.
+CAPTCHA_SCREENSHOT_DIR = Path("engine/screenshots")
 
 
 LinkElement = selenium.webdriver.remote.webelement.WebElement
@@ -84,6 +114,11 @@ class SearchController:
     )
     LOC_CONTINUE_BUTTON = (By.TAG_NAME, "g-raised-button")
     NOT_NOW_BUTTON = (By.CSS_SELECTOR, "g-raised-button[data-ved]")
+
+    # Попыток решить капчу за сессию процесса — см. CAPTCHA_SOLVE_SESSION_LIMIT.
+    # На классе, а не на инстансе: контроллер живёт один сценарий, лимит —
+    # весь воркер.
+    _solve_attempts_used = 0
 
     def __init__(
         self, driver: selenium.webdriver, query: str, country_code: Optional[str] = None
@@ -1199,70 +1234,479 @@ class SearchController:
                 pyautogui.moveTo(screen_width / 2, screen_height / 2)
 
     def _check_captcha(self) -> None:
-        """Check if captcha exists and solve it if 2captcha is used, otherwise exit"""
+        """Проверить страницу на CAPTCHA и применить ``behavior.captcha_policy``.
 
+        Единственная точка детекта: все вызовы из ``search_for_ads`` (до
+        поиска, в ветке ``ElementNotInteractable``, после набора запроса)
+        зовут этот метод, а он обязан пройти через единственную точку события
+        :meth:`_record_captcha_event` — строка в ``captcha_events``, счётчик
+        ``runs``, лог с категорией ``captcha`` и telegram. Обход цепочки
+        ловится структурным тестом.
+
+        Политика (план §5, фаза 8):
+
+        * **stop** — дефолт. Событие + скриншот + telegram и сценарий
+          прерывается ``SystemExit``. Семантика ровно как у legacy-ветки
+          «нет ключа»: ``ad_clicker.run_scenario`` в ``finally`` доводит
+          teardown (закрывает браузер), ``engine.worker`` ловит
+          ``SystemExit``, помечает прогон упавшим и ждёт следующего раунда
+          по расписанию. «Ждать оператора» = остановленный сценарий и живой
+          воркер, который ничего не делает, пока оператор не разберётся
+          (сменит прокси, включит 2captcha, остановит пул). Отдельного
+          «спящего» цикла здесь намеренно нет: он не получил бы SIGTERM
+          от супервизора и завис бы вместе с процессом.
+        * **solve** — авто-решение через 2captcha: таймаут, ретраи и
+          сессионный лимит — константы ``CAPTCHA_SOLVE_*`` сверху файла; в
+          событие уходят ``solved``/``solver``/``elapsed_ms``. Неудача,
+          таймаут, отсутствие ключа или исчерпание лимита уводят в
+          stop-ветку с ``solved=false``.
+        * **both** — решает; любая неудача или исчерпание лимита — stop-ветка.
+
+        **Изменение семантики (осознанное, по плану):** legacy при наличии
+        ключа решал капчу сам и продолжал прогон, без ключа — останавливал.
+        Новый дефолт ``captcha_policy=stop`` останавливает прогон и при
+        наличии ключа: авто-решение включается только явным
+        ``solve``/``both``.
+        """
         sleep(get_random_sleep(2, 2.5) * config.behavior.wait_factor)
 
         try:
             captcha = self._driver.find_element(*self.RECAPTCHA)
+        except NoSuchElementException:
+            log.debug("captcha", "No captcha seen. Continue to search...")
+            return
 
-            if captcha:
-                log.error("captcha", "Captcha was shown.")
+        if not captcha:
+            log.debug("captcha", "No captcha seen. Continue to search...")
+            return
 
-                if self._hooks_enabled:
-                    hooks.captcha_seen_hook(self._driver)
+        # --- обнаружено: дальше любая судьба идёт через одну точку события ---
+        log.error("captcha", "Captcha was shown.")
 
-                self._stats.captcha_seen = True
+        if self._hooks_enabled:
+            hooks.captcha_seen_hook(self._driver)
 
-                if not self._twocaptcha_apikey:
-                    log.info("captcha", "Please try with a different proxy or enable 2captcha service.")
-                    log.info("click", str(self.stats))
-                    raise SystemExit()
+        self._stats.captcha_seen = True
 
-                cookies = ";".join(
-                    [f"{cookie['name']}:{cookie['value']}" for cookie in self._driver.get_cookies()]
+        policy = self._captcha_policy()
+        browser_id = self._event_browser_id()
+        page_url = self._current_url()
+        sitekey = self._element_attribute(captcha, "data-sitekey")
+        screenshot_path = self._captcha_screenshot(browser_id)
+
+        # Словарь события: stop-ветки ниже отличаются только причиной,
+        # solved/solver/elapsed_ms меняются при уходе в solve.
+        event: dict[str, Any] = {
+            "page_url": page_url,
+            "sitekey": sitekey,
+            "screenshot_path": screenshot_path,
+            "solved": False,
+            "solver": None,
+            "elapsed_ms": None,
+            "policy": policy,
+        }
+
+        if policy == "stop":
+            self._record_captcha_event(**event)
+            self._stop_for_captcha(f"captcha_policy={policy}")
+            return
+
+        # --- solve | both -----------------------------------------------------
+        if not self._twocaptcha_apikey:
+            log.error(
+                "captcha",
+                "2captcha API key is not configured (behavior.2captcha_apikey): cannot auto-solve",
+                fields={"captcha_policy": policy},
+            )
+            self._record_captcha_event(**event)
+            self._stop_for_captcha("no 2captcha api key")
+            return
+
+        if SearchController._solve_attempts_used >= CAPTCHA_SOLVE_SESSION_LIMIT:
+            log.error(
+                "captcha",
+                "2captcha attempt limit reached for this worker session: cannot auto-solve",
+                fields={
+                    "used": SearchController._solve_attempts_used,
+                    "limit": CAPTCHA_SOLVE_SESSION_LIMIT,
+                },
+            )
+            self._record_captcha_event(**event)
+            self._stop_for_captcha("2captcha session limit reached")
+            return
+
+        if page_url is None:
+            log.error("captcha", "Current page URL is unavailable: cannot auto-solve CAPTCHA")
+            self._record_captcha_event(**event)
+            self._stop_for_captcha("page url unavailable")
+            return
+
+        data_s = self._element_attribute(captcha, "data-s")
+        cookies = self._page_cookies()
+        started_at = time.monotonic()
+        response_code: Optional[str] = None
+        last_error: Optional[str] = None
+        attempt = 0
+
+        while attempt < CAPTCHA_SOLVE_RETRIES and response_code is None:
+            if SearchController._solve_attempts_used >= CAPTCHA_SOLVE_SESSION_LIMIT:
+                # Лимит исчерпан предыдущими попытками этого же процесса.
+                last_error = "2captcha session limit reached"
+                break
+            attempt += 1
+            SearchController._solve_attempts_used += 1
+            log.info(
+                "captcha",
+                "Trying to solve captcha...",
+                fields={
+                    "attempt": attempt,
+                    "retries": CAPTCHA_SOLVE_RETRIES,
+                    "session_used": SearchController._solve_attempts_used,
+                },
+            )
+            response_code, last_error = self._solve_via_service(
+                current_url=page_url,
+                sitekey=sitekey,
+                data_s=data_s,
+                cookies=cookies,
+            )
+            if response_code is None:
+                log.warning(
+                    "captcha",
+                    "CAPTCHA solve attempt failed",
+                    fields={"attempt": attempt, "error": last_error},
                 )
 
-                log.debug("captcha", "Cookies", fields={"cookies": cookies})
+        elapsed_ms = int((time.monotonic() - started_at) * 1000)
 
-                sitekey = captcha.get_attribute("data-sitekey")
-                data_s = captcha.get_attribute("data-s")
+        if response_code:
+            log.info("captcha", "Captcha was solved.", fields={"elapsed_ms": elapsed_ms})
+            self._stats.captcha_solved = True
+            event.update(solved=True, solver="2captcha", elapsed_ms=elapsed_ms)
+            self._record_captcha_event(**event)
+            captcha_redirect_url = f"{page_url}&g-recaptcha-response={response_code}"
+            self._driver.get(captcha_redirect_url)
+            sleep(get_random_sleep(2, 2.5) * config.behavior.wait_factor)
+            return
 
-                log.debug(
+        # Неудача: сначала событие (solver="2captcha" — попытки реально были,
+        # если дошли до ветки solve), затем stop-ветка.
+        event.update(solver="2captcha" if attempt else None, elapsed_ms=elapsed_ms)
+        self._record_captcha_event(**event)
+        self._stop_for_captcha(last_error or "2captcha did not solve the captcha")
+
+    def _captcha_policy(self) -> str:
+        """Политика из конфига; неизвестное значение → дефолт ``stop`` + WARNING.
+
+        ``config_reader`` не валидирует enum (в control plane это делает
+        ``_ENUM_FIELDS``), поэтому старый или рукописный ``config.json`` с
+        опечаткой не должен ни ронять сценарий, ни молча решать капчу:
+        безопасный исход — остановка и явный WARNING, а не догадка.
+        """
+        policy = config.behavior.captcha_policy
+        if policy not in CAPTCHA_POLICIES:
+            log.warning(
                 "captcha",
-                "Captcha element",
-                fields={"sitekey": sitekey, "data_s": data_s},
+                "Unknown captcha_policy, falling back to stop",
+                fields={"captcha_policy": policy, "resolved": DEFAULT_CAPTCHA_POLICY},
+            )
+            return DEFAULT_CAPTCHA_POLICY
+        return policy
+
+    def _event_browser_id(self) -> Optional[str]:
+        """``browser_id`` события: из stats (``set_browser_id``), иначе биндинг логгера."""
+        if self._stats.browser_id:
+            return str(self._stats.browser_id)
+        return log.browser_id
+
+    def _current_url(self) -> Optional[str]:
+        """URL страницы; мёртвый драйвер не роняет событие (None)."""
+        try:
+            return self._driver.current_url
+        except Exception as exp:  # noqa: BLE001 - страница могла умереть вместе с драйвером
+            log.warning(
+                "captcha",
+                "Page URL is unavailable for the CAPTCHA event",
+                fields={"error": str(exp), "error_type": type(exp).__name__},
+            )
+            return None
+
+    @staticmethod
+    def _element_attribute(element: Any, name: str) -> Optional[str]:
+        """Атрибут элемента без исключений: устаревший элемент не роняет событие."""
+        try:
+            return element.get_attribute(name)
+        except Exception as exp:  # noqa: BLE001 - StaleElement и прочее на живой странице
+            log.warning(
+                "captcha",
+                "CAPTCHA element attribute was not read",
+                fields={"attribute": name, "error": str(exp), "error_type": type(exp).__name__},
+            )
+            return None
+
+    def _page_cookies(self) -> Optional[str]:
+        """Cookies страницы для запроса к 2captcha, в legacy-формате ``name:value;...``.
+
+        Значения не логируются: это сессионные креды, и в ``logs`` они не
+        должны попадать (dump cookies из legacy-ветки намеренно не
+        переносится). Отказ чтения — None: сервис решает и без cookies.
+        """
+        try:
+            return ";".join(
+                f"{cookie['name']}:{cookie['value']}" for cookie in self._driver.get_cookies()
+            )
+        except Exception as exp:  # noqa: BLE001 - cookies нужны решению, не сценарию
+            log.warning(
+                "captcha",
+                "Cookies were not read for the 2captcha request",
+                fields={"error": str(exp), "error_type": type(exp).__name__},
+            )
+            return None
+
+    def _captcha_screenshot(self, browser_id: Optional[str]) -> Optional[str]:
+        """Снять страницу с CAPTCHA: ``engine/screenshots/<browser_id>_<epoch>.png``.
+
+        Отдельный явный вызов драйвера (а не побочный эффект события), чтобы
+        отказ снимка был виден отдельно и чтобы событие могло уйти с
+        ``screenshot_path=NULL``. В имени файла — только id воркера и время:
+        ни креды прокси, ни URL страницы туда не попадают (иначе утекут в
+        списки файлов и отчёты).
+
+        В БД уходит тот же абсолютный путь, что ушёл драйверу: каталог
+        относится к текущему каталогу (как весь legacy-вывод), а читать его
+        будет UI из другого процесса. Отказ (мёртвый драйвер, нет прав) →
+        None + WARNING: скриншот не роняет ни событие, ни сценарий.
+        """
+        name = f"{browser_id or 'unknown'}_{int(time.time())}.png"
+        path = Path.cwd() / CAPTCHA_SCREENSHOT_DIR / name
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            saved = self._driver.get_screenshot_as_file(str(path))
+        except Exception as exp:  # noqa: BLE001 - снимок не важнее события
+            log.warning(
+                "captcha",
+                "CAPTCHA screenshot failed",
+                fields={"path": str(path), "error": str(exp), "error_type": type(exp).__name__},
+            )
+            return None
+        if not saved:
+            log.warning(
+                "captcha",
+                "CAPTCHA screenshot failed",
+                fields={"path": str(path), "error": "driver refused to save the screenshot"},
+            )
+            return None
+        log.info("captcha", "CAPTCHA screenshot saved", fields={"path": str(path)})
+        return str(path)
+
+    def _captcha_context(
+        self, browser_id: Optional[str]
+    ) -> tuple[Optional[int], Optional[int], Optional[StateStore]]:
+        """``(proxy_id, run_id, store)`` события — как у снимка сессии.
+
+        Прокси берётся из строки воркера тем же
+        ``engine.diagnostics.proxy_context``, что и диагностика; run —
+        активная строка ``runs`` для этого ``browser_id``: счётчики пишет сам
+        воркер, а его ``run_id`` процессу неизвестен. Ошибка чтения не роняет
+        событие — контекст становится пустым, строка пишется в любом случае.
+        """
+        if not browser_id:
+            return None, None, None
+        try:
+            store = StateStore(resolve_db_path())
+            proxy_id, _country = proxy_context(store, browser_id)
+            return proxy_id, store.active_run_id(browser_id), store
+        except Exception as exp:  # noqa: BLE001 - контекст не важнее события
+            log.warning(
+                "captcha",
+                "CAPTCHA event context is unavailable",
+                fields={"error": str(exp), "error_type": type(exp).__name__},
+            )
+            return None, None, None
+
+    def _record_captcha_event(
+        self,
+        *,
+        page_url: Optional[str],
+        sitekey: Optional[str],
+        screenshot_path: Optional[str],
+        solved: bool,
+        solver: Optional[str],
+        elapsed_ms: Optional[int],
+        policy: str,
+    ) -> None:
+        """Единая точка события CAPTCHA: строка, счётчики run, лог и telegram.
+
+        Все ветки детекта зовут только эту функцию. Порядок: строка в
+        ``captcha_events`` (немедленно — оператор ждёт её вместе с
+        уведомлением), счётчики активного запуска (``captcha_seen`` всегда,
+        ``captcha_solved`` — если решилось), лог с категорией ``captcha``,
+        затем telegram по флагу.
+
+        Политика ошибок не бросает: запись события защищена политикой
+        ``StoreWriter`` (``dropped``/``last_error``), контекст и счётчик —
+        собственными WARNING'ами. Событие — это реакция на проблему, оно не
+        должно превращаться в неё.
+        """
+        browser_id = self._event_browser_id()
+        ts = time.time()
+        proxy_id, run_id, store = self._captcha_context(browser_id)
+
+        log.record_captcha_event(
+            browser_id=browser_id,
+            ts=ts,
+            proxy_id=proxy_id,
+            page_url=page_url,
+            sitekey=sitekey,
+            screenshot_path=screenshot_path,
+            solved=solved,
+            solver=solver,
+            elapsed_ms=elapsed_ms,
+        )
+
+        if store is not None and run_id is not None:
+            try:
+                store.add_run_counts(run_id, captcha_seen=1, captcha_solved=int(solved))
+            except Exception as exp:  # noqa: BLE001 - счётчик не важнее события
+                log.warning(
+                    "captcha",
+                    "CAPTCHA run counter was not updated",
+                    fields={
+                        "run_id": run_id,
+                        "error": str(exp),
+                        "error_type": type(exp).__name__,
+                    },
+                )
+
+        log.info(
+            "captcha",
+            "CAPTCHA event recorded",
+            fields={
+                "policy": policy,
+                "solved": bool(solved),
+                "solver": solver,
+                "elapsed_ms": elapsed_ms,
+                "screenshot_path": screenshot_path,
+                "sitekey": sitekey,
+                "page_url": page_url,
+                "proxy_id": proxy_id,
+                "run_id": run_id,
+            },
+        )
+
+        self._notify_captcha_telegram(
+            browser_id=browser_id,
+            page_url=page_url,
+            screenshot_path=screenshot_path,
+            solved=bool(solved),
+            policy=policy,
+        )
+
+    def _notify_captcha_telegram(
+        self,
+        *,
+        browser_id: Optional[str],
+        page_url: Optional[str],
+        screenshot_path: Optional[str],
+        solved: bool,
+        policy: str,
+    ) -> None:
+        """Уведомление в Telegram на самое событие CAPTCHA. Никогда не бросает.
+
+        Раньше telegram срабатывал только по результатам прогона
+        (``notify_matching_ads``), а CAPTCHA — событие посреди сценария:
+        уведомление уходит сразу после записи строки. Импорт ленивый и
+        wrapped в try: пакет telegram не входит в nix-окружение, и его
+        отсутствие или ошибка отправки не должны менять исход — событие уже
+        записано, сценарий уже принял решение.
+        """
+        if not config.behavior.telegram_enabled:
+            return
+        try:
+            from telegram_notifier import notify_captcha_event
+
+            notify_captcha_event(
+                browser_id=browser_id,
+                page_url=page_url,
+                screenshot_path=screenshot_path,
+                solved=solved,
+                policy=policy,
+            )
+        except Exception as exp:  # noqa: BLE001 - уведомление не решает сценарий
+            log.warning(
+                "captcha",
+                "CAPTCHA telegram notification failed",
+                fields={"error": str(exp), "error_type": type(exp).__name__},
             )
 
-                response_code = solve_recaptcha(
+    def _solve_via_service(
+        self,
+        *,
+        current_url: str,
+        sitekey: Optional[str],
+        data_s: Optional[str],
+        cookies: Optional[str],
+    ) -> tuple[Optional[str], Optional[str]]:
+        """Один вызов 2captcha под таймаутом ``CAPTCHA_SOLVE_TIMEOUT_S``.
+
+        Возвращает ``(response_code | None, причина | None)``.
+
+        ``solve_recaptcha`` — синхронный сетевой код со своими паузами и
+        ретраями (см. константы в ``utils``), поэтому вызов идёт в
+        daemon-потоке с ``join(timeout)``: по таймауту сценарий уходит в
+        stop-ветку, а заброшенный поток никого не держит и не блокирует
+        выход процесса.
+
+        ``SystemExit`` из ``solve_recaptcha`` (2captcha ответил фатально: не
+        тот ключ, нет средств) перехватывается здесь же: это неудача
+        решения, а не приказ завершать процесс — иначе событие не успело бы
+        записаться.
+        """
+        result: dict[str, Any] = {}
+
+        def _solve() -> None:
+            try:
+                result["code"] = solve_recaptcha(
                     apikey=self._twocaptcha_apikey,
                     sitekey=sitekey,
-                    current_url=self._driver.current_url,
+                    current_url=current_url,
                     data_s=data_s,
                     cookies=cookies,
                 )
+            except SystemExit as exp:
+                result["error"] = str(exp) or f"2captcha solver exited (code {exp.code})"
+            except Exception as exp:  # noqa: BLE001 - ошибка сервиса = неудача решения
+                result["error"] = f"{type(exp).__name__}: {exp}"
 
-                if response_code:
-                    log.info("captcha", "Captcha was solved.")
+        worker = Thread(target=_solve, name="captcha-solve", daemon=True)
+        worker.start()
+        worker.join(CAPTCHA_SOLVE_TIMEOUT_S)
+        if worker.is_alive():
+            log.warning(
+                "captcha",
+                "CAPTCHA solve timed out",
+                fields={"timeout_s": CAPTCHA_SOLVE_TIMEOUT_S},
+            )
+            return None, f"timeout after {CAPTCHA_SOLVE_TIMEOUT_S}s"
+        return result.get("code"), result.get("error")
 
-                    self._stats.captcha_solved = True
+    def _stop_for_captcha(self, reason: str) -> None:
+        """Stop-ветка: прервать сценарий и ждать оператора.
 
-                    captcha_redirect_url = (
-                        f"{self._driver.current_url}&g-recaptcha-response={response_code}"
-                    )
-                    self._driver.get(captcha_redirect_url)
-
-                    sleep(get_random_sleep(2, 2.5) * config.behavior.wait_factor)
-
-                else:
-                    log.info("captcha", "Please try with a different proxy.")
-
-                    self._driver.quit()
-
-                    raise SystemExit()
-
-        except NoSuchElementException:
-            log.debug("captcha", "No captcha seen. Continue to search...")
+        Семантика — legacy-ветка «нет ключа»: ``SystemExit`` выходит из
+        ``search_for_ads`` в ``run_scenario``, whose ``finally`` закрывает
+        браузер, а ``engine.worker`` ловит ``SystemExit``, помечает прогон
+        упавшим и ждёт следующего раунда по расписанию. Скриншот, событие и
+        уведомление к этому моменту уже сделаны — оператор получает полную
+        картину и решает, что дальше.
+        """
+        log.info(
+            "captcha",
+            "Please try with a different proxy or enable 2captcha service.",
+            fields={"reason": reason},
+        )
+        log.info("click", str(self.stats))
+        raise SystemExit()
 
     def _close_choose_location_popup(self) -> None:
         """Close 'Choose location for search results' popup"""

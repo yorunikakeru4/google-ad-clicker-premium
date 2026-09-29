@@ -1,4 +1,5 @@
-"""Батчевый writer SQLite: логи, клики, сетевые запросы, запуски, heartbeat и деградация.
+"""Батчевый writer SQLite: логи, клики, сетевые запросы, запуски, heartbeat,
+деградация, снимки диагностики и события CAPTCHA.
 
 Один writer на процесс, соединение держится открытым. Логи, клики и записи
 ``network_requests`` — частые append-операции, поэтому они буферизуются и
@@ -93,6 +94,15 @@ _DIAGNOSTIC_INSERT = (
     "timezone_id, screen_w, screen_h, platform, webgl_vendor, webgl_renderer, "
     "browser_version, headers, suspicion_flags"
     ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+)
+# Событие CAPTCHA — второй немедленный append (после диагностики): оператор
+# ждёт строку вместе с уведомлением и ссылкой на скриншот, а не через батч.
+# Порядок колонок соответствует schema.sql.
+_CAPTCHA_EVENT_INSERT = (
+    "INSERT INTO captcha_events ("
+    "ts, browser_id, proxy_id, page_url, sitekey, screenshot_path, "
+    "solved, solver, elapsed_ms"
+    ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)"
 )
 
 
@@ -405,6 +415,62 @@ class StoreWriter:
             except Exception as exc:
                 self._rollback_quietly_locked()
                 self._record_loss_locked(1, f"record_diagnostic {browser_id}: {exc}")
+
+    # --- события CAPTCHA: немедленная запись -------------------------------
+
+    def record_captcha_event(
+        self,
+        *,
+        browser_id: str | None = None,
+        ts: float | None = None,
+        proxy_id: int | None = None,
+        page_url: str | None = None,
+        sitekey: str | None = None,
+        screenshot_path: str | None = None,
+        solved: bool = False,
+        solver: str | None = None,
+        elapsed_ms: int | None = None,
+    ) -> None:
+        """Записать событие CAPTCHA в ``captcha_events``. Немедленно, как heartbeat.
+
+        Событие — не телеметрия, а ответ оператору: строка должна быть в БД
+        ровно тогда, когда уходит telegram-уведомление и когда UI показывает
+        ссылку на скриншот, поэтому батч (до 1 с) здесь не подходит.
+
+        Отличия от ``record_diagnostic``:
+
+        * ``browser_id`` опционален и NULL-строка — нормальный исход:
+          CLI-прогон без ``--id`` пишет событие с NULL, терять его хуже, чем
+          иметь пустую привязку (там же незаполненными остаются proxy/run);
+        * ``solved`` — bool на входе, в колонку уходит 0/1: контракт INTEGER
+          читает UI, а «получилось/не получилось» — язык вызывающего кода.
+
+        Политика ошибок общая для writer'а: закрытая БД или полный диск не
+        бросают исключение и идут в ``dropped``/``last_error`` — событие не
+        должно ронять сценарий, в котором его поймали.
+        """
+        stamp = time.time() if ts is None else ts
+        row = (
+            stamp,
+            browser_id,
+            proxy_id,
+            page_url,
+            sitekey,
+            screenshot_path,
+            1 if solved else 0,
+            solver,
+            elapsed_ms,
+        )
+        with self._lock:
+            if self._closed:
+                self._record_loss_locked(1, "writer закрыт: событие CAPTCHA отброшено")
+                return
+            try:
+                self._conn.execute(_CAPTCHA_EVENT_INSERT, row)
+                self._conn.commit()
+            except Exception as exc:
+                self._rollback_quietly_locked()
+                self._record_loss_locked(1, f"record_captcha_event: {exc}")
 
     # --- запуски: делегирование StateStore --------------------------------
     def start_run(self, worker_id: int) -> int | None:
