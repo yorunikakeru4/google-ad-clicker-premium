@@ -157,6 +157,33 @@ pub struct ProfileRow {
     pub proxy_address: Option<String>,
 }
 
+/// Строка диагностики: последний снимок сессии одного воркера — экран
+/// Diagnostics. Колонки — контракт таблицы `diagnostics` из
+/// `engine/db/schema.sql`, без изменений.
+///
+/// `headers` и `suspicion_flags` остаются сырыми строками JSON: читалка не
+/// парсит их, поэтому битый JSON не превращается в ошибку чтения, а доходит
+/// до фронта как есть — там и решается, что с ним делать.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct DiagnosticRow {
+    pub ts: f64,
+    pub browser_id: Option<String>,
+    pub proxy_id: Option<i64>,
+    pub ip: Option<String>,
+    pub country: Option<String>,
+    pub user_agent: Option<String>,
+    pub accept_language: Option<String>,
+    pub timezone_id: Option<String>,
+    pub screen_w: Option<i64>,
+    pub screen_h: Option<i64>,
+    pub platform: Option<String>,
+    pub webgl_vendor: Option<String>,
+    pub webgl_renderer: Option<String>,
+    pub browser_version: Option<String>,
+    pub headers: Option<String>,
+    pub suspicion_flags: Option<String>,
+}
+
 /// Читатель боевой БД: одно соединение, строго на чтение.
 ///
 /// Соединение не разделяется между потоками (`SQLITE_OPEN_NO_MUTEX`):
@@ -378,6 +405,62 @@ impl DbReader {
 
         rows.map(|row| row.map_err(read_failed)).collect()
     }
+
+    /// Последний снимок диагностики на каждый `browser_id` — экран
+    /// Diagnostics. Снимки пишет воркер асинхронно (`POST
+    /// /control/diagnostics/collect`), поэтому экран только поллит читалку.
+    ///
+    /// Свежесть решает `ts`, равные `ts` — `id` (вставлено позже = новее):
+    /// без второй части ключа выборка зависела бы от порядка строк в таблице.
+    /// Строки без `browser_id` складываются в одну группу (так NULL трактует
+    /// `PARTITION BY`) и идут последними: снимок без воркера не выбрасывается,
+    /// но и не опережает карточки воркеров.
+    ///
+    /// `headers`/`suspicion_flags` возвращаются сырыми строками JSON — парсит
+    /// фронтенд (см. [`DiagnosticRow`]).
+    pub fn list_diagnostics(&self) -> Result<Vec<DiagnosticRow>, DbError> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT ts, browser_id, proxy_id, ip, country, user_agent, \
+                        accept_language, timezone_id, screen_w, screen_h, platform, \
+                        webgl_vendor, webgl_renderer, browser_version, headers, \
+                        suspicion_flags \
+                   FROM (SELECT *, ROW_NUMBER() OVER ( \
+                                  PARTITION BY browser_id \
+                                  ORDER BY ts DESC, id DESC) AS rn \
+                           FROM diagnostics) \
+                  WHERE rn = 1 \
+                  ORDER BY browser_id IS NULL, browser_id",
+            )
+            .map_err(read_failed)?;
+
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(DiagnosticRow {
+                    ts: row.get(0)?,
+                    browser_id: row.get(1)?,
+                    proxy_id: row.get(2)?,
+                    ip: row.get(3)?,
+                    country: row.get(4)?,
+                    user_agent: row.get(5)?,
+                    accept_language: row.get(6)?,
+                    timezone_id: row.get(7)?,
+                    screen_w: row.get(8)?,
+                    screen_h: row.get(9)?,
+                    platform: row.get(10)?,
+                    webgl_vendor: row.get(11)?,
+                    webgl_renderer: row.get(12)?,
+                    browser_version: row.get(13)?,
+                    headers: row.get(14)?,
+                    suspicion_flags: row.get(15)?,
+                })
+            })
+            .map_err(read_failed)?;
+
+        rows.map(|row| row.map_err(read_failed)).collect()
+    }
+
     /// Общий путь запросов логов: одна страница в порядке `ts DESC, id DESC`.
     fn fetch_log_page(
         &self,
