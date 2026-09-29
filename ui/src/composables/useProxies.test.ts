@@ -161,6 +161,29 @@ describe("createProxies: список и опрос", () => {
     expect(proxies.rows.value).toHaveLength(1);
     proxies.stop();
   });
+
+  it("API, бросающий синхронно, не залипает в полёте — следующий тик идёт в сеть", async () => {
+    const fake = fakeApi([proxyRow({ id: 2 })]);
+    let synchronous = true;
+    fake.api.list = vi.fn(() => {
+      if (synchronous) throw new Error("синхронный сбой списка");
+      return Promise.resolve([proxyRow({ id: 2 })]);
+    });
+    const proxies = createProxies(fake.api);
+
+    await proxies.tick();
+    expect(proxies.error.value).toContain("синхронный сбой");
+
+    synchronous = false;
+    await proxies.tick();
+
+    expect(fake.api.list).toHaveBeenCalledTimes(2);
+    expect(
+      proxies.rows.value.map((row) => row.id),
+      "второй тик обязан пойти в API, а не вернуть старый промис",
+    ).toEqual([2]);
+    expect(proxies.error.value).toBeNull();
+  });
 });
 
 describe("createProxies: добавление", () => {
