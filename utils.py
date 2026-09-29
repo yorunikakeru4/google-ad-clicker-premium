@@ -26,9 +26,12 @@ except ImportError:
     from openpyxl.styles import Alignment, Font
 
 from config_reader import config
+from engine.log import get_logger
 from geolocation_db import GeolocationDB
-from logger import logger
 from proxy import get_proxies
+
+
+log = get_logger()
 
 
 class Direction(Enum):
@@ -72,7 +75,7 @@ def get_random_user_agent_string() -> str:
 
     user_agent_string = random.choice(filtered_user_agents)
 
-    logger.debug(f"user_agent: {user_agent_string}")
+    log.debug("browser", "user_agent", fields={"user_agent": user_agent_string})
 
     return user_agent_string
 
@@ -128,10 +131,14 @@ def get_location(geolocation_db_client: GeolocationDB, proxy: str) -> tuple[floa
                 break
 
             except Exception as exp:
-                logger.debug(exp)
+                log.debug(
+                    "proxy",
+                    "IP lookup attempt failed",
+                    fields={"source": "api.ipify.org", "error": str(exp)},
+                )
 
                 try:
-                    logger.debug("Trying with ipv4.webshare.io...")
+                    log.debug("proxy", "Trying with ipv4.webshare.io...")
                     response = requests.get(
                         "https://ipv4.webshare.io/", proxies=proxies_header, timeout=5
                     )
@@ -143,10 +150,14 @@ def get_location(geolocation_db_client: GeolocationDB, proxy: str) -> tuple[floa
                     break
 
                 except Exception as exp:
-                    logger.debug(exp)
+                    log.debug(
+                        "proxy",
+                        "IP lookup attempt failed",
+                        fields={"source": "ipv4.webshare.io", "error": str(exp)},
+                    )
 
                     try:
-                        logger.debug("Trying with ipconfig.io...")
+                        log.debug("proxy", "Trying with ipconfig.io...")
                         response = requests.get(
                             "https://ipconfig.io/json", proxies=proxies_header, timeout=5
                         )
@@ -158,13 +169,21 @@ def get_location(geolocation_db_client: GeolocationDB, proxy: str) -> tuple[floa
                         break
 
                     except Exception as exp:
-                        logger.debug(exp)
+                        log.debug(
+                            "proxy",
+                            "IP lookup attempt failed",
+                            fields={"source": "ipconfig.io", "error": str(exp)},
+                        )
 
                         if repeat == 1:
                             break
 
                         request_retry_timeout = 60 * config.behavior.wait_factor
-                        logger.info(f"Request will be resend after {request_retry_timeout} seconds")
+                        log.info(
+                            "proxy",
+                            "Request will be resend after",
+                            fields={"retry_after_s": request_retry_timeout},
+                        )
 
                         sleep(request_retry_timeout)
 
@@ -173,11 +192,11 @@ def get_location(geolocation_db_client: GeolocationDB, proxy: str) -> tuple[floa
         ip_address = proxy.split(":")[0]
 
     if not ip_address:
-        logger.info(f"Couldn't verify IP address for {proxy}!")
-        logger.debug("Geolocation won't be set")
+        log.info("proxy", "Couldn't verify IP address!", fields={"proxy": proxy})
+        log.debug("proxy", "Geolocation won't be set")
         return (None, None, None, None)
 
-    logger.info(f"Connecting with IP: {ip_address}")
+    log.info("proxy", "Connecting with IP", fields={"ip_address": ip_address})
 
     db_result = geolocation_db_client.query_geolocation(ip_address)
 
@@ -188,15 +207,27 @@ def get_location(geolocation_db_client: GeolocationDB, proxy: str) -> tuple[floa
 
     if db_result:
         latitude, longitude, country_code = db_result
-        logger.debug(f"Cached latitude and longitude for {ip_address}: ({latitude}, {longitude})")
-        logger.debug(f"Cached country code for {ip_address}: {country_code}")
+        log.debug(
+            "proxy",
+            "Cached latitude and longitude",
+            fields={"ip_address": ip_address, "latitude": latitude, "longitude": longitude},
+        )
+        log.debug(
+            "proxy",
+            "Cached country code",
+            fields={"ip_address": ip_address, "country_code": country_code},
+        )
 
         if not country_code:
             try:
                 response = requests.get(f"https://ipapi.co/{ip_address}/json/", timeout=5)
                 country_code = response.json().get("country_code")
                 timezone = response.json().get("timezone")
-                logger.debug(f"Country code for {ip_address}: {country_code}")
+                log.debug(
+                    "proxy",
+                    "Country code",
+                    fields={"ip_address": ip_address, "country_code": country_code},
+                )
 
             except Exception:
                 try:
@@ -206,7 +237,11 @@ def get_location(geolocation_db_client: GeolocationDB, proxy: str) -> tuple[floa
                     country_code = response.json().get("country_iso")
                     timezone = response.json().get("time_zone")
                 except Exception:
-                    logger.debug(f"Couldn't find country code for {ip_address}!")
+                    log.debug(
+                        "proxy",
+                        "Couldn't find country code!",
+                        fields={"ip_address": ip_address},
+                    )
 
         return (float(latitude), float(longitude), country_code, timezone)
 
@@ -230,8 +265,12 @@ def get_location(geolocation_db_client: GeolocationDB, proxy: str) -> tuple[floa
 
                 break
             except Exception as exp:
-                logger.debug(exp)
-                logger.debug("Continue with ifconfig.co")
+                log.debug(
+                    "proxy",
+                    "Geolocation lookup attempt failed",
+                    fields={"source": "ipapi.co", "error": str(exp)},
+                )
+                log.debug("proxy", "Continue with ifconfig.co")
 
                 try:
                     response = requests.get(
@@ -249,8 +288,12 @@ def get_location(geolocation_db_client: GeolocationDB, proxy: str) -> tuple[floa
 
                     break
                 except Exception as exp:
-                    logger.debug(exp)
-                    logger.debug("Continue with ipconfig.io")
+                    log.debug(
+                        "proxy",
+                        "Geolocation lookup attempt failed",
+                        fields={"source": "ifconfig.co", "error": str(exp)},
+                    )
+                    log.debug("proxy", "Continue with ipconfig.io")
 
                     try:
                         response = requests.get(
@@ -268,10 +311,15 @@ def get_location(geolocation_db_client: GeolocationDB, proxy: str) -> tuple[floa
 
                         break
                     except Exception as exp:
-                        logger.debug(exp)
-                        logger.error(
-                            f"Couldn't find latitude and longitude for {ip_address}! "
-                            f"Retrying after {sleep_seconds} seconds..."
+                        log.debug(
+                            "proxy",
+                            "Geolocation lookup attempt failed",
+                            fields={"source": "ipconfig.io", "error": str(exp)},
+                        )
+                        log.error(
+                            "proxy",
+                            "Couldn't find latitude and longitude! Retrying after",
+                            fields={"ip_address": ip_address, "retry_after_s": sleep_seconds},
                         )
 
                         retry_count += 1
@@ -281,14 +329,26 @@ def get_location(geolocation_db_client: GeolocationDB, proxy: str) -> tuple[floa
             sleep(0.5 * config.behavior.wait_factor)
 
         if latitude and longitude and country_code:
-            logger.debug(f"Latitude and longitude for {ip_address}: ({latitude}, {longitude})")
-            logger.debug(f"Country code for {ip_address}: {country_code}")
+            log.debug(
+                "proxy",
+                "Latitude and longitude",
+                fields={"ip_address": ip_address, "latitude": latitude, "longitude": longitude},
+            )
+            log.debug(
+                "proxy",
+                "Country code",
+                fields={"ip_address": ip_address, "country_code": country_code},
+            )
 
             geolocation_db_client.save_geolocation(ip_address, latitude, longitude, country_code)
 
             return (latitude, longitude, country_code, timezone)
         else:
-            logger.error(f"Couldn't find latitude, longitude, and country_code for {ip_address}!")
+            log.error(
+                "proxy",
+                "Couldn't find latitude, longitude, and country_code!",
+                fields={"ip_address": ip_address},
+            )
             return (None, None, None, None)
 
 
@@ -332,7 +392,7 @@ def get_domains() -> list[str]:
             for domain in domainsfile.read().splitlines()
         ]
 
-    logger.debug(f"Domains: {domains}")
+    log.debug("click", "Domains", fields={"domains": domains})
 
     # blank lines would match any domain
     return [domain for domain in domains if domain]
@@ -350,13 +410,13 @@ def add_cookies(driver: undetected_chromedriver.Chrome) -> None:
     if not filepath.exists():
         raise SystemExit("Missing cookies.txt file!")
 
-    logger.info(f"Adding cookies from {filepath}")
+    log.info("browser", "Adding cookies from", fields={"path": str(filepath)})
 
     with open(filepath, encoding="utf-8") as cookie_file:
         try:
             cookies = json.loads(cookie_file.read())
         except Exception:
-            logger.error("Failed to read cookies file. Check format and try again.")
+            log.error("browser", "Failed to read cookies file. Check format and try again.")
             raise SystemExit()
 
     for cookie in cookies:
@@ -393,7 +453,7 @@ def solve_recaptcha(
     :returns: Response code obtained from the service or None
     """
 
-    logger.info("Trying to solve captcha...")
+    log.info("captcha", "Trying to solve captcha...")
 
     api_url = "http://2captcha.com/in.php"
     params = {
@@ -413,7 +473,7 @@ def solve_recaptcha(
     while request_retry_count < max_retry_count:
         response = requests.get(api_url, params=params)
 
-        logger.debug(f"Response: {response.text}")
+        log.debug("captcha", "Response", fields={"response": response.text})
 
         error_to_exit, error_to_continue, error_to_break = _check_error(response.text)
 
@@ -422,7 +482,7 @@ def solve_recaptcha(
 
         elif error_to_break:
             request_id = response.text.split("|")[1]
-            logger.debug(f"request_id: {request_id}")
+            log.debug("captcha", "request_id", fields={"request_id": request_id})
             break
 
         elif error_to_continue:
@@ -442,7 +502,7 @@ def solve_recaptcha(
     while response_retry_count < max_retry_count:
         response = requests.get(response_api_url, params=params)
 
-        logger.debug(f"Response: {response.text}")
+        log.debug("captcha", "Response", fields={"response": response.text})
 
         error_to_exit, error_to_continue, error_to_break = _check_error(
             response.text, request_type="res_php"
@@ -461,7 +521,7 @@ def solve_recaptcha(
                 return captcha_response
 
     if not captcha_response:
-        logger.error("Failed to solve captcha!")
+        log.error("captcha", "Failed to solve captcha!")
 
     return captcha_response
 
@@ -479,7 +539,7 @@ def take_screenshot(driver: undetected_chromedriver.Chrome) -> None:
     if driver:
         driver.save_screenshot(filename)
         sleep(get_random_sleep(1, 1.5) * config.behavior.wait_factor)
-        logger.info(f"Saved screenshot during exception as {filename}")
+        log.info("browser", "Saved screenshot during exception as", fields={"filename": filename})
 
 
 def generate_click_report(click_results: list[tuple[str, str, str]], report_date: str) -> None:
@@ -528,7 +588,7 @@ def generate_click_report(click_results: list[tuple[str, str, str]], report_date
 
     workbook.save(click_report_file)
 
-    logger.info(f"Results were written to {click_report_file}")
+    log.info("click", "Results were written to", fields={"path": str(click_report_file)})
 
 
 def get_random_sleep(start: float, end: float) -> float:
@@ -556,64 +616,74 @@ def _check_error(response_text: str, request_type: str = "in_php") -> tuple[bool
     :returns: Flags for exit, continue, and break
     """
 
-    logger.debug("Checking error code...")
+    log.debug("captcha", "Checking error code...")
 
     error_to_exit, error_to_continue, error_to_break = False, False, False
     error_wait = 5 * config.behavior.wait_factor
 
     if request_type == "in_php":
         if "ERROR_WRONG_USER_KEY" in response_text or "ERROR_KEY_DOES_NOT_EXIST" in response_text:
-            logger.error("Invalid API key. Please check your 2captcha API key.")
+            log.error("captcha", "Invalid API key. Please check your 2captcha API key.")
             error_to_exit = True
 
         elif "ERROR_ZERO_BALANCE" in response_text:
-            logger.error("You don't have funds on your account. Please load your account.")
+            log.error("captcha", "You don't have funds on your account. Please load your account.")
             error_to_exit = True
 
         elif "ERROR_NO_SLOT_AVAILABLE" in response_text:
-            logger.error(
-                "The queue of your captchas that are not distributed to workers is too long."
+            log.error(
+                "captcha",
+                "The queue of your captchas that are not distributed to workers is too long.",
             )
-            logger.info(f"Waiting {error_wait} seconds before sending new request...")
+            log.info(
+                "captcha",
+                "Waiting before sending new request...",
+                fields={"wait_s": error_wait},
+            )
             sleep(error_wait)
 
             error_to_continue = True
 
         elif "IP_BANNED" in response_text:
-            logger.error(
-                "Your IP address is banned due to many frequent attempts to access the server"
+            log.error(
+                "captcha",
+                "Your IP address is banned due to many frequent attempts to access the server",
             )
             error_to_exit = True
 
         elif "ERROR_GOOGLEKEY" in response_text:
-            logger.error("Blank or malformed sitekey.")
+            log.error("captcha", "Blank or malformed sitekey.")
             error_to_exit = True
 
         else:
-            logger.debug(response_text)
+            log.debug("captcha", "2captcha response", fields={"response": response_text})
             error_to_break = True
 
     elif request_type == "res_php":
         if "ERROR_WRONG_USER_KEY" in response_text or "ERROR_KEY_DOES_NOT_EXIST" in response_text:
-            logger.error("Invalid API key. Please check your 2captcha API key.")
+            log.error("captcha", "Invalid API key. Please check your 2captcha API key.")
             error_to_exit = True
 
         elif "ERROR_CAPTCHA_UNSOLVABLE" in response_text:
-            logger.error("Unable to solve the captcha.")
+            log.error("captcha", "Unable to solve the captcha.")
             error_to_exit = True
 
         elif "CAPCHA_NOT_READY" in response_text:
-            logger.info(f"Waiting {error_wait} seconds before checking response again...")
+            log.info(
+                "captcha",
+                "Waiting before checking response again...",
+                fields={"wait_s": error_wait},
+            )
             sleep(error_wait)
 
             error_to_continue = True
 
         else:
-            logger.debug(response_text)
+            log.debug("captcha", "2captcha response", fields={"response": response_text})
             error_to_break = True
 
     else:
-        logger.error(f"Wrong request type: {request_type}")
+        log.error("captcha", "Wrong request type", fields={"request_type": request_type})
 
     return (error_to_exit, error_to_continue, error_to_break)
 
@@ -627,14 +697,18 @@ def get_locale_language(country_code: str) -> str:
     :returns: Locale language for the given country code
     """
 
-    logger.debug(f"Getting locale language for {country_code}...")
+    log.debug("browser", "Getting locale language...", fields={"country_code": country_code})
 
     with open("country_to_locale.json", "r") as locales_file:
         locales = json.load(locales_file)
 
     locale_language = locales.get(country_code, ["en"])
 
-    logger.debug(f"Locale language code for {country_code}: {locale_language[0]}")
+    log.debug(
+        "browser",
+        "Locale language code",
+        fields={"country_code": country_code, "language": locale_language[0]},
+    )
 
     return locale_language
 
@@ -653,7 +727,11 @@ def resolve_redirect(url: str) -> str:
         return response.url
 
     except requests.RequestException as exp:
-        logger.error(f"Error resolving URL redirection: {exp}")
+        log.error(
+            "click",
+            "Error resolving URL redirection",
+            fields={"error": str(exp)},
+        )
         return url
 
 
@@ -673,13 +751,23 @@ def _make_boost_request(url: str, proxy: str, user_agent: str) -> None:
 
     try:
         response = requests.get(url, headers=headers, proxies=proxy_config, timeout=5)
-        logger.debug(
-            f"Boosted [{url}] via [{proxy.split('@')[1] if '@' in proxy else proxy}] "
-            f"UA={headers['User-Agent']}, Response code: {response.status_code}"
+        log.debug(
+            "proxy",
+            "Boosted",
+            fields={
+                "url": url,
+                "proxy": proxy.split("@")[1] if "@" in proxy else proxy,
+                "user_agent": headers["User-Agent"],
+                "status_code": response.status_code,
+            },
         )
 
     except Exception as exp:
-        logger.debug(f"Boost request failed for [{url}] via [{proxy}]: {exp}")
+        log.debug(
+            "proxy",
+            "Boost request failed",
+            fields={"url": url, "proxy": proxy, "error": str(exp)},
+        )
 
 
 def boost_requests(url: str) -> None:
@@ -689,7 +777,7 @@ def boost_requests(url: str) -> None:
     :param url: Input URL to send requests to
     """
 
-    logger.debug(f"Sending 10 requests to [{url}]...")
+    log.debug("proxy", "Sending 10 requests to", fields={"url": url})
 
     proxies = get_proxies()
     user_agents = _get_user_agents(config.paths.user_agents)

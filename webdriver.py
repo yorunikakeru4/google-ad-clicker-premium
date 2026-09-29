@@ -13,10 +13,13 @@ import seleniumbase
 import undetected_chromedriver
 
 from config_reader import config
+from engine.log import get_logger
 from geolocation_db import GeolocationDB
-from logger import logger
 from proxy import install_plugin
 from utils import get_location, get_locale_language, get_random_sleep
+
+
+log = get_logger()
 
 
 IS_POSIX = sys.platform.startswith(("cygwin", "linux"))
@@ -28,7 +31,6 @@ class CustomChrome(undetected_chromedriver.Chrome):
     def quit(self):
 
         try:
-            # logger.debug("Terminating the browser")
             os.kill(self.browser_pid, 15)
             if IS_POSIX:
                 os.waitpid(self.browser_pid, 0)
@@ -37,23 +39,21 @@ class CustomChrome(undetected_chromedriver.Chrome):
         except (AttributeError, ChildProcessError, RuntimeError, OSError):
             pass
         except TimeoutError as e:
-            logger.debug(e, exc_info=True)
+            log.debug("browser", str(e), fields={"error_type": type(e).__name__}, exc_info=e)
         except Exception as e:
             # quit() не должен ронять завершение, но молча глотать ошибку
             # нельзя: без записи в лог падение браузера при выходе
             # недиагностируемо.
-            logger.debug(e, exc_info=True)
+            log.debug("browser", str(e), fields={"error_type": type(e).__name__}, exc_info=e)
 
         if hasattr(self, "service") and getattr(self.service, "process", None):
-            # logger.debug("Stopping webdriver service")
-            self.service.stop()
+                self.service.stop()
 
         try:
             if self.reactor:
-                # logger.debug("Shutting down Reactor")
                 self.reactor.event.set()
         except Exception as e:
-            logger.debug(e, exc_info=True)
+            log.debug("browser", str(e), fields={"error_type": type(e).__name__}, exc_info=e)
 
         if (
             hasattr(self, "keep_user_data_dir")
@@ -66,12 +66,12 @@ class CustomChrome(undetected_chromedriver.Chrome):
                 except FileNotFoundError:
                     pass
                 except (RuntimeError, OSError, PermissionError) as e:
-                    logger.debug(
-                        "When removing the temp profile, a %s occured: %s\nretrying..."
-                        % (e.__class__.__name__, e)
+                    log.debug(
+                        "browser",
+                        "When removing the temp profile, retrying...",
+                        fields={"error_type": e.__class__.__name__, "error": str(e)},
                     )
                 else:
-                    # logger.debug("successfully removed %s" % self.user_data_dir)
                     break
 
                 sleep(0.1 * config.behavior.wait_factor)
@@ -129,7 +129,7 @@ def create_webdriver(
     """
 
     if config.webdriver.use_seleniumbase:
-        logger.debug("Using SeleniumBase...")
+        log.debug("browser", "Using SeleniumBase...")
         return create_seleniumbase_driver(proxy, user_agent)
 
     geolocation_db_client = GeolocationDB()
@@ -217,13 +217,13 @@ def create_webdriver(
             masked_password = password[:3] + "***" + password[-3:] if len(password) > 6 else "***"
             masked_proxy = f"{masked_username}:{masked_password}@{host}:{port}"
 
-            logger.info(f"Using proxy: {masked_proxy}")
-            logger.debug(f"Using proxy: {proxy}")
+            log.info("proxy", "Using proxy", fields={"proxy": masked_proxy})
+            log.debug("proxy", "Using proxy", fields={"proxy": proxy})
 
             install_plugin(chrome_options, host, int(port), username, password, plugin_folder_name)
             sleep(2 * config.behavior.wait_factor)
         else:
-            logger.info(f"Using proxy: {proxy}")
+            log.info("proxy", "Using proxy", fields={"proxy": proxy})
             chrome_options.add_argument(f"--proxy-server={proxy}")
 
         # get location of the proxy IP
@@ -262,8 +262,13 @@ def create_webdriver(
 
             driver.execute_cdp_cmd("Emulation.setTimezoneOverride", {"timezoneId": timezone})
 
-            logger.debug(
-                f"Timezone of {proxy.split('@')[1] if config.webdriver.auth else proxy}: {timezone}"
+            log.debug(
+                "browser",
+                "Timezone of",
+                fields={
+                    "proxy": proxy.split("@")[1] if config.webdriver.auth else proxy,
+                    "timezone": timezone,
+                },
             )
 
     else:
@@ -278,10 +283,10 @@ def create_webdriver(
 
     if config.webdriver.window_size:
         width, height = config.webdriver.window_size.split(",")
-        logger.debug(f"Setting window size as {width}x{height} px")
+        log.debug("browser", "Setting window size", fields={"width": width, "height": height})
         driver.set_window_size(width, height)
     else:
-        logger.debug("Maximizing window...")
+        log.debug("browser", "Maximizing window...")
         driver.maximize_window()
 
     if config.webdriver.shift_windows:
@@ -326,10 +331,10 @@ def create_seleniumbase_driver(
             masked_password = password[:3] + "***" + password[-3:] if len(password) > 6 else "***"
             masked_proxy = f"{masked_username}:{masked_password}@{host}:{port}"
 
-            logger.info(f"Using proxy: {masked_proxy}")
-            logger.debug(f"Using proxy: {proxy}")
+            log.info("proxy", "Using proxy", fields={"proxy": masked_proxy})
+            log.debug("proxy", "Using proxy", fields={"proxy": proxy})
         else:
-            logger.info(f"Using proxy: {proxy}")
+            log.info("proxy", "Using proxy", fields={"proxy": proxy})
 
         # get location of the proxy IP
         lat, long, country_code, timezone = get_location(geolocation_db_client, proxy)
@@ -371,17 +376,22 @@ def create_seleniumbase_driver(
 
         driver.execute_cdp_cmd("Emulation.setTimezoneOverride", {"timezoneId": timezone})
 
-        logger.debug(
-            f"Timezone of {proxy.split('@')[1] if config.webdriver.auth else proxy}: {timezone}"
+        log.debug(
+            "browser",
+            "Timezone of",
+            fields={
+                "proxy": proxy.split("@")[1] if config.webdriver.auth else proxy,
+                "timezone": timezone,
+            },
         )
 
     # handle window size and position
     if config.webdriver.window_size:
         width, height = config.webdriver.window_size.split(",")
-        logger.debug(f"Setting window size as {width}x{height} px")
+        log.debug("browser", "Setting window size", fields={"width": width, "height": height})
         driver.set_window_size(int(width), int(height))
     else:
-        logger.debug("Maximizing window...")
+        log.debug("browser", "Maximizing window...")
         driver.maximize_window()
 
     if config.webdriver.shift_windows:
@@ -432,7 +442,7 @@ def _shift_window_position(
     new_x = min(x + random_x_offset, screen_width - new_width)
     new_y = min(y + random_y_offset, screen_height - new_height)
 
-    logger.debug(f"Setting window position as ({new_x},{new_y})...")
+    log.debug("browser", "Setting window position", fields={"x": new_x, "y": new_y})
 
     driver.set_window_position(new_x, new_y)
     sleep(get_random_sleep(0.1, 0.5) * config.behavior.wait_factor)
@@ -1043,4 +1053,4 @@ def execute_stealth_js_code(driver: Union[undetected_chromedriver.Chrome, seleni
     """
     driver.execute_cdp_cmd("Page.addScriptToEvaluateOnNewDocument", {"source": webrtc_js})
 
-    logger.debug("Applied advanced stealth JavaScript techniques")
+    log.debug("browser", "Applied advanced stealth JavaScript techniques")

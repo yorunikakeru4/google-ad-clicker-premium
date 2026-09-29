@@ -10,9 +10,12 @@ from typing import Optional
 
 from adb import adb_controller
 from config_reader import config
-from logger import logger
+from engine.log import get_logger
 from proxy import get_proxies
 from utils import get_queries
+
+
+log = get_logger()
 
 
 def start_tool(
@@ -57,7 +60,11 @@ def main() -> None:
     MAX_WORKERS = config.behavior.browser_count
 
     if MAX_WORKERS > 1:
-        logger.debug(f"Creating {multi_browser_flag_file} flag file...")
+        log.debug(
+            "scheduler",
+            "Creating flag file...",
+            fields={"path": str(multi_browser_flag_file)},
+        )
         multi_browser_flag_file.touch()
 
     if config.paths.query_file:
@@ -85,7 +92,11 @@ def main() -> None:
     else:
         device_ids = [None] * MAX_WORKERS
 
-    logger.info(f"Running with {MAX_WORKERS} browser{'s' if MAX_WORKERS > 1 else ''}...")
+    log.info(
+        "scheduler",
+        "Running with browsers",
+        fields={"count": MAX_WORKERS},
+    )
 
     # 1st way - different query on each browser (default)
     if config.behavior.multiprocess_style == 1:
@@ -134,7 +145,7 @@ def main() -> None:
                 _, _ = wait(futures)
 
     else:
-        logger.error("Invalid multiprocess style!")
+        log.error("scheduler", "Invalid multiprocess style!")
 
 
 if __name__ == "__main__":
@@ -142,11 +153,19 @@ if __name__ == "__main__":
         main()
 
     except Exception as exp:
-        logger.error("Exception occurred. See the details in the log file.")
+        log.error("scheduler", "Exception occurred. See the details in the log file.")
 
         message = str(exp).split("\n")[0]
-        logger.debug(f"Exception: {message}")
+        log.debug("scheduler", "Exception", fields={"error": message})
         details = traceback.format_tb(exp.__traceback__)
-        logger.debug(f"Exception details: \n{''.join(details)}")
+        log.debug(
+            "scheduler",
+            "Exception details:",
+            fields={"traceback": "".join(details)},
+        )
 
-        logger.debug(f"Exception cause: {exp.__cause__}") if exp.__cause__ else None
+        (
+            log.debug("scheduler", "Exception cause", fields={"cause": str(exp.__cause__)})
+            if exp.__cause__
+            else None
+        )

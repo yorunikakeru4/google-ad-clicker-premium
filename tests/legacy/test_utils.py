@@ -120,7 +120,14 @@ def test_check_error_res_php_breaks_on_solved_captcha(monkeypatch):
 
 def test_check_error_unknown_request_type_returns_no_flags(caplog):
     assert utils._check_error("OK|1", "unknown_type") == (False, False, False)
-    assert "Wrong request type: unknown_type" in caplog.text
+
+    # Текст запроса ушёл в поля, а не в message: проверяем структурную
+    # запись в зеркале legacy-логгера, а не склеенную строку.
+    record = next(
+        entry for entry in caplog.records if entry.getMessage().startswith("Wrong request type")
+    )
+    assert record.category == "captcha"
+    assert record.fields == {"request_type": "unknown_type"}
 
 
 def test_check_error_in_php_treats_res_php_captcha_not_ready_as_success(monkeypatch):
