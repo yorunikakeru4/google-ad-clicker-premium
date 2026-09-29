@@ -208,12 +208,13 @@ class _FakeManager:
 
 
 class _FakeChrome:
-    """CustomChrome без запуска браузера: аргументы и вызовы quit."""
+    """CustomChrome без запуска браузера: аргументы, CDP-вызовы и quit."""
 
     def __init__(self, **kwargs) -> None:
         self.init_kwargs = kwargs
         self.options = kwargs["options"]
         self.quit_calls = 0
+        self.cdp_calls: list[tuple[tuple, dict]] = []
 
     def set_window_size(self, width, height) -> None:
         pass
@@ -222,7 +223,7 @@ class _FakeChrome:
         pass
 
     def execute_cdp_cmd(self, *args, **kwargs) -> None:
-        pass
+        self.cdp_calls.append((args, kwargs))
 
     def quit(self) -> None:
         self.quit_calls += 1
@@ -293,6 +294,49 @@ def no_geolocation(monkeypatch):
     monkeypatch.setattr(
         webdriver, "get_location", lambda client, proxy: (None, None, "US", "Europe/Berlin")
     )
+
+
+@pytest.fixture
+def geolocated_proxy(monkeypatch):
+    """Прокси с координатами: гео-локация и гео-часовой пояс без сети."""
+
+    monkeypatch.setattr(
+        webdriver,
+        "get_location",
+        lambda client, proxy: (52.52, 13.405, "DE", "Europe/Berlin"),
+    )
+
+
+@pytest.fixture
+def assign_profile(tmp_path, monkeypatch):
+    """Профиль в отдельной БД, назначенный процессу через env супервизора."""
+
+    from engine.db import migrations
+    from engine.profile_apply import PROFILE_ID_ENV
+    from engine.profile_pool import ProfilePool
+
+    db = tmp_path / "profiles.db"
+    migrations.migrate(db)
+    monkeypatch.setenv("ADCLICKER_DB", str(db))
+    pool = ProfilePool(db)
+
+    def _assign(**fields):
+        pool.add_profiles([{"name": f"acc-{len(pool.list_profiles()) + 1}", **fields}])
+        row = pool.list_profiles()[-1]
+        monkeypatch.setenv(PROFILE_ID_ENV, str(row["id"]))
+        return row["id"]
+
+    return _assign
+
+
+def _cdp_payloads(driver, command: str) -> list[dict]:
+    """Полезные нагрузки всех вызовов данной CDP-команды.
+
+    Драйвер вызывает ``execute_cdp_cmd(command, payload)`` позиционно, поэтому
+    payload — второй элемент args, а не kwargs.
+    """
+
+    return [args[1] for args, _kwargs in driver.cdp_calls if args and args[0] == command]
 
 
 @pytest.fixture
@@ -618,11 +662,12 @@ class TestProxyDegradation:
 
 
 class _FakeSeleniumBaseDriver:
-    """Драйвер SeleniumBase без браузера: аргументы get_driver и вызовы quit."""
+    """Драйвер SeleniumBase без браузера: аргументы get_driver, CDP и quit."""
 
     def __init__(self, kwargs: dict) -> None:
         self.init_kwargs = kwargs
         self.quit_calls = 0
+        self.cdp_calls: list[tuple[tuple, dict]] = []
 
     def set_window_size(self, width, height) -> None:
         pass
@@ -631,7 +676,7 @@ class _FakeSeleniumBaseDriver:
         pass
 
     def execute_cdp_cmd(self, *args, **kwargs) -> None:
-        pass
+        self.cdp_calls.append((args, kwargs))
 
     def quit(self) -> None:
         self.quit_calls += 1
@@ -762,3 +807,302 @@ class TestSeleniumBaseTransport:
         assert driver.init_kwargs["proxy_string"] is None
         assert proxy_auth_stub.calls == []
         assert install_plugin_stub == []
+
+
+# --- Настройки профиля: локаль и часовой пояс против гео-вычислений ----------
+
+
+class TestProfileSettings:
+    """Профильные locale/timezone главнее гео-вычислений (UC-режим).
+
+    Пустое поле профиля равносильно отсутствующему: прежнее поведение
+    сохраняется строка в строку, и часть тестов ниже — это именно паритет,
+    зафиксированный на случай, если приоритет «случайно» станет
+    безусловным.
+    """
+
+    def test_profile_locale_replaces_the_geo_one(
+        self,
+        isolated_tempdir,
+        fake_chrome,
+        geolocated_proxy,
+        assign_profile,
+        config,
+        monkeypatch,
+        transport,
+    ):
+        transport("direct")
+        monkeypatch.setattr(config.webdriver, "language_from_proxy", True)
+        assign_profile(locale="de-DE")
+
+        driver, _ = webdriver.create_webdriver(PROXY, "Mozilla/5.0", "abcde")
+
+        prefs = driver.options.experimental_options["prefs"]
+        assert prefs["intl.accept_languages"] == "de-DE"
+        assert "--lang=de" in driver.options.arguments
+
+    def test_without_a_profile_the_geo_locale_is_used_unchanged(
+        self,
+        isolated_tempdir,
+        fake_chrome,
+        geolocated_proxy,
+        config,
+        monkeypatch,
+        transport,
+    ):
+        transport("direct")
+        monkeypatch.setattr(config.webdriver, "language_from_proxy", True)
+
+        driver, _ = webdriver.create_webdriver(PROXY, "Mozilla/5.0", "abcde")
+
+        # Квирк legacy зафиксирован намеренно: get_locale_language возвращает
+        # список, и в prefs/--lang он уходит через str() целиком.
+        prefs = driver.options.experimental_options["prefs"]
+        assert prefs["intl.accept_languages"] == str(["de-DE", "en-US"])
+        assert "--lang=['de-DE', 'en-US']" in driver.options.arguments
+
+    def test_empty_profile_locale_keeps_the_geo_one(
+        self,
+        isolated_tempdir,
+        fake_chrome,
+        geolocated_proxy,
+        assign_profile,
+        config,
+        monkeypatch,
+        transport,
+    ):
+        transport("direct")
+        monkeypatch.setattr(config.webdriver, "language_from_proxy", True)
+        assign_profile(locale="   ")
+
+        driver, _ = webdriver.create_webdriver(PROXY, "Mozilla/5.0", "abcde")
+
+        prefs = driver.options.experimental_options["prefs"]
+        assert prefs["intl.accept_languages"] == str(["de-DE", "en-US"])
+
+    def test_profile_locale_is_applied_without_the_geo_flag(
+        self,
+        isolated_tempdir,
+        fake_chrome,
+        geolocated_proxy,
+        assign_profile,
+        config,
+        monkeypatch,
+        transport,
+    ):
+        transport("direct")
+        assign_profile(locale="fr-FR")
+
+        driver, _ = webdriver.create_webdriver(PROXY, "Mozilla/5.0", "abcde")
+
+        prefs = driver.options.experimental_options["prefs"]
+        assert prefs["intl.accept_languages"] == "fr-FR"
+        assert "--lang=fr" in driver.options.arguments
+
+    def test_disabled_geo_flag_without_profile_leaves_locale_alone(
+        self, isolated_tempdir, fake_chrome, geolocated_proxy, transport
+    ):
+        transport("direct")
+
+        driver, _ = webdriver.create_webdriver(PROXY, "Mozilla/5.0", "abcde")
+
+        prefs = driver.options.experimental_options.get("prefs", {})
+        assert "intl.accept_languages" not in prefs
+
+    def test_profile_locale_is_applied_without_a_proxy(
+        self, isolated_tempdir, fake_chrome, assign_profile, transport
+    ):
+        transport("direct")
+        assign_profile(locale="it-IT")
+
+        driver, _ = webdriver.create_webdriver("", "Mozilla/5.0", "abcde")
+
+        prefs = driver.options.experimental_options["prefs"]
+        assert prefs["intl.accept_languages"] == "it-IT"
+
+    def test_profile_timezone_replaces_the_geo_one(
+        self,
+        isolated_tempdir,
+        fake_chrome,
+        geolocated_proxy,
+        assign_profile,
+        transport,
+    ):
+        transport("direct")
+        assign_profile(timezone="Europe/Paris")
+
+        driver, _ = webdriver.create_webdriver(PROXY, "Mozilla/5.0", "abcde")
+
+        assert _cdp_payloads(driver, "Emulation.setTimezoneOverride") == [
+            {"timezoneId": "Europe/Paris"}
+        ]
+        assert driver._custom_timezone == "Europe/Paris"
+        # Геолокация при этом продолжает применяться — меняется только пояс.
+        assert _cdp_payloads(driver, "Emulation.setGeolocationOverride")
+
+    def test_without_a_profile_the_geo_timezone_is_used_unchanged(
+        self, isolated_tempdir, fake_chrome, geolocated_proxy, transport
+    ):
+        transport("direct")
+
+        driver, _ = webdriver.create_webdriver(PROXY, "Mozilla/5.0", "abcde")
+
+        assert _cdp_payloads(driver, "Emulation.setTimezoneOverride") == [
+            {"timezoneId": "Europe/Berlin"}
+        ]
+        assert driver._custom_timezone == "Europe/Berlin"
+
+    def test_profile_timezone_is_applied_without_geo_coordinates(
+        self, isolated_tempdir, fake_chrome, no_geolocation, assign_profile, transport
+    ):
+        transport("direct")
+        assign_profile(timezone="Europe/Paris")
+
+        driver, _ = webdriver.create_webdriver(PROXY, "Mozilla/5.0", "abcde")
+
+        assert _cdp_payloads(driver, "Emulation.setTimezoneOverride") == [
+            {"timezoneId": "Europe/Paris"}
+        ]
+        assert _cdp_payloads(driver, "Emulation.setGeolocationOverride") == []
+
+    def test_without_coordinates_and_without_profile_no_timezone_is_set(
+        self, isolated_tempdir, fake_chrome, no_geolocation, transport
+    ):
+        transport("direct")
+
+        driver, _ = webdriver.create_webdriver(PROXY, "Mozilla/5.0", "abcde")
+
+        # Паритет: legacy не ставил пояс, пока координат нет, даже если
+        # get_location вернул часовой пояс отдельно от широты/долготы.
+        assert _cdp_payloads(driver, "Emulation.setTimezoneOverride") == []
+        assert not hasattr(driver, "_custom_timezone")
+
+    def test_profile_timezone_is_applied_without_a_proxy(
+        self, isolated_tempdir, fake_chrome, assign_profile, transport
+    ):
+        transport("direct")
+        assign_profile(timezone="Europe/Paris")
+
+        driver, _ = webdriver.create_webdriver("", "Mozilla/5.0", "abcde")
+
+        assert _cdp_payloads(driver, "Emulation.setTimezoneOverride") == [
+            {"timezoneId": "Europe/Paris"}
+        ]
+
+    def test_user_agent_reaches_chrome_as_an_argument(
+        self, isolated_tempdir, fake_chrome, no_geolocation, transport
+    ):
+        transport("direct")
+
+        driver, _ = webdriver.create_webdriver(PROXY, "Profile-UA", "abcde")
+
+        assert "--user-agent=Profile-UA" in driver.options.arguments
+
+
+class TestProfileSettingsSeleniumBase:
+    """Те же настройки в режиме use_seleniumbase: хук не привязан к UC."""
+
+    def test_profile_locale_replaces_the_geo_one(
+        self,
+        isolated_tempdir,
+        seleniumbase_mode,
+        seleniumbase_stub,
+        geolocated_proxy,
+        assign_profile,
+        config,
+        monkeypatch,
+        transport,
+    ):
+        transport("direct")
+        monkeypatch.setattr(config.webdriver, "language_from_proxy", True)
+        assign_profile(locale="de-DE")
+
+        driver, _ = webdriver.create_webdriver(PROXY, "Mozilla/5.0", "abcde")
+
+        assert driver.init_kwargs["locale_code"] == "de-DE"
+
+    def test_without_a_profile_the_geo_locale_is_used_unchanged(
+        self,
+        isolated_tempdir,
+        seleniumbase_mode,
+        seleniumbase_stub,
+        geolocated_proxy,
+        config,
+        monkeypatch,
+        transport,
+    ):
+        transport("direct")
+        monkeypatch.setattr(config.webdriver, "language_from_proxy", True)
+
+        driver, _ = webdriver.create_webdriver(PROXY, "Mozilla/5.0", "abcde")
+
+        assert driver.init_kwargs["locale_code"] == str(["de-DE", "en-US"])
+
+    def test_without_the_geo_flag_and_without_profile_locale_code_is_none(
+        self,
+        isolated_tempdir,
+        seleniumbase_mode,
+        seleniumbase_stub,
+        geolocated_proxy,
+        transport,
+    ):
+        transport("direct")
+
+        driver, _ = webdriver.create_webdriver(PROXY, "Mozilla/5.0", "abcde")
+
+        assert driver.init_kwargs["locale_code"] is None
+
+    def test_profile_locale_is_applied_without_a_proxy(
+        self, isolated_tempdir, seleniumbase_mode, seleniumbase_stub, assign_profile, transport
+    ):
+        transport("direct")
+        assign_profile(locale="it-IT")
+
+        driver, _ = webdriver.create_webdriver("", "Mozilla/5.0", "abcde")
+
+        assert driver.init_kwargs["locale_code"] == "it-IT"
+
+    def test_user_agent_reaches_the_seleniumbase_driver(
+        self, isolated_tempdir, seleniumbase_mode, seleniumbase_stub, no_geolocation, transport
+    ):
+        transport("direct")
+
+        driver, _ = webdriver.create_webdriver(PROXY, "Profile-UA", "abcde")
+
+        assert driver.init_kwargs["user_agent"] == "Profile-UA"
+
+    def test_profile_timezone_replaces_the_geo_one(
+        self,
+        isolated_tempdir,
+        seleniumbase_mode,
+        seleniumbase_stub,
+        geolocated_proxy,
+        assign_profile,
+        transport,
+    ):
+        transport("direct")
+        assign_profile(timezone="Europe/Paris")
+
+        driver, _ = webdriver.create_webdriver(PROXY, "Mozilla/5.0", "abcde")
+
+        assert _cdp_payloads(driver, "Emulation.setTimezoneOverride") == [
+            {"timezoneId": "Europe/Paris"}
+        ]
+        assert driver._custom_timezone == "Europe/Paris"
+
+    def test_without_a_profile_the_geo_timezone_is_used_unchanged(
+        self,
+        isolated_tempdir,
+        seleniumbase_mode,
+        seleniumbase_stub,
+        geolocated_proxy,
+        transport,
+    ):
+        transport("direct")
+
+        driver, _ = webdriver.create_webdriver(PROXY, "Mozilla/5.0", "abcde")
+
+        assert _cdp_payloads(driver, "Emulation.setTimezoneOverride") == [
+            {"timezoneId": "Europe/Berlin"}
+        ]
+        assert driver._custom_timezone == "Europe/Berlin"
