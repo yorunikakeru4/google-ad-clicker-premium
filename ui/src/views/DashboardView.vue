@@ -1,20 +1,26 @@
 <script setup lang="ts">
-// Dashboard (план §5, фаза 4): успешные/неуспешные сценарии, аптайм демона,
-// запросы/час как проверяемое утверждение ≥50, доля CAPTCHA с порогом 5%
-// и три графика (клики/час, CAPTCHA по часам, нагрузка на воркеры).
-// Под метриками — таблица воркеров из /state (WorkersTable): опрос и AppShell,
-// экран только читает снимок.
+// Dashboard (план §5, фазы 4 и 8): успешные/неуспешные сценарии, аптайм
+// демона, запросы/час как проверяемое утверждение ≥50, доля CAPTCHA с
+// порогом 5% и три графика (клики/час, CAPTCHA по часам, нагрузка на
+// воркеры). Под метриками — таблица воркеров из /state (WorkersTable): опрос
+// и AppShell, экран только читает снимок; воркеры с нерешённой капчей за
+// 30 минут получают warning-чип — значение приходит из ленты CAPTCHA,
+// отдельного запроса по воркерам нет. Ниже — лента последних событий
+// CAPTCHA с кнопкой скриншота и всплывающее уведомление о новом событии.
 //
 // Вёрстка — шаблон экрана: PageLayout + MetricCard + StatusChip. Пороговые
 // правила остаются в lib/thresholds, данные — в useDashboard: карточка только
 // показывает утверждение цветом и текстом, ничего не пересчитывает.
 import { computed, onMounted, onUnmounted } from "vue";
 import BarChartCard from "../components/charts/BarChartCard.vue";
+import CaptchaFeedCard from "../components/data/CaptchaFeedCard.vue";
 import DbUnavailableAlert from "../components/DbUnavailableAlert.vue";
 import MetricCard from "../components/data/MetricCard.vue";
 import PageLayout from "../components/layout/PageLayout.vue";
+import CaptchaNoticeAlert from "../components/status/CaptchaNoticeAlert.vue";
 import WorkersTable from "../components/WorkersTable.vue";
 import type { StatusKind } from "../constants/statusMap";
+import { useCaptchaFeed } from "../composables/useCaptchaFeed";
 import { useDashboard } from "../composables/useDashboard";
 import { useDaemonStatus } from "../composables/useDaemonStatus";
 import { useDb } from "../composables/useDb";
@@ -29,6 +35,9 @@ import {
 
 const db = useDb();
 const dash = useDashboard();
+// Лента CAPTCHA: события, уведомления о новых и подсветка воркеров —
+// один цикл опроса на экран, как у метрик.
+const feed = useCaptchaFeed();
 // Опрос /state уже идёт в AppShell: здесь читается тот же снимок, без
 // собственного интервала (план §5, фаза 4).
 const daemon = useDaemonStatus();
@@ -36,8 +45,12 @@ const daemon = useDaemonStatus();
 onMounted(() => {
   void db.ensureOpen();
   dash.start();
+  void feed.start();
 });
-onUnmounted(() => dash.stop());
+onUnmounted(() => {
+  dash.stop();
+  feed.stop();
+});
 
 const requestsStatus = computed(() => {
   const load = dash.requests.value;
@@ -104,6 +117,12 @@ const demoWindowHint = "окно 24 часа";
 <template>
   <PageLayout title="Dashboard" subtitle="Сценарии, запросы/час и доля CAPTCHA">
     <DbUnavailableAlert class="mb-4" />
+
+    <!-- Уведомление о новом событии: очередь и дедупликация — в composable -->
+    <CaptchaNoticeAlert
+      :notice="feed.notice.value"
+      @dismiss="feed.dismiss"
+    />
 
     <v-alert
       v-if="dash.error.value"
@@ -201,12 +220,26 @@ const demoWindowHint = "окно 24 часа";
       </v-col>
     </v-row>
 
-    <!-- Воркеры из /state: под метриками, до графиков (план §5, фаза 4) -->
+    <!-- Воркеры из /state: под метриками, до графиков (план §5, фаза 4).
+         Подсветка CAPTCHA — производная от ленты ниже, не новый запрос. -->
     <v-row dense class="mt-1">
       <v-col cols="12">
         <WorkersTable
           :phase="daemon.state.value.phase"
           :snapshot="daemon.state.value.snapshot"
+          :captcha-alert-ids="feed.alertIds.value"
+        />
+      </v-col>
+    </v-row>
+
+    <!-- Лента событий CAPTCHA: последние строки captcha_events -->
+    <v-row dense class="mt-1">
+      <v-col cols="12">
+        <CaptchaFeedCard
+          :events="feed.events.value"
+          :error="feed.error.value"
+          :screenshot-error="feed.screenshotError.value"
+          @open-screenshot="feed.openShot"
         />
       </v-col>
     </v-row>
@@ -241,5 +274,6 @@ const demoWindowHint = "окно 24 часа";
         />
       </v-col>
     </v-row>
+
   </PageLayout>
 </template>

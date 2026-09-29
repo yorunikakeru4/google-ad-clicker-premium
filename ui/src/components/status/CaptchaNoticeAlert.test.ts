@@ -6,7 +6,7 @@ import { describe, expect, it } from "vitest";
 import { createSSRApp, h, type Component } from "vue";
 import { renderToString } from "vue/server-renderer";
 import vuetify from "../../plugins/vuetify";
-import CaptchaNoticeSnackbar from "./CaptchaNoticeSnackbar.vue";
+import CaptchaNoticeAlert from "./CaptchaNoticeAlert.vue";
 import type { CaptchaNotice } from "../../lib/captcha";
 
 async function render(
@@ -28,20 +28,21 @@ function notice(overrides: Partial<CaptchaNotice> = {}): CaptchaNotice {
   };
 }
 
-describe("CaptchaNoticeSnackbar", () => {
+describe("CaptchaNoticeAlert", () => {
   it("уведомление показывает воркера и исход решения", async () => {
-    const html = await render(CaptchaNoticeSnackbar, {
+    const html = await render(CaptchaNoticeAlert, {
       notice: notice(),
     });
 
     expect(html).toContain('data-test="captcha-notice"');
+    expect(html).toContain('data-test="captcha-notice-text"');
     expect(html).toContain("CAPTCHA · br-7 — не решена");
     expect(html).toContain('data-test="captcha-notice-close"');
     expect(html).toContain("Закрыть");
   });
 
   it("решённая капча подписывается иначе, а не той же строкой", async () => {
-    const html = await render(CaptchaNoticeSnackbar, {
+    const html = await render(CaptchaNoticeAlert, {
       notice: notice({ solved: true }),
     });
 
@@ -50,7 +51,7 @@ describe("CaptchaNoticeSnackbar", () => {
   });
 
   it("уведомления нет — всплывашки нет в разметке вовсе", async () => {
-    const html = await render(CaptchaNoticeSnackbar, { notice: null });
+    const html = await render(CaptchaNoticeAlert, { notice: null });
 
     expect(html).not.toContain("captcha-notice");
     expect(html).not.toContain("CAPTCHA ·");

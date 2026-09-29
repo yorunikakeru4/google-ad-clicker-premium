@@ -25,6 +25,7 @@ function event(
   overrides: Partial<CaptchaEvent> = {},
 ): CaptchaEvent {
   return {
+    id,
     ts: AT,
     browser_id: "br-1",
     proxy_id: null,
@@ -44,6 +45,24 @@ function rowOf(html: string, id: number): string {
   if (at === -1) return "";
   const end = html.indexOf("</tr>", at);
   return end === -1 ? html.slice(at) : html.slice(at, end);
+}
+
+/**
+ * Видимый текст ячейки: от `>` с data-test до ближайшего closeTag — так
+ * атрибуты (title с полным адресом) не попадают в «текст» строки.
+ */
+function textOf(html: string, test: string, closeTag = "</span>"): string {
+  const at = html.indexOf(`data-test="${test}"`);
+  if (at === -1) return "";
+  const open = html.indexOf(">", at);
+  if (open === -1) return "";
+  const start = open + 1;
+  const end = html.indexOf(closeTag, start);
+  const chunk = end === -1 ? html.slice(start) : html.slice(start, end);
+  return chunk
+    .replace(/<[^>]*>/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
 }
 
 function card(events: CaptchaEvent[], extra: Record<string, unknown> = {}) {
@@ -86,10 +105,14 @@ describe("CaptchaFeedCard: строки событий", () => {
     const url = "https://www.google.com/search?q=captcha+threshold+policy+demo";
     const html = await card([event(1, { page_url: url })]);
 
+    // Полный адрес доступен глазами через title ячейки...
     expect(html).toContain(`title="${url}"`);
-    const cell = rowOf(html, 1);
-    expect(cell).not.toContain(url);
-    expect(cell).toContain("…");
+
+    // ...а видимый текст — усечённая подпись, а не вся строка ссылки.
+    const label = textOf(html, "captcha-page-1");
+    expect(label).not.toBe(url);
+    expect(label.endsWith("…")).toBe(true);
+    expect(label.length).toBeLessThanOrEqual(60);
     expect(html).toContain('data-test="captcha-browser-1"');
   });
 

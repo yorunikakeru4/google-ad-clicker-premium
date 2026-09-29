@@ -9,7 +9,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   CAPTCHA_FEED_POLL_MS,
   createCaptchaFeed,
-  type CaptchaFeedOptions,
+  type CreateCaptchaFeedOptions,
 } from "./useCaptchaFeed";
 import {
   CAPTCHA_FEED_LIMIT,
@@ -19,12 +19,15 @@ import {
 import type { DbApi } from "../lib/dbApi";
 
 const NOW = 1_760_000_000;
+/** Часы composable — эпоха в миллисекундах (как Date.now). */
+const NOW_MS = NOW * 1000;
 
 function event(
   id: number,
   overrides: Partial<CaptchaEvent> = {},
 ): CaptchaEvent {
   return {
+    id,
     ts: NOW - 5,
     browser_id: "br-1",
     proxy_id: null,
@@ -53,8 +56,8 @@ function fakeApi(rows: CaptchaEvent[] = []) {
   return { api, state };
 }
 
-function options(extra: Partial<CaptchaFeedOptions> = {}): CaptchaFeedOptions {
-  return { isReady: () => true, now: () => NOW, pollMs: 1000, ...extra };
+function options(extra: Partial<CreateCaptchaFeedOptions> = {}): CreateCaptchaFeedOptions {
+  return { isReady: () => true, now: () => NOW_MS, pollMs: 1000, ...extra };
 }
 
 beforeEach(() => vi.useFakeTimers());
