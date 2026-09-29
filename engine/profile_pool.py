@@ -356,6 +356,22 @@ class ProfilePool:
             rows = conn.execute(sql).fetchall()
         return [_row_to_dict(row) for row in rows]
 
+    def get_profile(self, profile_id: Any) -> dict[str, Any] | None:
+        """Строка профиля для чтения. None — строки нет или id вне контракта.
+
+        Read-only путь для воркера (:mod:`engine.profile_apply`): ему нужны
+        настройки профиля, а не разрешение работать — никаких проверок
+        статуса и владения здесь нет, их делает машина статусов в
+        :meth:`mark_active`/`:meth:`mark_done`. Логика ``fields`` та же, что
+        в :meth:`list_profiles`: повреждённый JSON не валит чтение.
+        """
+
+        if isinstance(profile_id, bool) or not isinstance(profile_id, int) or profile_id < 1:
+            return None
+        with self._connect() as conn:
+            row = conn.execute("SELECT * FROM profiles WHERE id = ?", (profile_id,)).fetchone()
+        return None if row is None else _row_to_dict(row)
+
     def assigned_profile_ids(self) -> set[int]:
         """Id профилей, которые должны держать воркеры (``assigned``/``active``).
 
