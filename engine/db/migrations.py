@@ -31,7 +31,9 @@ SCHEMA_FILE = DB_DIR / "schema.sql"
 MIGRATIONS_DIR = DB_DIR / "migrations"
 
 # Повышается только вместе с новым файлом в MIGRATIONS_DIR.
-SCHEMA_VERSION = 1
+# 2 — колонка profiles.fields и нормализация статуса new → free
+# (migrations/002_profile_fields.sql).
+SCHEMA_VERSION = 2
 
 # Движок пишет из нескольких воркеров, UI читает одновременно. WAL снимает
 # блокировку между ними, busy_timeout ждёт освобождения вместо ошибки.

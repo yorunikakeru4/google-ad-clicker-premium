@@ -13,6 +13,12 @@ PRAGMA foreign_keys = ON;
 
 
 -- Аккаунты/ключи, с которыми работает кликер.
+--
+-- status — машина статусов engine/profile_pool.py: free | assigned | active |
+-- error | blocked. Системные переходы (назначение, работа, освобождение)
+-- делает пул, оператору через API доступны free|blocked|error.
+-- fields — произвольные поля профиля в JSON (объект), тот же формат, что и
+-- у logs.fields: текст в БД, объект на границе API.
 CREATE TABLE IF NOT EXISTS profiles (
     id           INTEGER PRIMARY KEY,
     name         TEXT    NOT NULL UNIQUE,
@@ -22,8 +28,9 @@ CREATE TABLE IF NOT EXISTS profiles (
     user_agent   TEXT,
     locale       TEXT,
     timezone     TEXT,
-    status       TEXT    NOT NULL DEFAULT 'new',
+    status       TEXT    NOT NULL DEFAULT 'free',
     last_used_at REAL,
+    fields       TEXT    NOT NULL DEFAULT '{}',
     created_at   REAL    NOT NULL DEFAULT (CAST(strftime('%s', 'now') AS REAL))
 );
 
