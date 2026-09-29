@@ -28,6 +28,17 @@ export function controlRequest(action: ControlAction): ControlRequest {
   return { method: "POST", path: CONTROL_PATHS[action] };
 }
 
+/** Чтение конфига: GET /control/config. Тела нет вовсе. */
+export interface ConfigRequest {
+  method: "GET";
+  path: string;
+  body?: undefined;
+}
+
+export function configRequest(): ConfigRequest {
+  return { method: "GET", path: "/control/config" };
+}
+
 /** Действия API прокси (контракт /control/proxies* параллельной ветки). */
 export type ProxiesAction =
   | { kind: "list" }
