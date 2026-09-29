@@ -10,9 +10,12 @@
 //
 // Вёрстка — шаблон: PageLayout (заголовок + тулбар) и FilterBar (контролы,
 // чипы активных фильтров, «Сбросить»). Сам список остаётся локальным:
-// LogViewer шаблона пришит к низу (новые внизу), живёт на v-virtual-scroll
-// и на своём empty-state — наше поведение (новые сверху, курсор, «Старше»
-// без сброса позиции, условный empty-state по фазе БД) он не вмещает.
+// LogViewer шаблона рисует новые снизу и сам скроллит при каждом изменении
+// списка, а нам нужно «новые сверху», автоскролл только по живому тику и
+// подгрузка «Старше» без сброса позиции. Плюс это таблица с заголовком
+// колонок и сырыми полями в подсказке, а не однострочные лог-линии, и
+// свой empty-state на v-virtual-scroll — наш empty-state зависит от фазы
+// БД, а v-virtual-scroll выгружает невидимые строки из DOM.
 
 import { computed, nextTick, onMounted, onUnmounted, ref, watch } from "vue";
 import DbUnavailableAlert from "../components/DbUnavailableAlert.vue";
@@ -312,7 +315,7 @@ watch(logs.liveAdded, async () => {
 
       <div
         v-else-if="!logs.loading.value && db.phase.value === 'open'"
-        class="empty-state h-100"
+        class="empty-state"
         data-test="logs-empty"
       >
         <v-icon icon="mdi-format-list-bulleted" size="40px" />
@@ -348,5 +351,12 @@ watch(logs.liveAdded, async () => {
   /* радиус sm и 14px — токены дизайн.md §2.2–2.3 для логов */
   border-radius: 2px;
   font-size: 14px;
+}
+
+/* Пустой список занимает всю панель и центрируется; border-box не даёт
+   отступам empty-state вылезти за высоту и включить лишний скролл. */
+.logs-scroller .empty-state {
+  box-sizing: border-box;
+  height: 100%;
 }
 </style>
