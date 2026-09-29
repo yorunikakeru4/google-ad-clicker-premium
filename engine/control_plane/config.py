@@ -284,6 +284,69 @@ def _validate(data: dict[str, Any]) -> list[dict[str, str]]:
     return problems
 
 
+# Пути из секции paths: непустое значение обязано указывать на существующий
+# файл. Пустая строка означает «не задано» и ошибка не является.
+_FILE_PATH_FIELDS = ("query_file", "proxy_file", "user_agents", "filtered_domains")
+
+
+def _validate_file_paths(data: dict[str, Any], base_dir: Path) -> list[dict[str, str]]:
+    """Существование файлов из секции paths.
+
+    ``base_dir`` — каталог, от которого разрешаются относительные пути. По
+    умолчанию вызывающий код передаёт текущий каталог: legacy читает
+    ``config.json`` именно оттуда (``config_reader``), а пути из него открывает
+    оттуда же (``Path(config.paths.query_file)`` в ``utils``), поэтому любая
+    другая база проверяла бы не те файлы, которые реально откроет кликер. Тот,
+    у кого ``config.json`` лежит вне текущего каталога, передаёт каталог явно.
+
+    Путь в сообщении — в том виде, в каком его написал пользователь: форма
+    подсвечивает поле, а не путь на диске.
+    """
+    paths = data.get("paths") if isinstance(data, dict) else None
+    if not isinstance(paths, dict):
+        # Нет секции или она не-словарь — это уже отмечено _validate, файлы по
+        # неправильной структуре не проверяются. Нестроковое значение ключа
+        # пропускается ниже: ошибку типа тоже уже дал _validate, и дублировать
+        # её сообщением о файле нельзя.
+        return []
+
+    problems: list[dict[str, str]] = []
+    for key in _FILE_PATH_FIELDS:
+        value = paths.get(key)
+        if not isinstance(value, str) or not value:
+            continue
+        candidate = Path(value)
+        if not candidate.is_absolute():
+            candidate = base_dir / candidate
+        if not candidate.is_file():
+            problems.append({"field": f"paths.{key}", "message": f"файл не найден: {value}"})
+    return problems
+
+
+def validate_settings(data: dict[str, Any], *, base_dir: str | Path | None = None) -> list[dict[str, str]]:
+    """Публичная валидация настроек для UI: список проблем, а не исключение.
+
+    Точка входа для формы (Tauri-HTTP и ``gui.py``): типы, диапазоны,
+    ``min <= max`` для пауз, ``ЧЧ:ММ`` для интервалов, взаимная exclusivity
+    ``proxy_file``/``proxy`` и ``query_file``/``query``, границы
+    ``browser_count``, — всё это правила ``_validate`` из этого же модуля, без
+    копий. Дополнительно проверяется существование файлов из секции ``paths``.
+
+    Порядок списка: сначала ошибки структуры и типов, потом файлы — UI показывает
+    их в этом порядке, а проверка файлов на мусорной структуре не выполняется.
+
+    ``base_dir`` — базовый каталог для относительных путей, по умолчанию текущий
+    каталог (см. ``_validate_file_paths``).
+
+    В отличие от ``Config.from_dict`` исключение не бросается и файлы на диске
+    не проверяются: демону важно только то, что значение имеет смысл, а
+    существование файлов — вопрос установки и UI.
+    """
+    problems = _validate(data)
+    problems.extend(_validate_file_paths(data, Path.cwd() if base_dir is None else Path(base_dir)))
+    return problems
+
+
 def _coerce_all(data: dict[str, Any]) -> dict[str, Any]:
     """Приводит значения к объявленным типам и дополняет недостающие ключи.
 
