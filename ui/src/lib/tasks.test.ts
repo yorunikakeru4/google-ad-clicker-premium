@@ -169,7 +169,7 @@ describe("querySource: источник запросов", () => {
 
   it("подсказка про exclusivity одна на все случаи", () => {
     const file = querySource(CONFIG);
-    const single = querySource({ ...CONFIG, queryFile: "" });
+    const single = querySource({ ...CONFIG, queryFile: "", query: "кофейня москва" });
     expect(file.hint).toContain("paths.query_file");
     expect(file.hint).toContain("behavior.query");
     expect(single.hint).toBe(file.hint);
@@ -218,7 +218,9 @@ describe("pickTasksConfig: разбор ответа /control/config", () => {
 
   it("нет поля — ошибка называет поле", () => {
     expect(() =>
-      pickTasksConfig({ config: { paths: {}, behavior: {} } }),
+      pickTasksConfig({
+        config: { paths: { query_file: "" }, behavior: { query: "" } },
+      }),
     ).toThrow(/running_interval_start/);
   });
 
