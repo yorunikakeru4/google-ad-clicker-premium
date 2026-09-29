@@ -18,6 +18,7 @@ import urllib.request
 import pytest
 
 from engine.control_plane.api import TOKEN_ENV_VAR, TOKEN_HEADER
+from engine.control_plane.config import SECRET_MASK
 from engine.control_plane.config import Config
 from engine.control_plane.daemon import (
     DEFAULT_PROXY_CHECK_INTERVAL_SECONDS,
@@ -32,7 +33,7 @@ from engine.control_plane.supervisor import Supervisor, SupervisorSettings
 from engine.proxy_health import CheckInProgressError
 from engine.proxy_pool import ProxyPool
 from tests.engine.control_plane.test_supervisor import FakeClock, FakeProcessRegistry
-from tests.engine.test_proxy_health import LoopbackProxy
+from tests.engine.test_proxy_health import LoopbackProxy, closed_port
 
 TOKEN = "periodic-test-token"
 
@@ -114,6 +115,27 @@ def get_json(daemon, path):
         status = exc.code
         payload = json.loads(exc.read().decode("utf-8"))
     return status, payload, time.monotonic() - started
+
+
+def post_json(daemon, path, body):
+    data = json.dumps(body).encode("utf-8")
+    request = urllib.request.Request(
+        f"http://127.0.0.1:{daemon.port}{path}", data=data, method="POST"
+    )
+    request.add_header(TOKEN_HEADER, TOKEN)
+    request.add_header("Content-Type", "application/json")
+    try:
+        with urllib.request.urlopen(request, timeout=5) as response:
+            return response.status, json.loads(response.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        return exc.code, json.loads(exc.read().decode("utf-8"))
+
+
+def get_raw(daemon, path):
+    request = urllib.request.Request(f"http://127.0.0.1:{daemon.port}{path}", method="GET")
+    request.add_header(TOKEN_HEADER, TOKEN)
+    with urllib.request.urlopen(request, timeout=5) as response:
+        return response.read().decode("utf-8")
 
 
 def wait_until(predicate, timeout=5.0):
@@ -310,3 +332,55 @@ class TestPeriodicJob:
         assert time.monotonic() - started < 5.0
         assert proxy_thread_alive() is False
         assert checker.calls == 0, "первый запуск должен быть через интервал, а не сразу"
+
+
+class TestCredentialLeakGuard:
+    """Сквозная проверка: креды не попадают ни в logs, ни в HTTP-ответы.
+
+    Путь длинный — ручная добавка, фоновая проверка (успех и отказ), список
+    в ответе, — потому что утечка обычно появляется не в одном месте, а там,
+    где кто-то «для удобства» дописал значение в лог.
+    """
+
+    def test_credentials_never_reach_logs_or_responses(self, db_path, config_path, registry):
+        stub = LoopbackProxy()
+        try:
+            daemon = make_daemon(
+                db_path, config_path, registry, proxy_check_interval=0.05
+            )
+            daemon.start()
+            status, body = post_json(
+                daemon,
+                "/control/proxies",
+                {
+                    "lines": [
+                        f"alice:s3cr3t@127.0.0.1:{stub.port}",
+                        f"bob:OTHER-SECRET@127.0.0.1:{closed_port()}",
+                    ]
+                },
+            )
+            assert status == 200 and body["added"] == 2, body
+
+            def both_checked():
+                with StateStore(db_path)._connect() as conn:
+                    rows = conn.execute(
+                        "SELECT last_checked_at FROM proxies"
+                    ).fetchall()
+                return len(rows) == 2 and all(row["last_checked_at"] for row in rows)
+
+            assert wait_until(both_checked, timeout=10), "проверка не отработала по обоим"
+
+            listed = get_raw(daemon, "/control/proxies")
+        finally:
+            daemon.shutdown()
+            stub.close()
+
+        with StateStore(db_path)._connect() as conn:
+            log_dump = str(conn.execute("SELECT * FROM logs").fetchall())
+            proxy_dump = str(conn.execute("SELECT * FROM proxies").fetchall())
+
+        for secret in ("s3cr3t", "OTHER-SECRET", "alice", "bob"):
+            assert secret not in log_dump, f"кред {secret!r} утёк в logs"
+            assert secret not in proxy_dump, f"кред {secret!r} утёк в колонки proxies"
+            assert secret not in listed, f"кред {secret!r} утёк в HTTP-ответ"
+        assert SECRET_MASK in listed, "список обязан показывать маску, а не пустоту"
