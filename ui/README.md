@@ -29,25 +29,36 @@ screens themselves are stubs until their phases land.
 ```
 src/
   main.ts                  app bootstrap: vue + router + vuetify
-  App.vue                  shell: nav drawer, app bar, control panel, routes
+  App.vue                  renders the app shell
   router/index.ts          the 7 routes + NAV_ITEMS for the drawer
+  layouts/
+    AppShell.vue           app bar (status, heartbeat, controls, theme),
+                           nav drawer, offline banner, snackbar, router-view
   views/                   Dashboard, Logs, Profiles, Proxies, Tasks,
-                           Settings, Diagnostics (stubs until their phases)
+                           Settings, Diagnostics
   components/
-    ControlPanel.vue       Start/Pause/Resume/Restart/Kill + workers table
-    HeartbeatChip.vue      daemon alive/offline indicator
-    ScreenStub.vue         shared stub for unimplemented screens
-    ThemeToggle.vue
+    DbUnavailableAlert.vue "database missing / failed to open" + retry
+    charts/                BarChartCard (chart.js bars for the dashboard)
+    data/                  DataTablePage, FilterBar, LogViewer, MetricCard
+    forms/                 ConfirmDialog, SettingField
+    layout/                PageLayout, DaemonControls, ThemeToggle
+    status/                StatusChip, DaemonStatusChip, HeartbeatIndicator
   composables/
     useDaemonStatus.ts     1s polling of /health + /state, control commands
-    useThemeToggle.ts
+    useDashboard.ts        metrics polling for the dashboard
+    useLogs.ts             live log polling, cursor pages, filters
+    useDb.ts, useThemeToggle.ts
+  constants/               statusMap (shared status colours/icons), schemas
   lib/
     control.ts             control requests + button disabled rules
     daemonApi.ts           /health, /state, /control/* over the Tauri proxy
+    dbApi.ts               db_open / metrics / paged log read commands
+    logFilters.ts          log filter form, validation, localStorage
+    logMerge.ts            cursor page merge for the live list
     poll.ts                polling reducer (online/offline, tick dedup)
-    format.ts              uptime/PID/last-error formatting
-    types.ts               daemon payload types
-  plugins/vuetify.ts       light/dark theme definitions
+    series.ts, thresholds.ts, csv.ts, format.ts, types.ts
+  plugins/vuetify.ts       gruvbox themes and component defaults
+  styles/global.css        font, .text-muted, .empty-state
 src-tauri/                 Rust shell
   src/lib.rs               tauri builder, command registration
   src/control.rs           HTTP proxy to the daemon control API

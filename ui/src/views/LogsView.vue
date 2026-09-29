@@ -7,14 +7,25 @@
 // когда живой тик привёз новые строки: подгрузка старого и пауза чтение не
 // сбивают. Фильтры валидируются и сохраняются в localStorage — они
 // переживают перезагрузку (см. lib/logFilters).
+//
+// Вёрстка — шаблон: PageLayout (заголовок + тулбар) и FilterBar (контролы,
+// чипы активных фильтров, «Сбросить»). Сам список остаётся локальным:
+// LogViewer шаблона рисует новые снизу и сам скроллит при каждом изменении
+// списка, а нам нужно «новые сверху», автоскролл только по живому тику и
+// подгрузка «Старше» без сброса позиции. Плюс это таблица с заголовком
+// колонок и сырыми полями в подсказке, а не однострочные лог-линии, и
+// свой empty-state на v-virtual-scroll — наш empty-state зависит от фазы
+// БД, а v-virtual-scroll выгружает невидимые строки из DOM.
 
 import { computed, nextTick, onMounted, onUnmounted, ref, watch } from "vue";
 import DbUnavailableAlert from "../components/DbUnavailableAlert.vue";
+import FilterBar from "../components/data/FilterBar.vue";
+import PageLayout from "../components/layout/PageLayout.vue";
 import { useDb } from "../composables/useDb";
 import { MAX_LOGS_ROWS, useLogs } from "../composables/useLogs";
 import { logsToCsv } from "../lib/csv";
+import { activeFilterChips } from "../lib/logFilterChips";
 import {
-  EMPTY_LOG_FILTERS,
   LOG_CATEGORIES,
   LOG_LEVELS,
   type LogFilterValues,
@@ -55,9 +66,20 @@ const categoryItems = [
   ...LOG_CATEGORIES.map((category) => ({ title: category, value: category })),
 ];
 
-const pristine = computed(
-  () => JSON.stringify(logs.filters.value) === JSON.stringify(EMPTY_LOG_FILTERS),
-);
+/** Активные фильтры чипами: их наличие и есть «фильтр включён». */
+const filterChips = computed(() => activeFilterChips(logs.filters.value));
+
+/** Крестик на чипе снимает ровно это поле, остальные фильтры остаются. */
+function onFilterClear(key: string): void {
+  const fieldKey = key as keyof LogFilterValues;
+  const patch: Partial<LogFilterValues> = {};
+  if (fieldKey === "since" || fieldKey === "until") {
+    patch[fieldKey] = null;
+  } else {
+    patch[fieldKey] = "";
+  }
+  void logs.updateFilters(patch);
+}
 
 // --- таблица и подгрузка -------------------------------------------------
 
@@ -112,10 +134,12 @@ function formatTs(ts: number): string {
   );
 }
 
+// Цвет уровня — тот же словарь, что у LogViewer шаблона: ERROR — error,
+// WARNING — warning, INFO — success, DEBUG — без цвета.
 const LEVEL_COLORS: Record<string, string | undefined> = {
   ERROR: "error",
   WARNING: "warning",
-  INFO: "info",
+  INFO: "success",
   DEBUG: undefined,
 };
 
@@ -131,8 +155,98 @@ watch(logs.liveAdded, async () => {
 </script>
 
 <template>
-  <div>
-    <h1 class="text-h5 mb-4">Logs</h1>
+  <PageLayout title="Logs" subtitle="Новые записи сверху, старые — кнопкой «Старше»">
+    <template #toolbar-left>
+      <FilterBar
+        :chips="filterChips"
+        @clear="onFilterClear"
+        @reset="logs.resetFilters()"
+      >
+        <v-select
+          v-model="levelField"
+          :items="levelItems"
+          label="Уровень"
+          hide-details
+          density="compact"
+          style="max-width: 170px"
+          data-test="filter-level"
+        />
+        <v-select
+          v-model="categoryField"
+          :items="categoryItems"
+          label="Категория"
+          hide-details
+          density="compact"
+          style="max-width: 180px"
+          data-test="filter-category"
+        />
+        <v-text-field
+          v-model="browserIdField"
+          label="browser_id"
+          hide-details
+          density="compact"
+          clearable
+          style="max-width: 170px"
+          data-test="filter-browser"
+        />
+        <v-text-field
+          v-model="sinceField"
+          label="с"
+          type="datetime-local"
+          hide-details
+          density="compact"
+          clearable
+          style="max-width: 210px"
+          data-test="filter-since"
+        />
+        <v-text-field
+          v-model="untilField"
+          label="по"
+          type="datetime-local"
+          hide-details
+          density="compact"
+          clearable
+          style="max-width: 210px"
+          data-test="filter-until"
+        />
+      </FilterBar>
+    </template>
+
+    <template #toolbar-right>
+      <v-btn
+        size="small"
+        variant="outlined"
+        prepend-icon="mdi-chevron-up"
+        :disabled="!hasRows || logs.exhausted.value || atRowCap"
+        :loading="logs.loadingOlder.value"
+        data-test="load-older"
+        @click="onLoadOlder"
+      >
+        {{ logs.exhausted.value ? "Старше нет" : "Старше" }}
+      </v-btn>
+
+      <v-btn
+        size="small"
+        variant="outlined"
+        prepend-icon="mdi-download"
+        :disabled="!canExport"
+        :title="atRowCap ? `Экспорт ограничен ${MAX_LOGS_ROWS} строками` : undefined"
+        data-test="export-csv"
+        @click="exportCsv"
+      >
+        Экспорт CSV
+      </v-btn>
+
+      <v-btn
+        size="small"
+        :color="logs.live.value ? 'primary' : 'warning'"
+        :prepend-icon="logs.live.value ? 'mdi-pause' : 'mdi-play'"
+        data-test="live-toggle"
+        @click="logs.toggleLive()"
+      >
+        {{ logs.live.value ? "Пауза" : "Продолжить" }}
+      </v-btn>
+    </template>
 
     <DbUnavailableAlert class="mb-4" />
 
@@ -146,76 +260,6 @@ watch(logs.liveAdded, async () => {
       {{ logs.error.value }}
     </v-alert>
 
-    <v-card class="mb-4" data-test="logs-filters">
-      <v-card-text class="py-3">
-        <v-row dense align="center">
-          <v-col cols="6" md="2">
-            <v-select
-              v-model="levelField"
-              :items="levelItems"
-              label="Уровень"
-              density="compact"
-              hide-details
-              data-test="filter-level"
-            />
-          </v-col>
-          <v-col cols="6" md="2">
-            <v-select
-              v-model="categoryField"
-              :items="categoryItems"
-              label="Категория"
-              density="compact"
-              hide-details
-              data-test="filter-category"
-            />
-          </v-col>
-          <v-col cols="6" md="2">
-            <v-text-field
-              v-model="browserIdField"
-              label="browser_id"
-              density="compact"
-              hide-details
-              clearable
-              data-test="filter-browser"
-            />
-          </v-col>
-          <v-col cols="6" md="2">
-            <v-text-field
-              v-model="sinceField"
-              label="с"
-              type="datetime-local"
-              density="compact"
-              hide-details
-              clearable
-              data-test="filter-since"
-            />
-          </v-col>
-          <v-col cols="6" md="2">
-            <v-text-field
-              v-model="untilField"
-              label="по"
-              type="datetime-local"
-              density="compact"
-              hide-details
-              clearable
-              data-test="filter-until"
-            />
-          </v-col>
-          <v-col cols="6" md="1">
-            <v-btn
-              block
-              size="small"
-              :disabled="pristine"
-              data-test="filter-reset"
-              @click="logs.resetFilters()"
-            >
-              Сброс
-            </v-btn>
-          </v-col>
-        </v-row>
-      </v-card-text>
-    </v-card>
-
     <div class="d-flex align-center flex-wrap ga-2 mb-3">
       <v-chip
         :color="logs.live.value ? 'success' : 'warning'"
@@ -226,43 +270,9 @@ watch(logs.liveAdded, async () => {
         {{ logs.live.value ? "живой режим" : "пауза" }}
       </v-chip>
 
-      <span class="text-body-2 text-medium-emphasis" data-test="logs-count">
+      <span class="text-body-2 text-muted" data-test="logs-count">
         {{ shownLabel }}
       </span>
-
-      <v-spacer />
-
-      <v-btn
-        size="small"
-        :prepend-icon="logs.live.value ? 'mdi-pause' : 'mdi-play'"
-        :color="logs.live.value ? undefined : 'warning'"
-        data-test="live-toggle"
-        @click="logs.toggleLive()"
-      >
-        {{ logs.live.value ? "Пауза" : "Продолжить" }}
-      </v-btn>
-
-      <v-btn
-        size="small"
-        prepend-icon="mdi-chevron-up"
-        :disabled="!hasRows || logs.exhausted.value || atRowCap"
-        :loading="logs.loadingOlder.value"
-        data-test="load-older"
-        @click="onLoadOlder"
-      >
-        {{ logs.exhausted.value ? "Старше нет" : "Старше" }}
-      </v-btn>
-
-      <v-btn
-        size="small"
-        prepend-icon="mdi-download"
-        :disabled="!canExport"
-        :title="atRowCap ? `Экспорт ограничен ${MAX_LOGS_ROWS} строками` : undefined"
-        data-test="export-csv"
-        @click="exportCsv"
-      >
-        Экспорт CSV
-      </v-btn>
     </div>
 
     <v-progress-linear
@@ -276,16 +286,16 @@ watch(logs.liveAdded, async () => {
       <v-table v-if="hasRows" density="compact" hover data-test="logs-table">
         <thead>
           <tr>
-            <th class="w-ts">время</th>
-            <th class="w-level">уровень</th>
-            <th class="w-browser">браузер</th>
-            <th class="w-category">категория</th>
+            <th>время</th>
+            <th>уровень</th>
+            <th>браузер</th>
+            <th>категория</th>
             <th>сообщение</th>
           </tr>
         </thead>
         <tbody>
           <tr v-for="row in logs.rows.value" :key="row.id" :data-test="`log-row-${row.id}`">
-            <td class="text-no-wrap text-medium-emphasis">{{ formatTs(row.ts) }}</td>
+            <td class="text-no-wrap text-muted">{{ formatTs(row.ts) }}</td>
             <td>
               <v-chip size="x-small" variant="tonal" :color="LEVEL_COLORS[row.level]">
                 {{ row.level }}
@@ -295,11 +305,7 @@ watch(logs.liveAdded, async () => {
             <td class="text-no-wrap">{{ row.category ?? "—" }}</td>
             <td>
               <span :title="row.fields ?? undefined">{{ row.message }}</span>
-              <span
-                v-if="row.fields"
-                class="text-medium-emphasis ml-2"
-                :title="row.fields"
-              >
+              <span v-if="row.fields" class="text-muted ml-2" :title="row.fields">
                 {{ row.fields }}
               </span>
             </td>
@@ -307,13 +313,22 @@ watch(logs.liveAdded, async () => {
         </tbody>
       </v-table>
 
-      <p
+      <div
         v-else-if="!logs.loading.value && db.phase.value === 'open'"
-        class="text-medium-emphasis ma-4"
+        class="empty-state"
         data-test="logs-empty"
       >
-        Нет записей под текущими фильтрами
-      </p>
+        <v-icon icon="mdi-format-list-bulleted" size="40px" />
+        <div class="empty-state__title">Нет записей под текущими фильтрами</div>
+        <v-btn
+          v-if="filterChips.length"
+          color="primary"
+          prepend-icon="mdi-filter-remove"
+          @click="logs.resetFilters()"
+        >
+          Сбросить фильтры
+        </v-btn>
+      </div>
     </div>
 
     <p
@@ -324,14 +339,24 @@ watch(logs.liveAdded, async () => {
       Достигнут лимит просмотра — сузьте фильтр по времени, чтобы увидеть
       старее.
     </p>
-  </div>
+  </PageLayout>
 </template>
 
 <style scoped>
 .logs-scroller {
   height: min(62vh, 640px);
   overflow-y: auto;
+  background-color: rgb(var(--v-theme-surface));
   border: 1px solid rgba(var(--v-border-color), var(--v-border-opacity));
-  border-radius: 8px;
+  /* радиус sm и 14px — токены дизайн.md §2.2–2.3 для логов */
+  border-radius: 2px;
+  font-size: 14px;
+}
+
+/* Пустой список занимает всю панель и центрируется; border-box не даёт
+   отступам empty-state вылезти за высоту и включить лишний скролл. */
+.logs-scroller .empty-state {
+  box-sizing: border-box;
+  height: 100%;
 }
 </style>

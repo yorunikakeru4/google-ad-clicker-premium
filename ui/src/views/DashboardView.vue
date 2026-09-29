@@ -2,12 +2,20 @@
 // Dashboard (план §5, фаза 4): успешные/неуспешные сценарии, аптайм демона,
 // запросы/час как проверяемое утверждение ≥50, доля CAPTCHA с порогом 5%
 // и три графика (клики/час, CAPTCHA по часам, нагрузка на воркеры).
+//
+// Вёрстка — шаблон экрана: PageLayout + MetricCard + StatusChip. Пороговые
+// правила остаются в lib/thresholds, данные — в useDashboard: карточка только
+// показывает утверждение цветом и текстом, ничего не пересчитывает.
 import { computed, onMounted, onUnmounted } from "vue";
 import BarChartCard from "../components/charts/BarChartCard.vue";
 import DbUnavailableAlert from "../components/DbUnavailableAlert.vue";
+import MetricCard from "../components/data/MetricCard.vue";
+import PageLayout from "../components/layout/PageLayout.vue";
+import type { StatusKind } from "../constants/statusMap";
 import { useDashboard } from "../composables/useDashboard";
 import { useDb } from "../composables/useDb";
 import { formatLastError, formatUptime } from "../lib/format";
+import { toneToStatus } from "../lib/thresholdStatus";
 import {
   REQUESTS_PER_HOUR_TARGET,
   captchaShareStatus,
@@ -39,6 +47,16 @@ const requestsClaim = computed(() => {
     : `≥${REQUESTS_PER_HOUR_TARGET}/час: не выполнено (${load.total})`;
 });
 
+/** Статус карточки: порог выполнен/нарушен, данных нет — idle, не ошибка. */
+const requestsStatusKind = computed<StatusKind>(() =>
+  requestsStatus.value === null ? "idle" : toneToStatus(requestsStatus.value.tone),
+);
+
+const requestsTotal = computed(() => {
+  const load = dash.requests.value;
+  return load === null ? undefined : String(load.total);
+});
+
 const shareStatus = computed(() => captchaShareStatus(dash.captchaShare.value));
 
 const shareClaim = computed(() => {
@@ -48,6 +66,10 @@ const shareClaim = computed(() => {
     ? "доля CAPTCHA < 5% — норма"
     : "доля CAPTCHA ≥ 5% — порог превышен";
 });
+
+const captchaStatusKind = computed<StatusKind>(() =>
+  toneToStatus(shareStatus.value.tone),
+);
 
 // Аптайм пересчитывается на каждом тике опроса: uptimeSeconds меняется
 // каждую секунду, поэтому строка не застынет на «00:00:01».
@@ -62,13 +84,18 @@ const lastError = computed(() => dash.runs.value?.last_error ?? null);
 
 const workersLabel = computed(() => String(dash.workers.value.length));
 
+/** Всего сценарий за окно: показывает масштаб, разбивка — в чипах ниже. */
+const runsTotal = computed(() => {
+  const runs = dash.runs.value;
+  if (runs === null) return undefined;
+  return String(runs.succeeded + runs.failed + runs.other);
+});
+
 const demoWindowHint = "окно 24 часа";
 </script>
 
 <template>
-  <div>
-    <h1 class="text-h5 mb-4">Dashboard</h1>
-
+  <PageLayout title="Dashboard" subtitle="Сценарии, запросы/час и доля CAPTCHA">
     <DbUnavailableAlert class="mb-4" />
 
     <v-alert
@@ -90,14 +117,14 @@ const demoWindowHint = "окно 24 часа";
 
     <v-row dense>
       <v-col cols="12" md="6" lg="3">
-        <v-card data-test="card-runs" fill-height>
-          <v-card-title class="text-subtitle-1 font-weight-medium">
-            Сценарии
-            <span class="text-medium-emphasis font-weight-regular">
-              · {{ demoWindowHint }}
-            </span>
-          </v-card-title>
-          <v-card-text class="pt-0">
+        <MetricCard
+          data-test="card-runs"
+          label="Сценарии"
+          :hint="demoWindowHint"
+          :value="runsTotal"
+          value-test="runs-total"
+        >
+          <template #default>
             <div class="d-flex flex-wrap ga-2 mb-2">
               <v-chip color="success" variant="tonal" size="small" data-test="runs-succeeded">
                 {{ dash.runs.value?.succeeded ?? "—" }} успешно
@@ -109,7 +136,7 @@ const demoWindowHint = "окно 24 часа";
                 {{ dash.runs.value?.other ?? "—" }} другое
               </v-chip>
             </div>
-            <div class="text-body-2 text-medium-emphasis">
+            <div class="text-body-2 text-muted">
               Последняя ошибка:
               <span
                 class="text-truncate d-inline-block"
@@ -120,71 +147,50 @@ const demoWindowHint = "окно 24 часа";
                 {{ formatLastError(lastError) }}
               </span>
             </div>
-          </v-card-text>
-        </v-card>
+          </template>
+        </MetricCard>
       </v-col>
 
       <v-col cols="12" md="6" lg="3">
-        <v-card data-test="card-uptime" fill-height>
-          <v-card-title class="text-subtitle-1 font-weight-medium">
-            Время работы
-          </v-card-title>
-          <v-card-text class="pt-0">
-            <div class="text-h5 mb-1" data-test="uptime-value">
-              {{ uptimeLabel }}
-            </div>
-            <div class="text-body-2 text-medium-emphasis mb-2">
+        <MetricCard
+          data-test="card-uptime"
+          label="Время работы"
+          :value="uptimeLabel"
+          value-test="uptime-value"
+        >
+          <template #default>
+            <div class="text-body-2 text-muted mb-2">
               демон отвечает непрерывно
             </div>
             <v-chip color="primary" variant="tonal" size="small" data-test="active-workers">
               активные воркеры: {{ workersLabel }}
             </v-chip>
-          </v-card-text>
-        </v-card>
+          </template>
+        </MetricCard>
       </v-col>
 
       <v-col cols="12" md="6" lg="3">
-        <v-card data-test="card-requests" fill-height>
-          <v-card-title class="text-subtitle-1 font-weight-medium">
-            Запросы/час
-          </v-card-title>
-          <v-card-text class="pt-0">
-            <div class="text-h5 mb-1" data-test="requests-total">
-              {{ dash.requests.value?.total ?? "—" }}
-            </div>
-            <v-chip
-              v-if="requestsStatus"
-              :color="requestsStatus.tone"
-              variant="tonal"
-              size="small"
-              data-test="requests-claim"
-            >
-              {{ requestsClaim }}
-            </v-chip>
-            <div v-else class="text-body-2 text-medium-emphasis">нет данных</div>
-          </v-card-text>
-        </v-card>
+        <MetricCard
+          data-test="card-requests"
+          label="Запросы/час"
+          :value="requestsTotal"
+          value-test="requests-total"
+          :status="requestsStatusKind"
+          :status-label="requestsClaim"
+          status-test="requests-claim"
+        />
       </v-col>
 
       <v-col cols="12" md="6" lg="3">
-        <v-card data-test="card-captcha" fill-height>
-          <v-card-title class="text-subtitle-1 font-weight-medium">
-            Доля CAPTCHA
-          </v-card-title>
-          <v-card-text class="pt-0">
-            <div class="text-h5 mb-1" data-test="captcha-value">
-              {{ formatCaptchaShare(dash.captchaShare.value) }}
-            </div>
-            <v-chip
-              :color="shareStatus.tone"
-              variant="tonal"
-              size="small"
-              data-test="captcha-claim"
-            >
-              {{ shareClaim }}
-            </v-chip>
-          </v-card-text>
-        </v-card>
+        <MetricCard
+          data-test="card-captcha"
+          label="Доля CAPTCHA"
+          :value="formatCaptchaShare(dash.captchaShare.value)"
+          value-test="captcha-value"
+          :status="captchaStatusKind"
+          :status-label="shareClaim"
+          status-test="captcha-claim"
+        />
       </v-col>
     </v-row>
 
@@ -218,5 +224,5 @@ const demoWindowHint = "окно 24 часа";
         />
       </v-col>
     </v-row>
-  </div>
+  </PageLayout>
 </template>
