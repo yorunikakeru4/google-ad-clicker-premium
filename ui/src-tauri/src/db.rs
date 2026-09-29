@@ -477,6 +477,33 @@ mod tests {
         }
     }
 
+    /// Строка `proxies` для тестов списка: креды подставляются теми же, что
+    /// в реальных данных, — маскирование проверяется на живых значениях.
+    fn insert_proxy(conn: &Connection, host: &str, port: i64) -> i64 {
+        conn.execute(
+            "INSERT INTO proxies (scheme, host, port) VALUES ('http', ?1, ?2)",
+            rusqlite::params![host, port],
+        )
+        .expect("строка proxies вставляется");
+        conn.last_insert_rowid()
+    }
+
+    fn insert_worker_on_proxy(conn: &Connection, browser_id: &str, proxy_id: i64) {
+        conn.execute(
+            "INSERT INTO workers (browser_id, proxy_id) VALUES (?1, ?2)",
+            rusqlite::params![browser_id, proxy_id],
+        )
+        .expect("строка workers вставляется");
+    }
+
+    fn insert_proxy_usage(conn: &Connection, proxy_id: i64, ts: f64) {
+        conn.execute(
+            "INSERT INTO proxy_usage (ts, proxy_id) VALUES (?1, ?2)",
+            rusqlite::params![ts, proxy_id],
+        )
+        .expect("строка proxy_usage вставляется");
+    }
+
     #[test]
     fn open_reports_missing_file_and_creates_nothing() {
         let tmp = TempDb::new();
@@ -1348,5 +1375,148 @@ mod tests {
             .list_logs_page(&LogFilters::default(), None, None, 10)
             .expect("пустая БД отдаёт пустую страницу")
             .is_empty());
+    }
+
+    #[test]
+    fn list_proxies_on_empty_db_returns_nothing() {
+        let tmp = TempDb::new();
+        let path = tmp.path();
+        let _writer = seed(&path, &[]);
+
+        let reader = DbReader::open(&path).expect("БД открывается");
+
+        assert_eq!(
+            reader.list_proxies().expect("пустая БД — пустой список"),
+            vec![] as Vec<ProxyRow>,
+            "отсутствие прокси — не ошибка чтения"
+        );
+    }
+
+    #[test]
+    fn list_proxies_joins_assignment_and_usage_without_row_multiplication() {
+        let tmp = TempDb::new();
+        let path = tmp.path();
+        let writer = seed(&path, &[]);
+
+        let assigned = insert_proxy(&writer, "a.example", 8080);
+        let free = insert_proxy(&writer, "b.example", 3128);
+        // Два воркера на одном прокси: строка не должна размножиться, а
+        // назначение обязано быть детерминированным — берём первый browser_id.
+        insert_worker_on_proxy(&writer, "br-2", assigned);
+        insert_worker_on_proxy(&writer, "br-1", assigned);
+        insert_proxy_usage(&writer, assigned, 10.0);
+        insert_proxy_usage(&writer, assigned, 20.0);
+        // Счётчик по proxy_id: строка usage достаётся своему прокси, а не всем.
+        insert_proxy_usage(&writer, free, 30.0);
+
+        let reader = DbReader::open(&path).expect("БД открывается");
+        let rows = reader.list_proxies().expect("список читается");
+
+        assert_eq!(rows.len(), 2, "join не размножает строки прокси");
+        assert_eq!(rows[0].id, assigned, "порядок — по id");
+        assert_eq!(
+            rows[0].assigned_browser_id.as_deref(),
+            Some("br-1"),
+            "назначение — browser_id воркера на этом прокси"
+        );
+        assert_eq!(rows[0].usage_count, 2, "usage_count — строки proxy_usage");
+        assert_eq!(rows[1].id, free);
+        assert_eq!(
+            rows[1].assigned_browser_id, None,
+            "прокси без воркера — NULL, а не пустая строка"
+        );
+        assert_eq!(rows[1].usage_count, 1);
+    }
+
+    #[test]
+    fn list_proxies_reports_liveness_nulls_and_hides_credentials() {
+        let tmp = TempDb::new();
+        let path = tmp.path();
+        let writer = seed(&path, &[]);
+
+        writer
+            .execute(
+                "INSERT INTO proxies (label, scheme, host, port, country, latency_ms, \
+                  is_alive, fail_count, last_checked_at, last_error, username, password) \
+                 VALUES ('проверенный', 'socks5', 'live.example', 1080, 'DE', 150, \
+                  1, 0, 1000.0, NULL, 'user', 'secret-password')",
+                [],
+            )
+            .expect("строка proxies с кредами вставляется");
+        let live_id = writer.last_insert_rowid();
+
+        writer
+            .execute(
+                "INSERT INTO proxies (scheme, host, port, is_alive, fail_count, last_error) \
+                 VALUES ('http', 'dead.example', 8080, 0, 3, 'connection refused')",
+                [],
+            )
+            .expect("мёртвая строка proxies вставляется");
+        let dead_id = writer.last_insert_rowid();
+
+        let reader = DbReader::open(&path).expect("БД открывается");
+        let rows = reader.list_proxies().expect("список читается");
+
+        let live = rows
+            .iter()
+            .find(|row| row.id == live_id)
+            .expect("живая строка в списке");
+        assert!(live.is_alive);
+        assert_eq!(live.label.as_deref(), Some("проверенный"));
+        assert_eq!(live.scheme, "socks5");
+        assert_eq!(live.host, "live.example");
+        assert_eq!(live.port, 1080);
+        assert_eq!(live.country.as_deref(), Some("DE"));
+        assert_eq!(live.latency_ms, Some(150));
+        assert_eq!(live.last_checked_at, Some(1000.0));
+        assert_eq!(live.last_error, None);
+        assert_eq!(live.fail_count, 0);
+
+        let dead = rows
+            .iter()
+            .find(|row| row.id == dead_id)
+            .expect("мёртвая строка в списке");
+        assert!(!dead.is_alive, "is_alive = 0 читается как false");
+        assert_eq!(dead.fail_count, 3);
+        assert_eq!(dead.last_error.as_deref(), Some("connection refused"));
+        assert_eq!(dead.label, None);
+        assert_eq!(dead.country, None);
+        assert_eq!(dead.latency_ms, None);
+        assert_eq!(dead.last_checked_at, None);
+
+        // Маскирование: в сериализованной строке нет кредов, но есть все
+        // поля контракта GET /control/proxies.
+        let json = serde_json::to_value(dead).expect("строка сериализуется");
+        let object = json.as_object().expect("JSON — объект");
+        assert!(
+            !object.contains_key("username") && !object.contains_key("password"),
+            "креды не должны покидать читалку: {object:?}"
+        );
+        assert!(
+            !serde_json::to_string(dead)
+                .expect("строка сериализуется")
+                .contains("secret-password"),
+            "пароль не должен попасть в выдачу"
+        );
+        for field in [
+            "id",
+            "label",
+            "scheme",
+            "host",
+            "port",
+            "country",
+            "latency_ms",
+            "is_alive",
+            "fail_count",
+            "last_checked_at",
+            "last_error",
+            "assigned_browser_id",
+            "usage_count",
+        ] {
+            assert!(
+                object.contains_key(field),
+                "контрактная колонка {field} должна попасть в ответ"
+            );
+        }
     }
 }

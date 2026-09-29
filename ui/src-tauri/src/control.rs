@@ -503,6 +503,47 @@ mod tests {
     }
 
     #[test]
+    fn allowlist_passes_proxies_endpoints_but_not_lookalikes() {
+        // Контракт API прокси: /control/proxies и его подпути.
+        assert!(allowed_path("/control/proxies"));
+        assert!(allowed_path("/control/proxies/import"));
+        assert!(allowed_path("/control/proxies/delete"));
+        assert!(allowed_path("/control/proxies/check"));
+
+        // Строки с обходом, регистром и запросом не проходят.
+        assert!(!allowed_path("/control/proxies/"));
+        assert!(!allowed_path("/control/proxies/Import"));
+        assert!(!allowed_path("/control/proxies/../state"));
+        assert!(!allowed_path("/control/proxies/import/../../state"));
+        assert!(!allowed_path("/control/proxies?all=1"));
+        assert!(!allowed_path("/control/proxies/delete\r\nX-Injected: 1"));
+    }
+
+    #[test]
+    fn request_carries_proxies_post_with_body_through_allowlist() {
+        let (endpoint, received, handle) = serve_once(response(
+            "HTTP/1.1 200 OK",
+            r#"{"added":1,"skipped":0,"problems":[]}"#,
+        ));
+        let base_url = format!("http://{}:{}", endpoint.host, endpoint.port);
+
+        let reply = request(
+            Some(TOKEN),
+            Some(&base_url),
+            "POST",
+            "/control/proxies",
+            Some(r#"{"lines":["http://a:8080"]}"#),
+        )
+        .unwrap();
+        handle.join().unwrap();
+
+        assert_eq!(reply.status, 200);
+        let request = received.recv().unwrap();
+        assert!(request.starts_with("POST /control/proxies HTTP/1.1"));
+        assert!(request.ends_with(r#"{"lines":["http://a:8080"]}"#));
+    }
+
+    #[test]
     fn request_rejects_missing_or_blank_token() {
         let error = request(None, Some("http://127.0.0.1:1"), "GET", "/health", None).unwrap_err();
         assert!(
