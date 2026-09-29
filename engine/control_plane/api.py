@@ -41,6 +41,7 @@ from engine.control_plane.supervisor import (
     SupervisorError,
     WorkerSpawnError,
 )
+from engine.diagnostics import request_signal
 from engine.profile_pool import (
     ProfileError,
     ProfileInUseError,
@@ -406,6 +407,50 @@ class ControlPlaneHandler(BaseHTTPRequestHandler):
         row = self.profile_pool.set_status(profile_id, status)
         self._send_json(200, {"id": row["id"], "status": row["status"]})
 
+    # --- диагностика -------------------------------------------------------
+
+    def _handle_diagnostics_collect(self) -> None:
+        """``POST /control/diagnostics/collect``: выставить kv-сигнал.
+
+        Контракт: тело — ровно одно из ``{"browser_id": str}`` или
+        ``{"all": true}``, ответ — ``{"requested": n}``, где ``n`` — число
+        ЖИВЫХ воркеров, которым выставлен сигнал. Сигнал — метка времени в
+        ``DIAGNOSTICS_REQUESTED_<id>``; сам снимок приходит в БД позже,
+        когда у воркера появится живой браузер (UI поллит ``diagnostics``).
+
+        Мёртвому или неизвестному воркеру сигнал не ставится: он и так не
+        прочитает его, а ``requested: 0`` честно говорит UI, что ничего не
+        ждёт. Прежний сигнал перетирается новой меткой — свежесть воркер
+        определяет сравнением со своим «последним обработанным».
+        """
+        raw = self._read_json_body()
+        if raw is None:
+            raw = {}
+        if not isinstance(raw, dict):
+            raise InvalidRequestError("ожидается объект с полями browser_id или all")
+
+        has_browser_id = "browser_id" in raw
+        has_all = "all" in raw
+        if has_browser_id == has_all:
+            raise InvalidRequestError("нужно ровно одно из полей: browser_id или all")
+
+        if has_all:
+            if raw["all"] is not True:
+                raise InvalidRequestError("поле all должно быть true")
+            targets = self.supervisor.alive_browser_ids()
+        else:
+            browser_id = raw["browser_id"]
+            # Не-строка (true, 5, список) — ошибка тела: browser_id идёт в
+            # ключ kv-флага, и любое другое значение превратило бы его в мусор.
+            if not isinstance(browser_id, str) or not browser_id.strip():
+                raise InvalidRequestError("поле browser_id должно быть непустой строкой")
+            wanted = browser_id.strip()
+            targets = [wanted] if wanted in set(self.supervisor.alive_browser_ids()) else []
+
+        for target in targets:
+            request_signal(self.supervisor.store, target)
+        self._send_json(200, {"requested": len(targets)})
+
     # --- вспомогательное -------------------------------------------------
 
     def _requested_worker_count(self) -> int:
@@ -584,6 +629,7 @@ _ROUTES: dict[tuple[str, str], str] = {
     ("POST", "/control/profiles/assign"): "_handle_profiles_assign",
     ("POST", "/control/profiles/unassign"): "_handle_profiles_unassign",
     ("POST", "/control/profiles/status"): "_handle_profiles_status",
+    ("POST", "/control/diagnostics/collect"): "_handle_diagnostics_collect",
 }
 
 
