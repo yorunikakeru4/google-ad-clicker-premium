@@ -14,6 +14,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 import signal
 import sys
 import threading
@@ -37,6 +38,8 @@ from engine.control_plane.supervisor import (
     Supervisor,
     SupervisorSettings,
 )
+from engine.proxy_health import ProxyHealthChecker
+from engine.proxy_pool import ProxyError, ProxyPool
 
 # Сигналы, по которым демон завершается. SIGINT — Ctrl+C при запуске из
 # терминала, SIGTERM — systemd/stop-скрипт. Оба обязаны приводить к
@@ -47,6 +50,41 @@ SHUTDOWN_SIGNALS = (signal.SIGTERM, signal.SIGINT)
 # скрипт установки) могла отличить "нет токена" от "сломан конфиг".
 EXIT_OK = 0
 EXIT_CONFIG_ERROR = 2
+
+# Интервал периодической проверки прокси в секундах. Дефолт — раз в час;
+# 0 (и любое отрицательное) расписание выключает.
+DEFAULT_PROXY_CHECK_INTERVAL_SECONDS = 3600.0
+
+# Интервал задаётся окружением, а не config.json: конфиг — файл, который UI
+# перезаписывает целиком и схему которого читает config_reader, а вопрос
+# «как часто фоновой задаче ходить по сети» относится к запуску демона
+# (systemd/launchd), не к настройкам кликера.
+PROXY_CHECK_INTERVAL_ENV_VAR = "ADCLICKER_PROXY_CHECK_INTERVAL"
+
+# Имя нити расписания: тесты ищут его при остановке, как "supervisor".
+PROXY_CHECK_THREAD_NAME = "proxy-check"
+
+
+def proxy_check_interval_from_environ(environ: dict[str, str] | None = None) -> float:
+    """Интервал периодической проверки прокси в секундах.
+
+    Пустая/не заданная переменная — дефолт модуля, ``0`` и отрицательные —
+    расписание выключено, нечисловое значение — ``ValueError`` с именем
+    переменной: демон не стартует и говорит, что именно не так, вместо
+    тихого часового интервала вместо секунд.
+    """
+    source = os.environ if environ is None else environ
+    raw = source.get(PROXY_CHECK_INTERVAL_ENV_VAR, "")
+    if not raw.strip():
+        return DEFAULT_PROXY_CHECK_INTERVAL_SECONDS
+    try:
+        interval = float(raw)
+    except ValueError as exc:
+        raise ValueError(
+            f"{PROXY_CHECK_INTERVAL_ENV_VAR} должна быть числом секунд, "
+            f"получено {raw.strip()!r}"
+        ) from exc
+    return interval if interval > 0 else 0.0
 
 
 class Daemon:
@@ -62,6 +100,8 @@ class Daemon:
         store: StateStore | None = None,
         supervisor: Supervisor | None = None,
         config: Config | None = None,
+        proxy_check_interval: float = DEFAULT_PROXY_CHECK_INTERVAL_SECONDS,
+        proxy_checker: Any = None,
     ):
         self.db_path = Path(db_path)
         self.config_path = Path(config_path)
@@ -69,6 +109,16 @@ class Daemon:
         self.port = port
         self.store = store or StateStore(self.db_path)
         self.config = config or Config.load(self.config_path)
+        self.proxy_check_interval = proxy_check_interval
+        # Пул и проверяющий — свои у демона, а не у HTTP-сервера: та же пара
+        # обслуживает и /control/proxies, и расписание, иначе ручная проверка
+        # и фоновая не знали бы друг о друге и шли бы параллельно.
+        self.proxy_pool = ProxyPool(self.store.db_path)
+        self.proxy_checker = (
+            proxy_checker
+            if proxy_checker is not None
+            else ProxyHealthChecker(self.proxy_pool, on_error=self._log_check_failure)
+        )
         self.supervisor = supervisor or Supervisor(
             store=self.store,
             settings=supervisor_settings_from_config(self.config),
@@ -80,10 +130,13 @@ class Daemon:
             config_path=self.config_path,
             host=host,
             port=port,
+            proxy_pool=self.proxy_pool,
+            proxy_checker=self.proxy_checker,
         )
         self._stop_event = threading.Event()
         self._shutdown_lock = threading.Lock()
         self._supervisor_thread: threading.Thread | None = None
+        self._proxy_check_thread: threading.Thread | None = None
         self._shutdown_thread: threading.Thread | None = None
         self._previous_handlers: dict[int, Any] = {}
         self._started = False
@@ -98,6 +151,7 @@ class Daemon:
         self.server.start()
         self.port = self.server.port
         self._supervisor_thread = self.supervisor.start_background()
+        self._proxy_check_thread = self._start_proxy_check_loop()
         self._started = True
         # Токен в лог не пишется никогда: логи демона читаются из UI и
         # попадают в отчёты о поддержке.
@@ -128,6 +182,13 @@ class Daemon:
             self._stop_event.set()
 
             self.server.stop()
+
+            # Расписание спит на _stop_event, который уже взведён: join —
+            # это ожидание пробуждения, а не истечения интервала.
+            check_thread = self._proxy_check_thread
+            if check_thread is not None:
+                check_thread.join(timeout=SHUTDOWN_GRACE_SECONDS)
+            self._proxy_check_thread = None
 
             thread = self._supervisor_thread
             if thread is not None:
@@ -221,6 +282,59 @@ class Daemon:
         return stopped
 
 
+    # --- периодическая проверка прокси -----------------------------------
+
+    def _start_proxy_check_loop(self) -> threading.Thread | None:
+        """Поднимает нить расписания; None — расписание выключено (интервал <= 0)."""
+        if self.proxy_check_interval <= 0:
+            return None
+        thread = threading.Thread(
+            target=self._run_proxy_check_loop,
+            kwargs={"stop_event": self._stop_event},
+            name=PROXY_CHECK_THREAD_NAME,
+            daemon=True,
+        )
+        thread.start()
+        return thread
+
+    def _run_proxy_check_loop(self, stop_event: threading.Event) -> None:
+        """Ждёт интервал, запускает проверку, повторяет, пока демон жив.
+
+        Первый запуск — через интервал после старта: немедленная проверка
+        при каждом рестарте удвоила бы нагрузку на прокси в момент и так
+        самого нагруженного события. Остановка идёт по тому же stop_event,
+        что и у остальных фоновых работ демона, поэтому shutdown не ждёт
+        истечения интервала.
+        """
+        while True:
+            if stop_event.wait(self.proxy_check_interval):
+                return
+            try:
+                self.proxy_checker.start()
+            except ProxyError as exc:
+                # CheckInProgressError во время ручной проверки — штатное
+                # состояние, а не сбой: в лог уходит причина пропуска.
+                self.store.log(
+                    "WARNING",
+                    "proxy",
+                    "periodic proxy check skipped",
+                    {"error": str(exc)},
+                )
+            except Exception as exc:  # noqa: BLE001 - расписание обязано пережить сбой
+                # Имя типа, а не str(exc): этот путь не про ошибки пула и не
+                # обязан быть свободен от постороннего содержимого.
+                self.store.log(
+                    "ERROR",
+                    "proxy",
+                    "periodic proxy check failed to start",
+                    {"error": type(exc).__name__},
+                )
+
+    def _log_check_failure(self, exc: Exception) -> None:
+        """Ошибки фоновой проверки — в таблицу logs, а не в stderr демона."""
+        self.store.log("ERROR", "proxy", "proxy health check failed", {"error": str(exc)})
+
+
 def supervisor_settings_from_config(config: Config) -> SupervisorSettings:
     """Собирает настройки супервизора из конфига.
 
@@ -244,16 +358,28 @@ def build_daemon(
     token: str | None = None,
     port: int = 8787,
     host: str = LOOPBACK_HOST,
+    proxy_check_interval: float | None = None,
 ) -> Daemon:
     """Собирает демона для запуска как самостоятельного процесса.
 
     Применяет схему к БД: демон запускается на голой машине, где отдельного
     шага "применить миграции" нет, и без этого первый же запрос упал бы с
     "no such table: workers".
+
+    ``proxy_check_interval=None`` — прочитать интервал проверки прокси из
+    окружения; явное значение важнее окружения (так тесты и встраиваемый
+    запуск задают своё, не меняя.environ). Нечисловое значение окружения —
+    ``ValueError``: молчаливый дефолт при опечатке включил бы таймер,
+    который никто не заказывал.
     """
     from engine.db import migrations
 
     resolved_token = token if token is not None else token_from_environ()
+    resolved_interval = (
+        proxy_check_interval_from_environ()
+        if proxy_check_interval is None
+        else proxy_check_interval
+    )
     migrations.migrate(db_path)
 
     return Daemon(
@@ -262,6 +388,7 @@ def build_daemon(
         token=resolved_token,
         port=port,
         host=host,
+        proxy_check_interval=resolved_interval,
     )
 
 
