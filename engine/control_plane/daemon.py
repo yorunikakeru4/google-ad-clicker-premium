@@ -39,6 +39,7 @@ from engine.control_plane.supervisor import (
     SupervisorSettings,
 )
 from engine.proxy_health import ProxyHealthChecker
+from engine.profile_pool import ProfilePool
 from engine.proxy_pool import ProxyError, ProxyPool
 
 # Сигналы, по которым демон завершается. SIGINT — Ctrl+C при запуске из
@@ -114,6 +115,9 @@ class Daemon:
         # обслуживает и /control/proxies, и расписание, иначе ручная проверка
         # и фоновая не знали бы друг о друге и шли бы параллельно.
         self.proxy_pool = ProxyPool(self.store.db_path)
+        # Профили: один экземпляр на всех потребителей — HTTP-список, спавн
+        # супервизора и реапер, — иначе выдача и то, что видит UI, разъезжались бы.
+        self.profile_pool = ProfilePool(self.store.db_path)
         self.proxy_checker = (
             proxy_checker
             if proxy_checker is not None
@@ -125,6 +129,7 @@ class Daemon:
             # Тот же пул, что у /control/proxies и расписания: иначе
             # назначения супервизора и то, что видит UI, разъезжались бы.
             proxy_pool=self.proxy_pool,
+            profile_pool=self.profile_pool,
         )
         self.server = ControlPlaneServer(
             supervisor=self.supervisor,
@@ -134,6 +139,7 @@ class Daemon:
             host=host,
             port=port,
             proxy_pool=self.proxy_pool,
+            profile_pool=self.profile_pool,
             proxy_checker=self.proxy_checker,
         )
         self._stop_event = threading.Event()
