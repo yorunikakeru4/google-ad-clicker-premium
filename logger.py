@@ -76,6 +76,12 @@ def update_log_formats(browser_id: str) -> None:
     file_formatter = logging.Formatter(file_log_format, datefmt="%d-%m-%Y %H:%M:%S")
     file_handler.setFormatter(file_formatter)
 
+    # Фильтры сбрасываются перед добавлением: update_log_formats зовётся на
+    # каждый раунд воркера (раньше — один раз на процесс), и без сброса
+    # цепочка фильтров росла бы неограниченно, заставляя каждую строку
+    # проходить через все накопленные MultiprocessLogFilter.
+    console_handler.filters.clear()
+    file_handler.filters.clear()
     console_handler.addFilter(MultiprocessLogFilter(browser_id))
     file_handler.addFilter(MultiprocessLogFilter(browser_id))
 

@@ -179,7 +179,6 @@ LEGACY_MODULES = (
     "geolocation_db",
     "logger",
     "proxy",
-    "run_in_loop",
     "search_controller",
     "stats",
     "utils",

@@ -112,3 +112,26 @@ def test_default_format_has_no_browser_id(restore_logging):
                    and not hasattr(h, "baseFilename"))
 
     assert "browser_id" not in console.formatter._fmt
+
+
+def test_update_log_formats_does_not_accumulate_filters(restore_logging):
+    """Фильтры обязаны заменяться, а не копиться.
+
+    update_log_formats теперь зовётся на каждый раунд воркера, а не один раз
+    на процесс: без сброса каждый обработчик накапливал бы по фильтру на
+    прогон, и каждая строка лога прошла бы через всю цепочку.
+    """
+    for browser_id in ("1", "2", "3", "4", "5"):
+        update_log_formats(browser_id)
+
+    handlers = list(logger.handlers)
+    assert handlers, "логгер должен иметь обработчики"
+    for handler in handlers:
+        assert len(handler.filters) == 1, (
+            f"у {handler} накопилось {len(handler.filters)} фильтров, ожидался ровно 1"
+        )
+
+    for handler in handlers:
+        assert "<<5>>" in render(handler, make_record()), (
+            "остался фильтр не того воркера: последний вызов обязан перекрыть прежние"
+        )

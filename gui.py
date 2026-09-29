@@ -9,8 +9,6 @@ from tkinter import filedialog
 from config_reader import config
 from logger import logger
 from ad_clicker import main as ad_clicker_main
-from run_ad_clicker import main as run_ad_clicker_main
-from run_in_loop import main as run_in_loop_main
 
 
 customtkinter.set_appearance_mode("dark")
@@ -491,23 +489,7 @@ class ActionButtonsFrame(customtkinter.CTkFrame):
             height=self.button_height,
             command=master.ad_clicker_script,
         )
-        self.run_button_1.grid(row=4, column=0, columnspan=2, padx=10, pady=5, sticky="ew")
-
-        self.run_button_2 = customtkinter.CTkButton(
-            self,
-            text="RUN run_ad_clicker.py",
-            height=self.button_height,
-            command=master.run_ad_clicker_script,
-        )
-        self.run_button_2.grid(row=4, column=2, columnspan=2, padx=10, pady=5, sticky="ew")
-
-        self.run_button_3 = customtkinter.CTkButton(
-            self,
-            text="RUN run_in_loop.py",
-            height=self.button_height,
-            command=master.run_in_loop_script,
-        )
-        self.run_button_3.grid(row=4, column=4, columnspan=2, padx=10, pady=5, sticky="ew")
+        self.run_button_1.grid(row=4, column=0, columnspan=6, padx=10, pady=5, sticky="ew")
 
 
 class ConfigGUI(customtkinter.CTk):
@@ -567,18 +549,6 @@ class ConfigGUI(customtkinter.CTk):
 
         self.close_config_ui()
         ad_clicker_main()
-
-    def run_ad_clicker_script(self):
-        """Run the run_ad_clicker.py script"""
-
-        self.close_config_ui()
-        run_ad_clicker_main()
-
-    def run_in_loop_script(self):
-        """Run the run_in_loop.py script"""
-
-        self.close_config_ui()
-        run_in_loop_main()
 
     def open_config_ui(self) -> None:
         """Open the gui"""

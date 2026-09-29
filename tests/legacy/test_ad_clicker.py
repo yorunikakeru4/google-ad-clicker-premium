@@ -1,12 +1,18 @@
-"""Тесты ad_clicker.get_arg_parser: контракт CLI запуска кликера.
+"""Тесты ad_clicker: CLI-контракт и выбор query/proxy для прогона.
 
-Сама функция main() требует браузера, поэтому покрывается только построение
-парсера аргументов - это чистая функция, через которую проходит весь запуск.
+Сам ``run_scenario`` требует браузера, поэтому не проверяется: покрыты
+чистые функции выбора запроса и прокси и диспетчеризация ``main()``,
+которые и есть поведение, перенесённое в воркер.
 """
+
+import contextlib
+import io
+import sys
 
 import pytest
 
-from ad_clicker import get_arg_parser
+import ad_clicker
+from ad_clicker import get_arg_parser, resolve_proxy, resolve_query
 
 
 def parse(argv):
@@ -93,3 +99,86 @@ def test_help_is_disabled_and_points_to_readme():
 def test_unknown_option_is_rejected():
     with pytest.raises(SystemExit):
         parse(["--definitely-not-an-option"])
+
+
+class TestResolveQuery:
+    """Выбор запроса для прогона: аргумент CLI против config.json."""
+
+    def test_argument_wins_over_config(self, config):
+        config.behavior.query = "from config"
+
+        assert resolve_query(parse(["-q", "from cli"])) == "from cli"
+
+    def test_config_is_used_when_no_argument(self, config):
+        config.behavior.query = "from config"
+
+        assert resolve_query(parse([])) == "from config"
+
+    def test_empty_query_everywhere_is_an_error(self, config):
+        config.behavior.query = ""
+
+        with pytest.raises(SystemExit):
+            resolve_query(parse([]))
+
+
+class TestResolveProxy:
+    """Выбор прокси для прогона: аргумент, файл со списком, конфиг, ничего."""
+
+    def test_argument_wins_over_config(self, config):
+        config.webdriver.proxy = "10.0.0.1:8080"
+
+        assert resolve_proxy(parse(["-p", "1.2.3.4:80"])) == "1.2.3.4:80"
+
+    def test_proxy_file_is_read_and_respected(self, config, set_paths, sandbox_dir):
+        set_paths(proxy_file=str(sandbox_dir / "proxies.txt"))
+        config.webdriver.proxy = "10.0.0.1:8080"
+
+        # Файл главнее одиночного прокси: так же это решает и воркер.
+        assert resolve_proxy(parse([])) in {"127.0.0.1:8080", "user:pass@10.0.0.1:3128"}
+
+    def test_single_proxy_from_config_when_no_file(self, config, set_paths):
+        set_paths(proxy_file="")
+        config.webdriver.proxy = "10.0.0.1:8080"
+
+        assert resolve_proxy(parse([])) == "10.0.0.1:8080"
+
+    def test_nothing_configured_yields_none(self, config, set_paths):
+        set_paths(proxy_file="")
+        config.webdriver.proxy = ""
+
+        assert resolve_proxy(parse([])) is None
+
+
+class TestMainDispatch:
+    """main() разбирает argv и передаёт управление в run_scenario."""
+
+    def test_main_hands_over_to_run_scenario(self, monkeypatch, config, set_paths):
+        monkeypatch.setattr(sys, "argv", ["ad_clicker.py"])
+        set_paths(proxy_file="")
+        config.webdriver.proxy = ""
+        config.behavior.query = "usb hub"
+        captured = {}
+
+        def fake_run_scenario(**kwargs):
+            captured.update(kwargs)
+            return True
+
+        monkeypatch.setattr(ad_clicker, "run_scenario", fake_run_scenario)
+
+        ad_clicker.main()
+
+        assert captured["query"] == "usb hub"
+        assert captured["proxy"] is None
+        assert captured["browser_id"] is None
+        assert captured["device_id"] is None
+        assert captured["check_stealth"] is False
+
+    def test_report_mode_does_not_run_a_scenario(self, monkeypatch, config):
+        monkeypatch.setattr(sys, "argv", ["ad_clicker.py", "--report_clicks"])
+        calls = []
+        monkeypatch.setattr(ad_clicker, "run_scenario", lambda **kwargs: calls.append(kwargs))
+
+        with contextlib.redirect_stdout(io.StringIO()):
+            ad_clicker.main()
+
+        assert calls == [], "отчёт не должен запускать сценарий"

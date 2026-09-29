@@ -77,9 +77,27 @@ See [here](https://github.com/coskundeniz/ad_clicker/wiki/Setup-for-Windows) for
 
 * Before running the below commands for the first time, run `python ad_clicker.py -q test` once and end it by pressing CTRL+C after seeing the browser opened.
 
-* Run `python ad_clicker.py` for a single run with single browser.
-* Run `python run_ad_clicker.py` for a single run with multiple browsers.
-* Run `python run_in_loop.py` for running in loop with either single or multiple browsers.
+* Run `python -m engine.control_plane.daemon` for the control daemon (HTTP API + worker supervisor).
+
+    The daemon refuses to start without a token:
+
+    ```bash
+    export ADCLICKER_CONTROL_TOKEN=$(openssl rand -hex 16)
+    python -m engine.control_plane.daemon
+    ```
+
+* Send `POST /control/start` to the daemon. Every control request must carry the token:
+
+    ```bash
+    curl -X POST \
+         -H "X-Auth-Token: $ADCLICKER_CONTROL_TOKEN" \
+         -H 'Content-Type: application/json' \
+         -d '{"workers": 3}' \
+         http://127.0.0.1:8787/control/start
+    ```
+
+    The daemon supervises `python -m engine.worker` processes itself; start a worker by hand only for debugging.
+* Run `python ad_clicker.py` for a single run with a single browser, outside the daemon.
 * Run `python gui.py` for opening the following ui to configure/run.
 
     ![gui](assets/ad_clicker_gui.png)
@@ -145,7 +163,7 @@ The followings are the default values in the config file.
 }
 ```
 
-* **query_file**: File path to read queries to search. Used with `run_ad_clicker.py` and `run_in_loop.py`. Put a query for each line.
+* **query_file**: File path to read queries to search. Used by the multi-browser worker. Put a query for each line.
 
 * **proxy_file**: File path to read proxies. Put a proxy for each line.
 
@@ -209,27 +227,26 @@ The followings are the default values in the config file.
     * 4: click 1 non-ad, then 1 ad on each round
     * 5: shuffle ad and non-ad links and click whichever order is created (default)
 
-* **browser_count**: Maximum number of browsers to run concurrently. Used with `run_ad_clicker.py` and `run_in_loop.py`.
+* **browser_count**: Maximum number of browsers to run concurrently. Used by the multi-browser worker.
     * If the value is 0, the number of cpu cores is used.
 
-* **multiprocess_style**: Style of the multiprocess run. Used with `run_ad_clicker.py` and `run_in_loop.py`.
+* **multiprocess_style**: Style of the multiprocess run. Used by the multi-browser worker.
     * 1: different query on each browser (default)
-        * e.g. First, queries in the file are shuffled. Then, 5 browsers search the first 5 queries from the file.
+        * e.g. 5 browsers take queries 1-5 from the file, in the next round 6-10, and so on.
     * 2: same query on each browser
         * e.g. 5 browsers search the first query from file. After they are completed, second group of 5 browsers search the second query and so on.
 
-    * If the number of queries or proxies are less than the number of browsers to run, they are cycled.
-    * If *multiprocess_style* is 1, queries read from the file are shuffled.
+    * Queries and proxies are dealt out by browser index, so two browsers never pick the same item in a round. If the file has fewer items than browsers, the list wraps around instead of failing.
 
-* **loop_wait_time**: Wait time between runs in seconds. Default is 60. Used with `run_in_loop.py`.
+* **loop_wait_time**: Wait time between runs in seconds. Default is 60. Used by the worker loop.
 
 * **wait_factor**: Wait factor to modify all sleeps except loop wait. The default value is 1.0.
     * For example, if you want to decrease waits by half, you can set this to 0.5, or if you want to increase them by 30%, you can use this as 1.3.
     * Note that especially with decreasing, it can make the tool faster but can not guarantee proper functioning.
 
-* **running_interval_start**: Running interval start in "HH:MM" format. Used with `run_in_loop.py`.
+* **running_interval_start**: Running interval start in "HH:MM" format. Used by the worker loop.
     * If the current time is outside of the interval, it waits the start time to run again.
-* **running_interval_end**: Running interval end in "HH:MM" format. Used with `run_in_loop.py`.
+* **running_interval_end**: Running interval end in "HH:MM" format. Used by the worker loop.
     * Difference between start and end time must be at least 10 minutes.
     * If both start and end is "00:00"(default), no interval check is done.
 
@@ -248,7 +265,7 @@ The followings are the default values in the config file.
 
     * There is a limit of 2048 characters. If the length of the message exceeds this, it will be truncated.
 
-* **send_to_android**: Send links to open on connected Android mobile device. Used with `run_ad_clicker.py` and `run_in_loop.py`.
+* **send_to_android**: Send links to open on connected Android mobile device. Used by the multi-browser worker.
 
     * Note that mobile device must be connected to the same wireless network or directly via USB cable for one of these usages.
 
@@ -363,14 +380,13 @@ Apply the following steps for once to enable Telegram notifications.
 
 #### 1. ValueError: max() arg is an empty sequence
 
-* If you see this error, run the following commands.
+* The message comes from the chromedriver bootstrap, not from the clicker itself. Warm it up once:
 
-    1. Delete `.MULTI_BROWSERS_IN_USE` file if exists.
-        * `rm .MULTI_BROWSERS_IN_USE` for Linux or `del .MULTI_BROWSERS_IN_USE` for Windows.
+    1. Run `python ad_clicker.py -q test` and end it by pressing CTRL+C after seeing the browser opened.
 
-    2. Run `python ad_clicker.py -q test` and end it by pressing CTRL+C after seeing the browser opened.
+    2. Continue with one of the commands from [How to run](#how-to-run) section.
 
-    3. Continue with one of the commands from [How to run](#how-to-run) section.
+* Note: the old `.MULTI_BROWSERS_IN_USE` marker is not read by anything anymore — the multi-browser flag now comes from the daemon's environment (`ADCLICKER_MULTI_BROWSERS`). Deleting a leftover copy is harmless but has no effect.
 
 #### 2. Chrome version mismatch error
 

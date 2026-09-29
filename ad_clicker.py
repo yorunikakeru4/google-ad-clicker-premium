@@ -60,80 +60,60 @@ def get_arg_parser() -> ArgumentParser:
     return arg_parser
 
 
-def main():
-    """Entry point for the tool"""
+def resolve_query(args) -> str:
+    """Один запрос для прогона: из аргумента, иначе из конфига.
 
-    arg_parser = get_arg_parser()
-    args = arg_parser.parse_args()
-
-    if args.report_clicks:
-        report_date = datetime.now().strftime("%d-%m-%Y") if not args.date else args.date
-
-        clicklogs_db_client = ClickLogsDB()
-        click_results = clicklogs_db_client.query_clicks(click_date=report_date)
-
-        border = (
-            "+" + "-" * 70 + "+" + "-" * 27 + "+" + "-" * 9 + "+" + "-" * 12 + "+" + "-" * 12 + "+"
-        )
-
-        if click_results:
-            print(border)
-            print(
-                f"| {'URL':68s} | {'Query':25s} | {'Clicks':7s} | {'Time':10s} | {'Category':10s} |"
-            )
-            print(border)
-
-            for result in click_results:
-                url, clicks, category, click_time, search_query = result
-
-                if len(url) > 68:
-                    url = url[:65] + "..."
-
-                print(
-                    f"| {url:68s} | {search_query:25s} | {str(clicks):7s} | {click_time:10s} | {category:10s} |"
-                )
-
-                print(border)
-
-            # write results to Excel with name click_report_dd-mm-yyyy.xlsx
-            if args.excel:
-                generate_click_report(click_results, report_date)
-
-        else:
-            logger.info(f"No click result was found for {report_date}!")
-
-        return
-
-    if args.enable_telegram:
-        if config.behavior.telegram_enabled:
-            start_bot()
-            return
-        else:
-            logger.info("Please set the telegram_enabled option to true in config and try again.")
-            return
-
-    if args.id:
-        update_log_formats(args.id)
-
+    Выделено из main(), потому что воркер передаёт запрос сам — он делит
+    очередь по браузерам, а CLI по-прежнему берёт его из config.json.
+    """
     if args.query:
-        query = args.query
-    else:
-        if not config.behavior.query:
-            logger.error("Fill the query parameter!")
-            raise SystemExit()
+        return args.query
 
-        query = config.behavior.query
+    if not config.behavior.query:
+        logger.error("Fill the query parameter!")
+        raise SystemExit()
 
+    return config.behavior.query
+
+
+def resolve_proxy(args) -> str | None:
+    """Один прокси для прогона: аргумент, файл со списком, конфиг, ничего."""
     if args.proxy:
-        proxy = args.proxy
-    elif config.paths.proxy_file:
+        return args.proxy
+    if config.paths.proxy_file:
         proxies = get_proxies()
         logger.debug(f"Proxies: {proxies}")
-        proxy = random.choice(proxies)
-    elif config.webdriver.proxy:
-        proxy = config.webdriver.proxy
-    else:
-        proxy = None
+        return random.choice(proxies)
+    if config.webdriver.proxy:
+        return config.webdriver.proxy
+    return None
+
+
+def run_scenario(
+    *,
+    query: str,
+    proxy: str | None = None,
+    browser_id: str | None = None,
+    device_id: str | None = None,
+    check_stealth: bool = False,
+) -> bool:
+    """Один прогон сценария: драйвер, поиск, клики, teardown.
+
+    Тело бывшего ``main()`` после разбора аргументов. Оставлено здесь, а не
+    перенесено в ``engine/``: движок переиспользует сценарий как есть (план,
+    раздел 3), а значит и жить он должен в том же модуле, что и раньше.
+
+    Возвращает ``False``, если прогон не доехал до конца. Сигнал обязателен:
+    legacy глотает исключения сам, чтобы один упавший прогон не ронял весь
+    процесс, но без возвращаемого результата вызывающий не отличил бы
+    завершившийся сценарий от упавшего и записал бы в статистику успех.
+
+    Исключения из подготовки (драйвер, файлы) не гасятся намеренно:
+    вызывающая сторона решает, что делать — CLI показывает трейсбек, а цикл
+    воркера ловит их и продолжает работу.
+    """
+    if browser_id:
+        update_log_formats(browser_id)
 
     domains = get_domains()
 
@@ -143,7 +123,7 @@ def main():
 
     driver, country_code = create_webdriver(proxy, user_agent, plugin_folder_name)
 
-    if args.check_stealth:
+    if check_stealth:
         from time import sleep
         from webdriver import execute_stealth_js_code
 
@@ -166,15 +146,16 @@ def main():
         hooks.before_search_hook(driver)
 
     search_controller = None
+    completed = True
 
     try:
         search_controller = SearchController(driver, query, country_code)
 
-        if args.id:
-            search_controller.set_browser_id(args.id)
+        if browser_id:
+            search_controller.set_browser_id(browser_id)
 
-        if args.device_id:
-            search_controller.assign_android_device(args.device_id)
+        if device_id:
+            search_controller.assign_android_device(device_id)
 
         ads, non_ad_links, shopping_ads = search_controller.search_for_ads(non_ad_domains=domains)
 
@@ -227,6 +208,7 @@ def main():
             logger.info(search_controller.stats)
 
     except Exception as exp:
+        completed = False
         logger.error("Exception occurred. See the details in the log file.")
 
         if config.webdriver.ss_on_exception:
@@ -256,6 +238,69 @@ def main():
             plugin_folder = Path.cwd() / "proxy_auth_plugin" / plugin_folder_name
             logger.debug(f"Removing '{plugin_folder}' folder...")
             shutil.rmtree(plugin_folder, ignore_errors=True)
+
+    return completed
+
+
+def main():
+    """Entry point for the tool"""
+
+    arg_parser = get_arg_parser()
+    args = arg_parser.parse_args()
+
+    if args.report_clicks:
+        report_date = datetime.now().strftime("%d-%m-%Y") if not args.date else args.date
+
+        clicklogs_db_client = ClickLogsDB()
+        click_results = clicklogs_db_client.query_clicks(click_date=report_date)
+
+        border = (
+            "+" + "-" * 70 + "+" + "-" * 27 + "+" + "-" * 9 + "+" + "-" * 12 + "+" + "-" * 12 + "+"
+        )
+
+        if click_results:
+            print(border)
+            print(
+                f"| {'URL':68s} | {'Query':25s} | {'Clicks':7s} | {'Time':10s} | {'Category':10s} |"
+            )
+            print(border)
+
+            for result in click_results:
+                url, clicks, category, click_time, search_query = result
+
+                if len(url) > 68:
+                    url = url[:65] + "..."
+
+                print(
+                    f"| {url:68s} | {search_query:25s} | {str(clicks):7s} | {click_time:10s} | {category:10s} |"
+                )
+
+                print(border)
+
+            # write results to Excel with name click_report_dd-mm-yyyy.xlsx
+            if args.excel:
+                generate_click_report(click_results, report_date)
+
+        else:
+            logger.info(f"No click result was found for {report_date}!")
+
+        return
+
+    if args.enable_telegram:
+        if config.behavior.telegram_enabled:
+            start_bot()
+            return
+        else:
+            logger.info("Please set the telegram_enabled option to true in config and try again.")
+            return
+
+    run_scenario(
+        query=resolve_query(args),
+        proxy=resolve_proxy(args),
+        browser_id=args.id,
+        device_id=args.device_id,
+        check_stealth=args.check_stealth,
+    )
 
 
 if __name__ == "__main__":
