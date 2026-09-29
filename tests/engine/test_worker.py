@@ -566,7 +566,9 @@ class TestProfileStatuses:
         migrations.migrate(db)
         pool = ProfilePool(db)
         pool.add_profiles([{"name": "acc-1"}])
-        profile = pool.list_profiles()[0]
+        # Назначение делает супервизор до спавна — здесь та же операция.
+        profile = pool.take_for_worker("br-7")
+        assert profile is not None
         monkeypatch.setenv(PROFILE_ID_ENV, str(profile["id"]))
 
         stop = threading.Event()
