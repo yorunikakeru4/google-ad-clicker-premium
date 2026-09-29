@@ -12,7 +12,10 @@ from pathlib import Path
 from selenium.webdriver import ChromeOptions
 
 from config_reader import config
-from logger import logger
+from engine.log import get_logger
+
+
+log = get_logger()
 
 
 def get_proxies() -> list[str]:
@@ -70,7 +73,11 @@ class _CredentialsHandler(BaseHTTPRequestHandler):
     def log_message(self, message_format: str, *args) -> None:
         """Log the request line through the project logger instead of stderr"""
 
-        logger.debug(f"Proxy credentials endpoint: {message_format % args}")
+        log.debug(
+            "proxy",
+            "Proxy credentials endpoint",
+            fields={"request": message_format % args},
+        )
 
 
 def _stop_credentials_service(server: HTTPServer) -> None:
@@ -104,7 +111,11 @@ def _open_credentials_service(username: str, password: str) -> int:
 
     threading.Thread(target=server.serve_forever, daemon=True).start()
 
-    logger.debug(f"Proxy credentials are served once on 127.0.0.1:{server.server_address[1]}")
+    log.debug(
+        "proxy",
+        "Proxy credentials are served once",
+        fields={"endpoint": f"127.0.0.1:{server.server_address[1]}"},
+    )
 
     return server.server_address[1]
 
@@ -277,7 +288,7 @@ chrome.webRequest.onAuthRequired.addListener(
 
     plugin_folder = plugins_folder / plugin_folder_name
 
-    logger.debug(f"Creating '{plugin_folder}' folder...")
+    log.debug("proxy", "Creating folder...", fields={"folder": str(plugin_folder)})
     plugin_folder.mkdir(exist_ok=True)
 
     manifest_path = plugin_folder / "manifest.json"
@@ -292,6 +303,6 @@ chrome.webRequest.onAuthRequired.addListener(
         raise RuntimeError("Failed to create extension files")
 
     extension_path = str(plugin_folder.resolve())
-    logger.debug(f"Loading extension from: {extension_path}")
+    log.debug("proxy", "Loading extension from", fields={"path": extension_path})
 
     chrome_options.add_argument(f"--load-extension={extension_path}")

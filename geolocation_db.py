@@ -3,7 +3,10 @@ from contextlib import contextmanager
 
 import sqlite3
 
-from logger import logger
+from engine.log import get_logger
+
+
+log = get_logger()
 
 
 DBCursor = sqlite3.Connection.cursor
@@ -49,13 +52,27 @@ class GeolocationDB:
                         "INSERT INTO geolocation VALUES (?, ?, ?, ?)",
                         (ip_address, latitude, longitude, country_code),
                     )
-                    logger.debug(
-                        f"[{ip_address}: ({latitude}, {longitude}, {country_code})] matching added to database."
+                    log.debug(
+                        "proxy",
+                        "matching added to database.",
+                        fields={
+                            "ip_address": ip_address,
+                            "latitude": latitude,
+                            "longitude": longitude,
+                            "country_code": country_code,
+                        },
                     )
 
                 else:
-                    logger.debug(
-                        f"[{ip_address}: ({latitude}, {longitude}, {country_code})] already exists. Skipping..."
+                    log.debug(
+                        "proxy",
+                        "already exists. Skipping...",
+                        fields={
+                            "ip_address": ip_address,
+                            "latitude": latitude,
+                            "longitude": longitude,
+                            "country_code": country_code,
+                        },
                     )
 
         except sqlite3.Error as exp:
@@ -80,7 +97,11 @@ class GeolocationDB:
                 found = geolocation_db_cursor.fetchone()
 
                 if not found:
-                    logger.debug(f"Couldn't found {ip_address} in database!")
+                    log.debug(
+                    "proxy",
+                    "Couldn't find IP in database!",
+                    fields={"ip_address": ip_address},
+                )
                     return None
                 else:
                     return (found[1], found[2], found[3])
@@ -114,7 +135,11 @@ class GeolocationDB:
             yield geolocation_db.cursor()
 
         except sqlite3.Error as exp:
-            logger.error(exp)
+            log.error(
+                "proxy",
+                "Failed to connect to geolocation database",
+                fields={"error": str(exp)},
+            )
             raise RuntimeError("Failed to connect to geolocation database!") from exp
 
         finally:

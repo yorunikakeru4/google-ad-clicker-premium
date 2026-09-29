@@ -4,15 +4,28 @@ import traceback
 from typing import Optional
 
 import customtkinter
-from tkinter import filedialog
+from tkinter import filedialog, messagebox
 
 from config_reader import config
+from engine.control_plane.config import validate_settings
 from logger import logger
 from ad_clicker import main as ad_clicker_main
 
 
 customtkinter.set_appearance_mode("dark")
 customtkinter.set_default_color_theme("green")
+
+
+def _format_problems(problems: list[dict[str, str]]) -> str:
+    """Список проблем в виде строк «поле: сообщение» для диалога."""
+
+    return "\n".join(f"{problem['field']}: {problem['message']}" for problem in problems)
+
+
+def _show_validation_problems(problems: list[dict[str, str]]) -> None:
+    """Показать ошибки валидации вместо записи и traceback."""
+
+    messagebox.showerror("Invalid configuration", _format_problems(problems))
 
 
 class PathsFrame(customtkinter.CTkFrame):
@@ -528,6 +541,14 @@ class ConfigGUI(customtkinter.CTk):
         }
 
         logger.debug(json.dumps(config_data, indent=4))
+
+        # Валидация до записи: невалидный конфиг — это диалог со списком проблем,
+        # а не изменённый config.json или SystemExit из read_parameters().
+        problems = validate_settings(config_data)
+        if problems:
+            logger.error(f"Configuration was not saved, {len(problems)} validation problem(s).")
+            _show_validation_problems(problems)
+            return
 
         with open("config.json", "w", encoding="utf-8") as config_file:
             json.dump(config_data, config_file, indent=4)

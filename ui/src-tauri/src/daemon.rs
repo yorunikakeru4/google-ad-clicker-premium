@@ -72,8 +72,9 @@ pub const STOP_GRACE: Duration = Duration::from_secs(45);
 /// Как часто монитор спрашивает у процесса, жив ли он.
 pub const POLL_INTERVAL: Duration = Duration::from_millis(50);
 
-/// Токен control API. Генерируется, если не задан в окружении.
-pub const TOKEN_ENV: &str = "ADCLICKER_CONTROL_TOKEN";
+/// Токен control API. Одна константа на весь крейт: control.rs читает ровно
+/// её, а два независимых объявления разошлись бы при первом же переименовании.
+pub use crate::control::TOKEN_ENV;
 
 #[derive(Clone, Debug)]
 pub struct SupervisorOptions {
@@ -195,34 +196,28 @@ pub fn find_project_root_within(start: &Path, max_up: usize) -> Option<PathBuf> 
     None
 }
 
-/// Токен control API: 16 байт из `/dev/urandom` в hex, ``None`` без энтропии.
+/// Токен control API из окружения.
 ///
-/// Токен — единственная защита порта на loopback, поэтому подставлять вместо
-/// него время и PID нельзя: тот же PID с тем же временем повторится, а
-/// предсказуемый токен превращает loopback-защиту в фикцию. Нет энтропии —
-/// нет запуска.
-pub fn generate_token() -> Option<String> {
-    let mut buffer = [0u8; 16];
-    let mut source = fs::File::open("/dev/urandom").ok()?;
-    source.read_exact(&mut buffer).ok()?;
-    Some(buffer.iter().map(|byte| format!("{byte:02x}")).collect())
-}
-
-/// Выбор токена: явно заданный, иначе из энтропии, иначе отказ.
-///
-/// Отделено от ``resolve`` ради проверяемости: единственный способ заставить
-/// отказ по-настоящему — подставить ``None`` вместо энтропии, а
-/// ``/dev/urandom`` в тесте не отключишь.
-fn token_for(provided: Option<&str>, generated: Option<String>) -> Result<String, String> {
-    if let Some(value) = provided {
-        let trimmed = value.trim();
-        if !trimmed.is_empty() {
-            return Ok(trimmed.to_string());
-        }
+/// Обязателен, а не генерируется: control.rs трактует отсутствие переменной
+/// как явную ошибку и сознательно держит токен вне frontend-кода, а
+/// параллельный источник значений дал бы UI токен, с которым оно не умеет
+/// авторизоваться. Перевод строки отклоняется — он сломал бы HTTP-заголовок.
+fn token_from_vars(vars: &HashMap<String, String>) -> Result<String, String> {
+    let token = vars
+        .get(TOKEN_ENV)
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            format!(
+                "{TOKEN_ENV} не задана: демон без токена не стартует, \
+                 а UI не сможет авторизоваться. Задайте её при запуске."
+            )
+        })?
+        .to_string();
+    if token.contains('\r') || token.contains('\n') {
+        return Err(format!("{TOKEN_ENV} содержит перевод строки"));
     }
-    generated.ok_or_else(|| {
-        "нет источника энтропии для токена: /dev/urandom недоступен".to_string()
-    })
+    Ok(token)
 }
 
 /// Как запускать демон: программа, аргументы, каталог, переменные.
@@ -276,7 +271,7 @@ impl DaemonSpec {
             .iter()
             .map(|(key, value)| (key.clone(), value.clone()))
             .collect();
-        let token = token_for(vars.get(TOKEN_ENV).map(String::as_str), generate_token())?;
+        let token = token_from_vars(vars)?;
         match env_pairs.iter_mut().find(|(key, _)| key == TOKEN_ENV) {
             Some((_, value)) => *value = token,
             None => env_pairs.push((TOKEN_ENV.to_string(), token)),
@@ -300,7 +295,6 @@ pub struct DaemonStatus {
     pub consecutive_failures: u32,
     pub gave_up: bool,
     pub last_error: Option<String>,
-    pub token: Option<String>,
 }
 
 #[derive(Debug, Default)]
@@ -315,7 +309,6 @@ struct Inner {
     consecutive_failures: u32,
     gave_up: bool,
     last_error: Option<String>,
-    token: Option<String>,
 }
 
 /// Общее состояние монитора и управляющих вызовов.
@@ -355,7 +348,6 @@ impl DaemonSupervisor {
             consecutive_failures: inner.consecutive_failures,
             gave_up: inner.gave_up,
             last_error: inner.last_error.clone(),
-            token: inner.token.clone(),
         }
     }
 
@@ -386,11 +378,6 @@ impl DaemonSupervisor {
             );
         }
         self.shared.stop.store(false, Ordering::SeqCst);
-        inner.token = spec
-            .env
-            .iter()
-            .find(|(key, _)| key == TOKEN_ENV)
-            .map(|(_, value)| value.clone());
         inner.gave_up = false;
         inner.restarts = 0;
         inner.consecutive_failures = 0;
@@ -780,6 +767,7 @@ mod tests {
 
         let mut vars = HashMap::new();
         vars.insert("PATH".to_string(), "/usr/bin".to_string());
+        vars.insert(TOKEN_ENV.to_string(), "provided-token".to_string());
         let spec = DaemonSpec::resolve(&vars, root.clone()).expect("спецификация собирается");
 
         assert_eq!(spec.program, DEFAULT_PYTHON);
@@ -788,8 +776,8 @@ mod tests {
         assert!(
             spec.env
                 .iter()
-                .any(|(key, value)| key == TOKEN_ENV && value.len() >= 32),
-            "токен обязан подставляться даже без переменной в окружении"
+                .any(|(key, value)| key == TOKEN_ENV && value == "provided-token"),
+            "токен обязан дойти до демона как есть"
         );
         let _ = fs::remove_dir_all(&root);
     }
@@ -861,40 +849,37 @@ mod tests {
     }
 
     #[test]
-    fn token_is_random_and_long_enough() {
-        let first = generate_token().expect("энтропия должна быть доступна");
-        let second = generate_token().expect("энтропия должна быть доступна");
+    fn token_is_required_and_not_invented() {
+        // Никакой генерации: control.rs считает отсутствие переменной явной
+        // ошибкой, и параллельный источник дал бы UI токен, которым оно не
+        // умеет авторизовываться.
+        let error =
+            token_from_vars(&HashMap::new()).expect_err("без токена старт запрещён");
+        assert!(error.contains(TOKEN_ENV), "причина должна назвать переменную: {error}");
 
-        assert!(first.len() >= 32, "hex 16 байт даёт 32 символа, получено {first}");
-        assert_ne!(first, second, "токены обязаны различаться");
+        let blank =
+            token_from_vars(&HashMap::from([(TOKEN_ENV.to_string(), "   ".to_string())]))
+                .expect_err("пробелы — не токен");
+        assert!(blank.contains(TOKEN_ENV), "причина должна назвать переменную: {blank}");
     }
 
     #[test]
-    fn token_is_refused_without_entropy_instead_of_falling_back() {
-        // Фолбэк «предсказуемо, но работает» запрещён: токен — единственная
-        // защита loopback-порта, и время с PID повторяемы.
-        let error = token_for(None, None).expect_err("без энтропии старт запрещён");
-        assert!(error.contains("энтропии"), "причина должна быть названа: {error}");
+    fn token_is_taken_verbatim_from_the_environment() {
+        let vars = HashMap::from([(TOKEN_ENV.to_string(), "  known-token  ".to_string())]);
 
-        let blank = token_for(Some("   "), None).expect_err("пробелы — не токен");
-        assert!(blank.contains("энтропии"), "причина должна быть названа: {blank}");
-    }
-
-    #[test]
-    fn token_prefers_the_value_from_the_environment() {
         assert_eq!(
-            token_for(Some("  known-token  "), None).expect("заданный токен принимается"),
+            token_from_vars(&vars).expect("заданный токен принимается"),
             "known-token"
         );
-        assert_eq!(
-            token_for(None, Some("generated".to_string())).expect("энтропия принимается"),
-            "generated"
-        );
-        // Заданный токен главнее: сгенерированный в этот момент не нужен.
-        assert_eq!(
-            token_for(Some("explicit"), None).expect("заданный токен принимается"),
-            "explicit"
-        );
+    }
+
+    #[test]
+    fn token_with_a_newline_is_refused() {
+        // Перевод строки в значении сломал бы HTTP-заголовок запроса.
+        let vars = HashMap::from([(TOKEN_ENV.to_string(), "bad\ntoken".to_string())]);
+
+        let error = token_from_vars(&vars).expect_err("токен с переводом строки должен быть отвергнут");
+        assert!(error.contains("перевод строки"), "{error}");
     }
 
     // --- жизненный цикл ---------------------------------------------------

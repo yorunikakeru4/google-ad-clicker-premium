@@ -11,6 +11,14 @@ Chrome ходит на настоящий прокси по ``--proxy-server=hos
 в логи и в тексты исключений — маскирование то же, что в ``webdriver.py``:
 первые/последние 3 символа, остальное ``***``, короткие значения — ``***``.
 
+Помимо авторизации, менеджер ведёт метрику «запросы/час» (план.md, фаза 4):
+на старте и на каждой новой сессии таргета уходит ``Network.enable``, пары
+событий ``Network.*`` коррелирует :class:`engine.network_recorder.NetworkRecorder`
+и готовые строки уходят в ``network_requests`` через общий логгер процесса —
+``browser_id`` воркера, тот же writer, что и у логов, без нового соединения.
+Запись без ответа не создаётся (статус до ответа неизвестен), а разобрать
+событие не удалось — счётчики коррелятора плюс debug-лог без URL.
+
 Три транспорта прокси (``resolve_proxy_transport``):
 ``cdp_auth`` (по умолчанию) | ``extension`` | ``direct``.
 
@@ -24,12 +32,13 @@ max_failures`` прокси считается мёртвым и один раз
 
 from __future__ import annotations
 
-import logging
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
 from engine.cdp import CdpClient, resolve_browser_ws_url
+from engine.log import get_logger
+from engine.network_recorder import NetworkRecorder
 
 __all__ = [
     "DEFAULT_PROXY_TRANSPORT",
@@ -46,7 +55,7 @@ __all__ = [
     "start_proxy_auth",
 ]
 
-logger = logging.getLogger(__name__)
+log = get_logger()
 
 PROXY_TRANSPORT_CDP_AUTH = "cdp_auth"
 PROXY_TRANSPORT_EXTENSION = "extension"
@@ -106,14 +115,34 @@ def resolve_proxy_transport(value: str | None) -> str:
     return value
 
 
+def _attached_session_id(message: Any) -> str | None:
+    """``sessionId`` из Target.attachedToTarget/detachedFromTarget; None, если бито."""
+    if not isinstance(message, dict):
+        return None
+    params = message.get("params")
+    if not isinstance(params, dict):
+        return None
+    session_id = params.get("sessionId")
+    if not isinstance(session_id, str) or not session_id:
+        return None
+    return session_id
+
+
 class ProxyAuthManager:
-    """Отвечает на ``Fetch.authRequired`` кредами прокси через готовый CdpClient.
+    """Авторизация прокси по CDP плюс запись метрики сетевых запросов.
 
     ``start()`` обязана слать ``Target.setAutoAttach`` (иначе не ловятся
     вызовы из новых вкладок — а сценарий открывает вкладку на каждый клик)
     и ``Fetch.enable`` строго без ``patterns``: с ``patterns`` CDP начнёт
     перехватывать все запросы и требовать ``Fetch.continueRequest`` на каждый,
-    вкладки зависнут.
+    вкладки зависнут. Там же отдельной командой включается ``Network.enable``:
+    это и есть включение метрики «запросы/час».
+
+    ``Target.attachedToTarget`` обрабатывается так же — новая сессия таргета
+    получает и ``Fetch.enable`` (без patterns, как требует план.md §2.1), и
+    ``Network.enable``: домены включаются per-session, события других
+    сессий на неё не приходят. Закрытие сессии снимает её незавершённые
+    запросы из окна ожидания коррелятора.
     """
 
     def __init__(
@@ -138,7 +167,8 @@ class ProxyAuthManager:
         self._dead = False
         self._dead_notified = False
         self._started = False
-        self._unsubscribe: Callable[[], None] | None = None
+        self._unsubscribes: list[Callable[[], None]] = []
+        self._recorder = NetworkRecorder()
 
     @property
     def fail_count(self) -> int:
@@ -148,26 +178,41 @@ class ProxyAuthManager:
     def dead(self) -> bool:
         return self._dead
 
+    @property
+    def recorder(self) -> NetworkRecorder:
+        """Коррелятор Network-событий; счётчики — для диагностики и тестов."""
+        return self._recorder
+
     def start(self) -> ProxyAuthManager:
-        """Подписывается на authRequired, включает auto-attach и Fetch-домен."""
+        """Подписывается на события, включает auto-attach, Fetch и Network."""
         if self._started:
             return self
-        self._unsubscribe = self._client.on("Fetch.authRequired", self.handle_event)
+        self._unsubscribes = [
+            self._client.on("Fetch.authRequired", self.handle_event),
+            self._client.on("Target.attachedToTarget", self.handle_attached),
+            self._client.on("Target.detachedFromTarget", self.handle_detached),
+            self._client.on("Network.requestWillBeSent", self.handle_network_event),
+            self._client.on("Network.responseReceived", self.handle_network_event),
+            self._client.on("Network.loadingFailed", self.handle_network_event),
+        ]
         self._client.send(
             "Target.setAutoAttach",
             {"autoAttach": True, "waitForDebuggerOnStart": False, "flatten": True},
         )
         # Без patterns: иначе CDP перехватит весь трафик и вкладки встанут.
         self._client.send("Fetch.enable", {"handleAuthRequests": True})
+        # Отдельной командой рядом с Fetch — включение метрики запросов/час.
+        self._client.send("Network.enable")
         self._started = True
-        logger.info("proxy CDP auth enabled (user %s)", mask_secret(self._username))
+        log.info("proxy", "proxy CDP auth enabled", fields={"user": mask_secret(self._username)})
+        log.debug("browser", "network metrics enabled")
         return self
 
     def stop(self) -> None:
         """Отписывается; свой клиент (из create_proxy_auth) ещё и закрывает."""
-        if self._unsubscribe is not None:
-            self._unsubscribe()
-            self._unsubscribe = None
+        for unsubscribe in self._unsubscribes:
+            unsubscribe()
+        self._unsubscribes = []
         self._started = False
         if self._owns_client:
             self._client.stop()
@@ -181,22 +226,82 @@ class ProxyAuthManager:
             return
         self._answer_auth_challenge(params)
 
+    def handle_attached(self, message: dict[str, Any]) -> None:
+        """Новая сессия таргета: та же пара Fetch + Network, что и на старте."""
+        session_id = _attached_session_id(message)
+        if session_id is None:
+            log.debug("proxy", "attachedToTarget without sessionId, ignoring")
+            return
+        # Fetch — тот же контракт §2.1 (handleAuthRequests, без patterns),
+        # Network.enable — события этой сессии для метрики запросов/час.
+        self._client.send(
+            "Fetch.enable", {"handleAuthRequests": True}, session_id=session_id
+        )
+        self._client.send("Network.enable", session_id=session_id)
+
+    def handle_detached(self, message: dict[str, Any]) -> None:
+        """Сессия закрыта: её незавершённые запросы больше не дождутся ответа."""
+        session_id = _attached_session_id(message)
+        if session_id is None:
+            return
+        dropped = self._recorder.drop_session(session_id)
+        if dropped:
+            log.debug(
+                "browser",
+                "network requests dropped with closed session",
+                fields={"dropped": dropped},
+            )
+
+    def handle_network_event(self, message: dict[str, Any]) -> None:
+        """Коррелирует событие Network.* и пишет готовую запись в store."""
+        recorder = self._recorder
+        ignored_before = recorder.ignored
+        record = recorder.handle(message)
+        if record is not None:
+            # browser_id подставляет биндинг общего логгера воркера; зеркала
+            # нет — полный URL с query в файловый лог не уходит.
+            log.record_network_request(
+                method=record.method,
+                url=record.url,
+                resource_type=record.resource_type,
+                status=record.status,
+                ts=record.ts,
+            )
+            return
+        if recorder.ignored > ignored_before:
+            # Событие должно было дать запись, но разобрать его не удалось.
+            # URL сознательно не логируется: это счётчик, а не отчёт.
+            event = message.get("method") if isinstance(message, dict) else None
+            log.debug(
+                "browser",
+                "network event dropped",
+                fields={
+                    "event": event if isinstance(event, str) else None,
+                    "malformed": recorder.malformed,
+                    "unmatched": recorder.unmatched_responses,
+                },
+            )
+
     def _answer_auth_challenge(self, params: dict[str, Any]) -> None:
         request_id = params.get("requestId")
         challenge = params.get("authChallenge")
         if not isinstance(request_id, str) or not request_id:
-            logger.debug("Fetch.authRequired without requestId, ignoring")
+            log.debug("proxy", "Fetch.authRequired without requestId, ignoring")
             return
         if not isinstance(challenge, dict):
             challenge = {}
         source = challenge.get("source")
         scheme = challenge.get("scheme")
         if source != "Proxy" or scheme not in _SUPPORTED_SCHEMES:
-            logger.debug("non-proxy auth challenge (source=%r scheme=%r), cancelling", source, scheme)
+            log.debug(
+                "proxy",
+                "non-proxy auth challenge, cancelling",
+                fields={"source": source, "scheme": scheme},
+            )
             self._cancel(request_id)
             return
         if request_id in self._answered:
-            logger.info("proxy auth rejected for request, cancelling")
+            log.info("proxy", "proxy auth rejected for request, cancelling")
             self._cancel(request_id)
             self._register_failure()
             return
@@ -212,7 +317,7 @@ class ProxyAuthManager:
                 },
             },
         )
-        logger.debug("answered proxy auth challenge")
+        log.debug("proxy", "answered proxy auth challenge")
 
     def _cancel(self, request_id: str) -> None:
         self._client.send(
@@ -226,7 +331,11 @@ class ProxyAuthManager:
             self._dead = True
         if self._dead and not self._dead_notified:
             self._dead_notified = True
-            logger.warning("proxy marked dead after %d auth failures", self._fail_count)
+            log.warning(
+                "proxy",
+                "proxy marked dead after auth failures",
+                fields={"fail_count": self._fail_count},
+            )
             if self._on_proxy_dead is not None:
                 self._on_proxy_dead()
 

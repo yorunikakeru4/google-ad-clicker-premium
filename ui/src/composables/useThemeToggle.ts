@@ -2,7 +2,7 @@ import { computed } from "vue";
 import { useTheme } from "vuetify";
 import { DARK_THEME, LIGHT_THEME } from "../plugins/vuetify";
 
-const STORAGE_KEY = "adclicker:theme";
+const STORAGE_KEY = "autodesk:theme";
 
 let restored = false;
 
@@ -14,6 +14,10 @@ function readStoredTheme(): string | null {
   }
 }
 
+function prefersLight(): boolean {
+  return typeof window.matchMedia === "function" && window.matchMedia("(prefers-color-scheme: light)").matches;
+}
+
 export function useThemeToggle() {
   const theme = useTheme();
 
@@ -21,26 +25,33 @@ export function useThemeToggle() {
 
   const current = computed(() => (isDark.value ? DARK_THEME : LIGHT_THEME));
 
-  function setTheme(name: string) {
+  function applyTheme(name: string) {
     theme.change(name);
+  }
+
+  function storeTheme(name: string) {
     try {
       window.localStorage.setItem(STORAGE_KEY, name);
     } catch {
-      // storage unavailable (private mode): theme still applies for this session
+      // no storage: theme still applies for this session
     }
   }
 
   function toggleTheme() {
-    setTheme(isDark.value ? LIGHT_THEME : DARK_THEME);
+    const next = isDark.value ? LIGHT_THEME : DARK_THEME;
+    applyTheme(next);
+    storeTheme(next);
   }
 
   if (!restored) {
     restored = true;
     const stored = readStoredTheme();
     if (stored === DARK_THEME || stored === LIGHT_THEME) {
-      setTheme(stored);
+      applyTheme(stored);
+    } else if (prefersLight()) {
+      applyTheme(LIGHT_THEME);
     }
   }
 
-  return { theme, isDark, current, setTheme, toggleTheme };
+  return { theme, isDark, current, applyTheme, toggleTheme };
 }

@@ -10,7 +10,8 @@ from pathlib import Path
 import hooks
 from clicklogs_db import ClickLogsDB
 from config_reader import config
-from logger import logger, update_log_formats
+from engine.log import get_logger
+from logger import update_log_formats
 from proxy import get_proxies
 from search_controller import SearchController
 from utils import (
@@ -24,6 +25,9 @@ from webdriver import create_webdriver
 
 if config.behavior.telegram_enabled:
     from telegram_notifier import notify_matching_ads, start_bot
+
+
+log = get_logger()
 
 
 __author__ = "Coşkun Deniz <coskun.denize@gmail.com>"
@@ -70,7 +74,7 @@ def resolve_query(args) -> str:
         return args.query
 
     if not config.behavior.query:
-        logger.error("Fill the query parameter!")
+        log.error("scheduler", "Fill the query parameter!")
         raise SystemExit()
 
     return config.behavior.query
@@ -82,7 +86,7 @@ def resolve_proxy(args) -> str | None:
         return args.proxy
     if config.paths.proxy_file:
         proxies = get_proxies()
-        logger.debug(f"Proxies: {proxies}")
+        log.debug("proxy", "Proxies", fields={"proxies": proxies})
         return random.choice(proxies)
     if config.webdriver.proxy:
         return config.webdriver.proxy
@@ -99,21 +103,22 @@ def run_scenario(
 ) -> bool:
     """Один прогон сценария: драйвер, поиск, клики, teardown.
 
-    Тело бывшего ``main()`` после разбора аргументов. Оставлено здесь, а не
-    перенесено в ``engine/``: движок переиспользует сценарий как есть (план,
-    раздел 3), а значит и жить он должен в том же модуле, что и раньше.
+    Тело бывшего ``main()`` после разбора аргументов. Оставлено здесь, а
+    не перенесено в ``engine/``: движок переиспользует сценарий как есть
+    (план, раздел 3), а значит и жить он должен в том же модуле, что и раньше.
 
     Возвращает ``False``, если прогон не доехал до конца. Сигнал обязателен:
     legacy глотает исключения сам, чтобы один упавший прогон не ронял весь
-    процесс, но без возвращаемого результата вызывающий не отличил бы
-    завершившийся сценарий от упавшего и записал бы в статистику успех.
+    процесс, но без результата вызывающий не отличил бы завершившийся
+    сценарий от упавшего и записал бы в статистику успех.
 
     Исключения из подготовки (драйвер, файлы) не гасятся намеренно:
-    вызывающая сторона решает, что делать — CLI показывает трейсбек, а цикл
-    воркера ловит их и продолжает работу.
+    CLI показывает трейсбек, а цикл воркера ловит их и продолжает работу.
     """
     if browser_id:
         update_log_formats(browser_id)
+        # Общий логгер процесса: все записи модулей ниже получают --id.
+        log.bind(browser_id)
 
     domains = get_domains()
 
@@ -163,12 +168,16 @@ def run_scenario(
             hooks.after_search_hook(driver)
 
         if not (ads or shopping_ads):
-            logger.info("No ads found in the search results!")
+            log.info("click", "No ads found in the search results!")
 
             if config.behavior.telegram_enabled:
                 notify_matching_ads(query, links=None, stats=search_controller.stats)
         else:
-            logger.debug(f"Selected click order: {config.behavior.click_order}")
+            log.debug(
+                "click",
+                "Selected click order",
+                fields={"click_order": config.behavior.click_order},
+            )
 
             if config.behavior.click_order == 1:
                 all_links = non_ad_links + ads
@@ -180,7 +189,7 @@ def run_scenario(
                 if non_ad_links:
                     all_links = [non_ad_links[0]] + [ads[0]] + non_ad_links[1:] + ads[1:]
                 else:
-                    logger.debug("Couldn't found non-ads! Continue with ads only.")
+                    log.debug("click", "Couldn't found non-ads! Continue with ads only.")
                     all_links = ads
 
             elif config.behavior.click_order == 4:
@@ -194,7 +203,11 @@ def run_scenario(
                 all_links = ads + non_ad_links
                 random.shuffle(all_links)
 
-            logger.info(f"Found {len(ads) + len(shopping_ads)} ads")
+            log.info(
+                "click",
+                "Found ads",
+                fields={"count": len(ads) + len(shopping_ads)},
+            )
 
             search_controller.click_shopping_ads(shopping_ads)
             search_controller.click_links(all_links)
@@ -205,21 +218,29 @@ def run_scenario(
             if config.behavior.telegram_enabled:
                 notify_matching_ads(query, links=ads + shopping_ads, stats=search_controller.stats)
 
-            logger.info(search_controller.stats)
+            log.info("click", str(search_controller.stats))
 
     except Exception as exp:
         completed = False
-        logger.error("Exception occurred. See the details in the log file.")
+        log.error("scheduler", "Exception occurred. See the details in the log file.")
 
         if config.webdriver.ss_on_exception:
             take_screenshot(driver)
 
         message = str(exp).split("\n")[0]
-        logger.debug(f"Exception: {message}")
+        log.debug("scheduler", "Exception", fields={"error": message})
         details = traceback.format_tb(exp.__traceback__)
-        logger.debug(f"Exception details: \n{''.join(details)}")
+        log.debug(
+            "scheduler",
+            "Exception details:",
+            fields={"traceback": "".join(details)},
+        )
 
-        logger.debug(f"Exception cause: {exp.__cause__}") if exp.__cause__ else None
+        (
+            log.debug("scheduler", "Exception cause", fields={"cause": str(exp.__cause__)})
+            if exp.__cause__
+            else None
+        )
 
         if config.behavior.hooks_enabled:
             hooks.exception_hook(driver)
@@ -236,11 +257,10 @@ def run_scenario(
 
         if proxy and config.webdriver.auth:
             plugin_folder = Path.cwd() / "proxy_auth_plugin" / plugin_folder_name
-            logger.debug(f"Removing '{plugin_folder}' folder...")
+            log.debug("cleanup", "Removing folder...", fields={"folder": str(plugin_folder)})
             shutil.rmtree(plugin_folder, ignore_errors=True)
 
     return completed
-
 
 def main():
     """Entry point for the tool"""
@@ -282,7 +302,11 @@ def main():
                 generate_click_report(click_results, report_date)
 
         else:
-            logger.info(f"No click result was found for {report_date}!")
+            log.info(
+                "click",
+                "No click result was found for",
+                fields={"report_date": report_date},
+            )
 
         return
 
@@ -291,7 +315,10 @@ def main():
             start_bot()
             return
         else:
-            logger.info("Please set the telegram_enabled option to true in config and try again.")
+            log.info(
+                "scheduler",
+                "Please set the telegram_enabled option to true in config and try again.",
+            )
             return
 
     run_scenario(

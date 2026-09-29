@@ -42,35 +42,32 @@
           httpx
         ];
 
-        # Системные библиотеки для сборки Tauri-кабины (ui/src-tauri).
+        # GTK/WebKit-стек для Rust-части UI (Tauri).
         #
-        # Без них `cargo check` падает ещё до нашего кода: libdbus-sys и
-        # gtk-sys ищут .pc-файлы через pkg-config, а в системном окружении
-        # dev-пакетов нет. Список повторяет тот, что отработал в фазе 0 при
-        # сборке deb/rpm. На macOS они не нужны — там те же зависимости
-        # идут из Xcode SDK, — поэтому набор действует только на Linux.
-        # lib.optionals hostPlatform.isLinux: на macOS этих пакетов в nixpkgs нет
-        # (webkitgtk, dbus, appindicator — linux-only), и сам факт наличия их
-        # в списке роняет eval dev-shell на целевой платформе проекта.
-        tauriNativeDeps = pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux (
+        # cargo test/build для ui/src-tauri без этого падает на первом же
+        # -sys крейте: gtk-sys ищет gtk+-3.0.pc и др. через pkg-config,
+        # libdbus-sys — dbus-1.pc. Список покрывает всё, что тянет tauri v2
+        # на Linux: webkit2gtk-4.1 (включая javascriptcoregtk) + libsoup-3.0
+        # + gtk3 с транзитивными glib/cairo/pango/atk/gdk-pixbuf + dbus.
+        #
+        # lib.optionals hostPlatform.isLinux: на macOS этих пакетов в nixpkgs
+        # нет (webkitgtk, dbus, appindicator — linux-only), и сам факт их
+        # наличия в списке роняет eval dev-shell на целевой платформе проекта;
+        # там Tauri берёт фреймворки из Xcode SDK.
+        tauriDeps = pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux (
           with pkgs;
           [
-            pkg-config
-            dbus
-            glib
             gtk3
+            glib
             cairo
             pango
+            atk
             gdk-pixbuf
-            at-spi2-atk
-            webkitgtk_4_1
             libsoup_3
-            libayatana-appindicator
-            librsvg
-            openssl
+            webkitgtk_4_1
+            dbus
           ]
-        );
-      in
+        );      in
       {
         devShells.default = pkgs.mkShell {
           packages = with pkgs; [
@@ -81,16 +78,18 @@
             uv
           ];
 
-          nativeBuildInputs = tauriNativeDeps;
-          buildInputs = tauriNativeDeps;
-
-          shellHook = ''
+          nativeBuildInputs = [ pkgs.pkg-config ];
+          buildInputs = tauriDeps;          shellHook = ''
             export PYTHONPATH="$PWD:$PYTHONPATH"
             export PYTHONDONTWRITEBYTECODE=1
+            # Системный cargo снаружи nix не кладёт rpath на библиотеки из
+            # nix store — без этого тест-бинарник tauri не стартует.
+            export LD_LIBRARY_PATH="${pkgs.lib.makeLibraryPath tauriDeps}:$LD_LIBRARY_PATH"
             echo "python:     $(python --version 2>&1)"
             echo "pytest:     $(pytest --version 2>&1 | head -1)"
             echo "ruff:       $(ruff --version 2>&1)"
             echo "uv:         $(uv --version 2>&1)"
+            echo "pkg-config: $(pkg-config --version 2>&1)"
           '';
         };
 

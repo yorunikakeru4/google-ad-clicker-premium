@@ -10,12 +10,13 @@
 
 from __future__ import annotations
 
-import logging
 import sqlite3
 from datetime import datetime
 from pathlib import Path
 
-logger = logging.getLogger(__name__)
+from engine.log import get_logger
+
+log = get_logger()
 
 _LEGACY_DATETIME_FORMAT = "%d-%m-%Y %H:%M:%S"
 
@@ -28,7 +29,11 @@ def _parse_legacy_timestamp(click_date: str, click_time: str) -> float | None:
             f"{click_date} {click_time}", _LEGACY_DATETIME_FORMAT
         ).timestamp()
     except (ValueError, TypeError):
-        logger.warning("Пропущена битая строка clicklogs: %r %r", click_date, click_time)
+        log.warning(
+            "click",
+            "Пропущена битая строка clicklogs",
+            fields={"click_date": click_date, "click_time": click_time},
+        )
         return None
 
 

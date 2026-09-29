@@ -8,8 +8,11 @@ from telegram import Update
 from telegram.ext import ApplicationBuilder, ContextTypes, CommandHandler
 from telegram.constants import ParseMode
 
-from logger import logger
+from engine.log import get_logger
 from stats import SearchStats
+
+
+log = get_logger()
 
 
 TELEGRAM_TOKEN = os.environ.get("TELEGRAM_TOKEN")
@@ -29,14 +32,14 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     """
 
     with open(telegram_chat_id_file, mode="w", encoding="utf-8") as chat_id_file:
-        logger.info(f"Chat ID: {update.effective_chat.id}")
+        log.info("scheduler", "Chat ID", fields={"chat_id": update.effective_chat.id})
         chat_id_file.write(str(update.effective_chat.id))
 
     response = "Started Ad Clicker Premium Notifier! Please end the script with CTRL+C"
 
     await context.bot.send_message(chat_id=update.effective_chat.id, text=response)
 
-    logger.info("Please end the script with CTRL+C")
+    log.info("scheduler", "Please end the script with CTRL+C")
 
 
 async def send_message(chat_id: str, message: str) -> None:
@@ -72,7 +75,7 @@ def notify_matching_ads(query: str, links: list, stats: Optional[SearchStats] = 
     """
 
     if not telegram_chat_id_file.exists():
-        logger.info("Please start the messaging with bot to get a chat ID!")
+        log.info("scheduler", "Please start the messaging with bot to get a chat ID!")
         raise SystemExit()
 
     with open(telegram_chat_id_file, encoding="utf-8") as chat_id_file:
@@ -98,16 +101,20 @@ def notify_matching_ads(query: str, links: list, stats: Optional[SearchStats] = 
 
         message += f"<b>Ad Title:</b> {ad_title}\n"
 
-        logger.debug(f"Notification was added for [{original_ad_title}]({link_url})")
+        log.debug(
+            "click",
+            "Notification was added",
+            fields={"ad_title": original_ad_title, "url": link_url},
+        )
 
     try:
-        logger.info("Sending Telegram notification...")
+        log.info("click", "Sending Telegram notification...")
         asyncio.run(send_message(chat_id=chat_id, message=message))
 
     except Exception as exp:
-        logger.debug(exp)
-        logger.error("Failed to send notification!")
-        logger.debug(f"Message: {message}")
+        log.debug("click", "Telegram send error", fields={"error": str(exp)})
+        log.error("click", "Failed to send notification!")
+        log.debug("click", "Message", fields={"message": message})
 
 
 def start_bot() -> None:
@@ -118,5 +125,5 @@ def start_bot() -> None:
     start_handler = CommandHandler("start", start)
     application.add_handler(start_handler)
 
-    logger.info("Waiting for /start command...")
+    log.info("scheduler", "Waiting for /start command...")
     application.run_polling()

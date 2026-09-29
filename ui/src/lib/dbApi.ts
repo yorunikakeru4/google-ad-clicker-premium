@@ -1,0 +1,157 @@
+// API-слой над Tauri-командами читалки БД (src-tauri/src/commands.rs).
+//
+// Имена аргументов здесь — camelCase: Tauri-макрос по умолчанию переименовывает
+// snake_case-параметры команд под JavaScript-сторону (rename_all = camelCase).
+// Ошибки команд не глотаются: DbError приходит сериализованным объектом
+// {kind, message}, dbErrorMessage превращает его в текст для UI.
+
+import { invoke } from "@tauri-apps/api/core";
+import type { LogQueryFilters } from "./logFilters";
+import type { LogCursor, LogRow } from "./logMerge";
+
+/** Подменяемый invoke: боевой — @tauri-apps/api, в тестах — фейк. */
+export type DbInvoke = (
+  command: string,
+  args: Record<string, unknown>,
+) => Promise<unknown>;
+
+export interface ListLogsPageParams {
+  query: LogQueryFilters;
+  limit: number;
+  /** Курсор прошлой страницы; null — самые новые строки. */
+  cursor?: LogCursor | null;
+}
+
+/** Сводка запусков — ответ runs_summary. */
+export interface RunsSummary {
+  succeeded: number;
+  failed: number;
+  other: number;
+  last_error: string | null;
+}
+
+/** Часовой бакет кликов — ответ clicks_per_hour. */
+export interface HourlyClicks {
+  bucket: number;
+  count: number;
+}
+
+export interface BrowserRequests {
+  browser_id: string | null;
+  count: number;
+}
+
+/** Скользящий час запросов плюс нагрузка по воркерам. */
+export interface RequestsLastHour {
+  total: number;
+  per_browser: BrowserRequests[];
+}
+
+export interface ActiveWorker {
+  browser_id: string;
+  pid: number | null;
+  status: string;
+  started_at: number | null;
+  heartbeat_at: number;
+  restart_count: number;
+  last_error: string | null;
+}
+
+export interface DbApi {
+  /** Открыть БД без аргументов: env ADCLICKER_DB → adclicker.db решает Rust. */
+  open(): Promise<string>;
+  listLogsPage(params: ListLogsPageParams): Promise<LogRow[]>;
+  countLogs(query: LogQueryFilters): Promise<number>;
+  runsSummary(since: number): Promise<RunsSummary>;
+  clicksPerHour(since: number, buckets: number): Promise<HourlyClicks[]>;
+  requestsLastHour(now: number): Promise<RequestsLastHour>;
+  captchaShare(since: number): Promise<number | null>;
+  activeWorkers(now: number, thresholdSecs: number): Promise<ActiveWorker[]>;
+}
+
+/** Поле из `message`-объекта сериализованного DbError. */
+function errorField(message: unknown, key: string): string | null {
+  if (typeof message !== "object" || message === null) return null;
+  const value = (message as Record<string, unknown>)[key];
+  return typeof value === "string" ? value : null;
+}
+
+/**
+ * Текст ошибки команды для UI. Копии видов согласованы с `Display` для
+ * `DbError` в src-tauri/src/db.rs — на стороне фронта живёт только то, что
+ * видит пользователь; структура ({kind, message}) берётся из serde-контракта.
+ */
+export function dbErrorMessage(error: unknown): string {
+  if (typeof error === "string") return error;
+  if (error instanceof Error) return error.message;
+
+  if (typeof error === "object" && error !== null) {
+    const kind = (error as { kind?: unknown }).kind;
+    if (typeof kind === "string") {
+      const message = (error as { message?: unknown }).message;
+      switch (kind) {
+        case "DatabaseNotFound":
+          return `База данных не найдена: ${errorField(message, "path") ?? "путь неизвестен"}. Запустите движок — он создаст файл при первом запуске.`;
+        case "OpenFailed":
+          return `Не удалось открыть базу ${errorField(message, "path") ?? ""}: ${errorField(message, "reason") ?? "неизвестная причина"}`;
+        case "ReadFailed":
+          return `Ошибка чтения из базы: ${errorField(message, "reason") ?? "неизвестная причина"}`;
+        case "NotOpen":
+          return "База данных не открыта: сначала вызовите db_open с путём к файлу.";
+        default:
+          break;
+      }
+    }
+    // Не наш формат — отдаём JSON, а не [object Object].
+    try {
+      return JSON.stringify(error);
+    } catch {
+      return String(error);
+    }
+  }
+  return String(error);
+}
+
+function queryArgs(query: LogQueryFilters): Record<string, unknown> {
+  return {
+    level: query.level,
+    category: query.category,
+    browserId: query.browserId,
+    since: query.since,
+    until: query.until,
+  };
+}
+
+export function createDbApi(call: DbInvoke = invoke): DbApi {
+  return {
+    open: () => call("db_open", {}) as Promise<string>,
+
+    listLogsPage: ({ query, limit, cursor }) =>
+      call("list_logs_page", {
+        limit,
+        ...queryArgs(query),
+        beforeTs: cursor?.ts ?? null,
+        beforeId: cursor?.id ?? null,
+      }) as Promise<LogRow[]>,
+
+    countLogs: (query) => call("count_logs", queryArgs(query)) as Promise<number>,
+
+    runsSummary: (since) =>
+      call("runs_summary", { since }) as Promise<RunsSummary>,
+
+    clicksPerHour: (since, buckets) =>
+      call("clicks_per_hour", { since, buckets }) as Promise<HourlyClicks[]>,
+
+    requestsLastHour: (now) =>
+      call("requests_last_hour", { now }) as Promise<RequestsLastHour>,
+
+    captchaShare: (since) =>
+      call("captcha_share", { since }) as Promise<number | null>,
+
+    activeWorkers: (now, thresholdSecs) =>
+      call("active_workers", { now, thresholdSecs }) as Promise<ActiveWorker[]>,
+  };
+}
+
+/** Боевой экземпляр: один на приложение, как и вызов invoke. */
+export const dbApi: DbApi = createDbApi();

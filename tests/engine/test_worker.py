@@ -577,6 +577,18 @@ def test_main_reads_browser_id_from_environment(tmp_path, monkeypatch):
 def test_main_closes_the_writer_on_the_way_out(tmp_path):
     import threading
 
+    def flushers() -> set[int | None]:
+        return {
+            thread.ident
+            for thread in threading.enumerate()
+            if thread.name == "store-flusher" and thread.is_alive()
+        }
+
+    # Сравниваем с фоном, а не с пустотой: engine.log держит собственный
+    # процессный writer с той же именованной нитью, и он к этому моменту уже
+    # мог быть создан другим тестом — он к воркеру отношения не имеет.
+    before = flushers()
+
     stop = threading.Event()
     source = FakeSource()
     source.on_scenario = lambda request: stop.set()
@@ -589,10 +601,10 @@ def test_main_closes_the_writer_on_the_way_out(tmp_path):
 
     # Writer обязан закрыться: иначе его flusher-поток живёт в процессе
     # дольше воркера, а незакрытое соединение держит WAL-файл.
-    assert not any(
-        thread.name == "store-flusher" and thread.is_alive()
-        for thread in threading.enumerate()
-    ), "после main() не должно оставаться живого store-flusher"
+    assert flushers() == before, (
+        "после main() не должно прибавиться живых store-flusher: "
+        f"было {len(before)}, стало {len(flushers())}"
+    )
 
 
 # --- контракт точки входа -------------------------------------------------

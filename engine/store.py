@@ -1,8 +1,10 @@
-"""Батчевый writer SQLite: логи, клики, запуски и heartbeat воркеров.
+"""Батчевый writer SQLite: логи, клики, сетевые запросы, запуски и heartbeat.
 
-Один writer на процесс, соединение держится открытым. Логи и клики — частые
-append-операции, поэтому они буферизуются и уходят в БД батчами: по размеру
-(``batch_size``) или по таймеру (``flush_interval``), по любому из условий.
+Один writer на процесс, соединение держится открытым. Логи, клики и записи
+``network_requests`` — частые append-операции, поэтому они буферизуются и
+уходят в БД батчами: по размеру (``batch_size``) или по таймеру
+(``flush_interval``), по любому из условий. Все три буфера делят один
+размер батча: метрика запросов не должна откладывать запись логов.
 
 Три решения, которые стоит знать:
 
@@ -34,6 +36,10 @@ writer продолжает принимать новые записи. Повт
 батч превратила бы полный диск в бесконечный ретрай и растущую память,
 поэтому батч отбрасывается сразу. Потеря при *штатном* завершении —
 дефект: ``close()`` всегда сбрасывает остаток.
+
+Политика чтения та же по духу: ``count_network_requests`` не бросает —
+ошибка окна даёт ``0`` и текст в ``last_error``, потому что метрика не
+должна ронять дашборд.
 """
 
 from __future__ import annotations
@@ -55,6 +61,10 @@ _LOG_INSERT = (
 _CLICK_INSERT = (
     "INSERT INTO clicks (ts, url, query, category, browser_id, proxy_id, http_status) "
     "VALUES (?, ?, ?, ?, ?, ?, ?)"
+)
+_NETWORK_INSERT = (
+    "INSERT INTO network_requests (ts, browser_id, method, url, resource_type, status) "
+    "VALUES (?, ?, ?, ?, ?, ?)"
 )
 _HEARTBEAT_UPSERT = (
     "INSERT INTO workers (browser_id, status, started_at, heartbeat_at) "
@@ -89,6 +99,7 @@ class StoreWriter:
         self._lock = threading.Lock()
         self._logs: list[tuple[Any, ...]] = []
         self._clicks: list[tuple[Any, ...]] = []
+        self._network: list[tuple[Any, ...]] = []
         self._conn = sqlite3.connect(
             self.db_path,
             timeout=BUSY_TIMEOUT_MS / 1000,
@@ -139,7 +150,7 @@ class StoreWriter:
                 self._record_loss_locked(1, "writer закрыт: запись в logs отброшена")
                 return
             self._logs.append((stamp, level, browser_id, category, message, payload))
-            if len(self._logs) + len(self._clicks) >= self._batch_size:
+            if len(self._logs) + len(self._clicks) + len(self._network) >= self._batch_size:
                 self._flush_locked()
 
     def record_click(
@@ -160,8 +171,77 @@ class StoreWriter:
             self._clicks.append(
                 (stamp, url, query, category, browser_id, proxy_id, http_status)
             )
-            if len(self._logs) + len(self._clicks) >= self._batch_size:
+            if len(self._logs) + len(self._clicks) + len(self._network) >= self._batch_size:
                 self._flush_locked()
+
+    def record_network_request(
+        self,
+        method: str,
+        url: str,
+        resource_type: str | None = None,
+        status: int | None = None,
+        browser_id: str | None = None,
+        ts: float | None = None,
+    ) -> None:
+        """Буферизовать строку ``network_requests`` — источник запросов/час.
+
+        Делит буфер, батч и таймер с логами и кликами и соблюдает ту же
+        политику ошибок: запись не роняет вызывающего, потерянный батч идёт
+        в ``dropped``/``last_error``. Новое соединение не открывается —
+        идёт в тот же writer, что и остальные записи процесса.
+        """
+        stamp = time.time() if ts is None else ts
+        with self._lock:
+            if self._closed:
+                self._record_loss_locked(
+                    1, "writer закрыт: запись в network_requests отброшена"
+                )
+                return
+            self._network.append(
+                (stamp, browser_id, method, url, resource_type, status)
+            )
+            if len(self._logs) + len(self._clicks) + len(self._network) >= self._batch_size:
+                self._flush_locked()
+
+    def count_network_requests(
+        self,
+        since: float,
+        *,
+        until: float | None = None,
+        browser_id: str | None = None,
+    ) -> int:
+        """Число запросов в скользящем окне ``[since, until]``.
+
+        Границы включительно; ``until=None`` — от ``since`` до конца истории,
+        ``browser_id`` — фильтр по воркеру (без него считаются все). Окно
+        считается на том же соединении, что и запись: перед запросом writer
+        сбрасывает свой буфер, чтобы только что записанные запросы попали в
+        счёт. Конкурентные читатели уживаются за счёт ``busy_timeout`` —
+        отдельных блокировок нет.
+
+        Ошибка чтения не бросает: возвращается 0, причина остаётся в
+        ``last_error``. Счётчик ``dropped`` при этом не растёт — терялись
+        записи, а не чтения.
+        """
+        with self._lock:
+            if self._closed:
+                self._record_loss_locked(0, "count_network_requests: writer закрыт")
+                return 0
+            self._flush_locked()
+            sql = "SELECT COUNT(*) FROM network_requests WHERE ts >= ?"
+            params: list[Any] = [since]
+            if until is not None:
+                sql += " AND ts <= ?"
+                params.append(until)
+            if browser_id is not None:
+                sql += " AND browser_id = ?"
+                params.append(browser_id)
+            try:
+                row = self._conn.execute(sql, params).fetchone()
+            except Exception as exc:
+                self._record_loss_locked(0, f"count_network_requests: {exc}")
+                return 0
+            return int(row[0]) if row is not None else 0
 
     def flush(self) -> None:
         """Сбросить накопленное в БД. После close() — no-op, не исключение."""
@@ -262,19 +342,23 @@ class StoreWriter:
         """Сброс под блокировкой. Ошибки — в счётчики, не наружу."""
         logs = self._logs
         clicks = self._clicks
-        if not logs and not clicks:
+        network = self._network
+        if not logs and not clicks and not network:
             return
         self._logs = []
         self._clicks = []
+        self._network = []
         try:
             if logs:
                 self._conn.executemany(_LOG_INSERT, logs)
             if clicks:
                 self._conn.executemany(_CLICK_INSERT, clicks)
+            if network:
+                self._conn.executemany(_NETWORK_INSERT, network)
             self._conn.commit()
         except Exception as exc:
             self._rollback_quietly_locked()
-            self._record_loss_locked(len(logs) + len(clicks), str(exc))
+            self._record_loss_locked(len(logs) + len(clicks) + len(network), str(exc))
 
     def _rollback_quietly_locked(self) -> None:
         # Откат после упавшего executemany — best effort: соединение может

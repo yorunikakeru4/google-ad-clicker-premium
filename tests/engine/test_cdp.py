@@ -500,14 +500,34 @@ def test_send_command_forwards_session_id() -> None:
         client.stop()
 
 
+def _reply_with_error_when_sent(ws: FakeWs) -> None:
+    """Ответить на ошибку CDP после того, как команда реально ушла в сокет.
+
+    Ответ нельзя класть в очередь заранее: receive-поток мгновенно
+    диспатчит его, а подписка на ответ появляется только после отправки.
+    """
+
+    deadline = time.monotonic() + 2.0
+    while time.monotonic() < deadline:
+        sent = ws.sent_json()
+        if sent:
+            ws.incoming.put(
+                json.dumps({"id": sent[0]["id"], "error": {"code": -32000, "message": "nope"}})
+            )
+            return
+        time.sleep(0.005)
+
+
 def test_send_command_error_response_raises() -> None:
     ws = FakeWs()
     client = _make_client(ws)
     client.start(timeout=2.0)
     try:
-        ws.incoming.put(json.dumps({"id": 1, "error": {"code": -32000, "message": "nope"}}))
+        responder = threading.Thread(target=_reply_with_error_when_sent, args=(ws,), daemon=True)
+        responder.start()
         with pytest.raises(CdpError, match="CDP err-cmd error"):
             client.send_command("err-cmd", timeout=2.0)
+        responder.join(timeout=3.0)
     finally:
         client.stop()
 

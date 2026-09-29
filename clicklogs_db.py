@@ -4,7 +4,10 @@ from contextlib import contextmanager
 
 import sqlite3
 
-from logger import logger
+from engine.log import get_logger
+
+
+log = get_logger()
 
 
 DBCursor = sqlite3.Connection.cursor
@@ -46,8 +49,17 @@ class ClickLogsDB:
                     "INSERT INTO clicklogs (click_date, click_time, site_url, query, category) VALUES (?, ?, ?, ?, ?)",
                     (click_date, click_time, site_url, query, category),
                 )
-                log_details = f"{click_date} {click_time}, {site_url}, {query}, {category}"
-                logger.debug(f"Click log ({log_details}) was added to database.")
+                log.debug(
+                    "click",
+                    "Click log was added to database.",
+                    fields={
+                        "click_date": click_date,
+                        "click_time": click_time,
+                        "site_url": site_url,
+                        "query": query,
+                        "category": category,
+                    },
+                )
 
         except sqlite3.Error as exp:
             raise RuntimeError(exp) from exp
@@ -61,7 +73,7 @@ class ClickLogsDB:
         :returns: List of (site_url, clicks, category, click_time, query) tuples for the given date
         """
 
-        logger.debug(f"Querying click results for {click_date}...")
+        log.debug("click", "Querying click results...", fields={"click_date": click_date})
 
         try:
             with self._clicklogs_db() as clicklogs_db_cursor:
@@ -76,7 +88,11 @@ class ClickLogsDB:
                 results = clicklogs_db_cursor.fetchall()
 
                 if not results:
-                    logger.debug(f"Couldn't found any click data for {click_date} in database!")
+                    log.debug(
+                        "click",
+                        "Couldn't found any click data in database!",
+                        fields={"click_date": click_date},
+                    )
                     return None
                 else:
                     return results
@@ -112,7 +128,11 @@ class ClickLogsDB:
             yield clicklogs_db.cursor()
 
         except sqlite3.Error as exp:
-            logger.error(exp)
+            log.error(
+                "click",
+                "Failed to connect to clicklogs database",
+                fields={"error": str(exp)},
+            )
             raise RuntimeError("Failed to connect to clicklogs database!") from exp
 
         finally:

@@ -354,7 +354,16 @@ def test_assign_android_device_logs_browser_id(make_search_controller, caplog):
 
     controller.assign_android_device("emulator-5554")
 
-    assert "Assigning device[emulator-5554] to browser 3" in caplog.text
+    # Устройство и браузер ушли в поля записи, а не в склеенную строку:
+    # проверяем структурную запись в зеркале legacy-логгера.
+    record = next(
+        entry
+        for entry in caplog.records
+        if entry.getMessage().startswith("Assigning device")
+    )
+    assert record.category == "browser"
+    assert record.fields == {"device_id": "emulator-5554", "browser_id": 3}
+    assert "emulator-5554" in record.getMessage()
 
 
 # --- _extract_link_info -----------------------------------------------------------

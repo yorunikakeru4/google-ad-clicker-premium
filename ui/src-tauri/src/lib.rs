@@ -1,20 +1,21 @@
-// Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
-mod daemon;
+pub mod commands;
+pub mod control;
+pub mod daemon;
+pub mod db;
+pub mod metrics;
 
 use tauri::Manager;
 
+use commands::{
+    active_workers, captcha_share, clicks_per_hour, count_logs, db_open, list_logs, list_logs_page,
+    requests_last_hour, runs_summary, DbState,
+};
 use daemon::{DaemonSpec, DaemonStatus, DaemonSupervisor, SupervisorOptions};
 
-#[tauri::command]
-fn greet(name: &str) -> String {
-    format!("Hello, {}! You've been greeted from Rust!", name)
-}
-
-/// Состояние демона для UI: жив ли, PID, число перезапусков, токен.
+/// Состояние демона для UI: жив ли, PID, число перезапусков, последняя ошибка.
 ///
-/// Токен отдаётся наружу намеренно: это единственная защита loopback-порта,
-/// и фронтенд — единственная сторона, которая должна подставлять его в
-/// заголовок запроса. За пределы приложения он не уходит.
+/// Токен сюда не попадает намеренно: control.rs держит его вне frontend-кода,
+/// и публиковать его второй командой значило бы отменять это решение.
 #[tauri::command]
 fn daemon_status(supervisor: tauri::State<'_, DaemonSupervisor>) -> DaemonStatus {
     supervisor.status()
@@ -26,6 +27,7 @@ pub fn run() {
 
     let app = tauri::Builder::default()
         .plugin(tauri_plugin_opener::init())
+        .manage(DbState::default())
         .manage(supervisor)
         .setup(|app| {
             // Ошибка подъёма демона не роняет приложение: UI обязан открыться,
@@ -41,7 +43,19 @@ pub fn run() {
             }
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![greet, daemon_status])
+        .invoke_handler(tauri::generate_handler![
+            control::control_request,
+            db_open,
+            list_logs,
+            list_logs_page,
+            count_logs,
+            runs_summary,
+            clicks_per_hour,
+            requests_last_hour,
+            captcha_share,
+            active_workers,
+            daemon_status,
+        ])
         .build(tauri::generate_context!())
         .expect("error while running tauri application");
 
@@ -55,3 +69,6 @@ pub fn run() {
         }
     });
 }
+
+#[cfg(test)]
+mod test_support;
