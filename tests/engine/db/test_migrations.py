@@ -5,7 +5,10 @@
 поведение при рассинхронизации версий.
 """
 
+import os
 import sqlite3
+import time
+from datetime import datetime, timezone
 
 import pytest
 
@@ -38,6 +41,7 @@ EXPECTED_TABLES = {
 EXPECTED_INDEXES = {
     "idx_logs_ts",
     "idx_logs_browser_id",
+    "idx_logs_day_level_browser",
     "idx_clicks_ts",
     "idx_clicks_browser_id",
     "idx_captcha_events_ts",
@@ -101,29 +105,75 @@ _LEGACY_PROFILES = [
     ("legacy-c", "key-c", "new"),
 ]
 
+# Снимок таблицы logs ДО миграции 003 — без колонки day. Тот же DDL нужен и
+# для БД версии 1, и для версии 2: logs не менялась миграцией 002, поэтому
+# «очередная» БД до 003 выглядит именно так.
+_LEGACY_LOGS_DDL = """
+CREATE TABLE logs (
+    id         INTEGER PRIMARY KEY,
+    ts         REAL    NOT NULL,
+    level      TEXT    NOT NULL DEFAULT 'INFO',
+    browser_id TEXT,
+    category   TEXT,
+    message    TEXT    NOT NULL,
+    fields     TEXT,
+    created_at REAL    NOT NULL DEFAULT (CAST(strftime('%s', 'now') AS REAL))
+);
+"""
 
-def _make_v1_database(db_path) -> None:
-    """Собирает БД версии 1: остальное — свежей схемой, profiles — снимком v1.
 
-    Порядок важен: сначала migrate() создаёт все таблицы и индексы (иначе
-    внешние ключи profiles останутся висеть на несуществующих proxies/workers),
-    затем profiles пересоздаётся в виде, котором он существовал до миграции
-    002, а user_version возвращается в 1 — ровно то, что увидит демон у
-    пользователя, обновившегося с прошлой версии.
+def _recreate_logs_without_day(conn: sqlite3.Connection) -> None:
+    """Вернуть logs в вид до миграции 003 (без колонки day).
+
+    Свежая migrate() уже создала колонку: без пересоздания накат 003 на такую
+    БД упал бы на duplicate column, и тест проверял бы миграцию против самой
+    себя. Индексы logs уходят вместе с таблицей и создаются заново — иначе
+    DROP TABLE оставил бы висячие idx_logs_*.
+    """
+    conn.execute("DROP TABLE logs")
+    conn.execute(_LEGACY_LOGS_DDL)
+    conn.execute("CREATE INDEX idx_logs_ts ON logs (ts)")
+    conn.execute("CREATE INDEX idx_logs_browser_id ON logs (browser_id)")
+
+
+def _make_version_database(db_path, version: int) -> None:
+    """Собрать БД указанной версии из текущей схемы.
+
+    Текущая схема создаётся целиком, затем таблицы, изменённые миграциями
+    новее ``version``, пересоздаются в их прежнем виде, а user_version
+    откатывается — ровно то, что увидит демон у пользователя, обновившегося
+    с прошлой версии. Порядок важен: сначала migrate() создаёт все таблицы и
+    индексы (иначе внешние ключи profiles останутся висеть на
+    несуществующих proxies/workers).
     """
     migrations.migrate(db_path)
     conn = sqlite3.connect(db_path, isolation_level=None)
     try:
         conn.execute("PRAGMA foreign_keys = OFF")
-        conn.execute("DROP TABLE profiles")
-        conn.execute(_LEGACY_PROFILES_DDL)
-        conn.executemany(
-            "INSERT INTO profiles (name, key_ref, status) VALUES (?, ?, ?)",
-            _LEGACY_PROFILES,
-        )
-        conn.execute(f"PRAGMA user_version = {migrations.SCHEMA_VERSION - 1}")
+        # 002 меняла profiles, 003 — logs: чем моложе целевая версия, тем
+        # больше таблиц надо вернуть в прежний вид.
+        if version < 3:
+            _recreate_logs_without_day(conn)
+        if version < 2:
+            conn.execute("DROP TABLE profiles")
+            conn.execute(_LEGACY_PROFILES_DDL)
+            conn.executemany(
+                "INSERT INTO profiles (name, key_ref, status) VALUES (?, ?, ?)",
+                _LEGACY_PROFILES,
+            )
+        conn.execute(f"PRAGMA user_version = {version}")
     finally:
         conn.close()
+
+
+def _make_v1_database(db_path) -> None:
+    """БД версии 1: profiles со status 'new' и logs без колонки day."""
+    _make_version_database(db_path, 1)
+
+
+def _make_v2_database(db_path) -> None:
+    """БД версии 2: текущая схема, но logs ещё без колонки day."""
+    _make_version_database(db_path, 2)
 
 
 class TestFreshInstall:
@@ -406,17 +456,17 @@ class TestProfileFieldsMigration:
     def test_incremental_migration_is_pending_on_a_version_one_database(self, db_path):
         _make_v1_database(db_path)
 
-        pending = migrations._pending_migrations(
-            migrations.SCHEMA_VERSION - 1, migrations.MIGRATIONS_DIR
-        )
+        pending = migrations._pending_migrations(1, migrations.MIGRATIONS_DIR)
 
-        assert [version for version, _ in pending] == [migrations.SCHEMA_VERSION], (
-            "миграция профилей должна найтись в каталоге и подтянуть БД до текущей версии"
-        )
+        # Все миграции после версии 1, по порядку: тест не должен ломаться
+        # с каждой новой, ему важно, что цепочка до текущей версии цела.
+        assert [version for version, _ in pending] == list(
+            range(2, migrations.SCHEMA_VERSION + 1)
+        ), "цепочка миграций от БД версии 1 до текущей должна быть полной"
 
     def test_incremental_migration_adds_the_column_and_advances_version(self, db_path):
         _make_v1_database(db_path)
-        assert _user_version(db_path) == migrations.SCHEMA_VERSION - 1
+        assert _user_version(db_path) == 1
 
         migrations.migrate(db_path)
 
@@ -486,3 +536,154 @@ class TestProfileFieldsMigration:
             ("legacy-c", "free"),
             ("post-migration", "assigned"),
         ]
+
+
+def _local_ts(year: int, month: int, day: int, hour: int = 0, minute: int = 0, second: int = 0) -> float:
+    """Unix-время для заданного локального времени (секунды не нужны точнее)."""
+    return time.mktime((year, month, day, hour, minute, second, 0, 0, -1))
+
+
+def _insert_logs(db_path, ts_values) -> None:
+    with sqlite3.connect(db_path) as conn:
+        conn.executemany(
+            "INSERT INTO logs (ts, level, message) VALUES (?, 'INFO', ?)",
+            [(ts, f"msg-{index}") for index, ts in enumerate(ts_values)],
+        )
+        conn.commit()
+
+
+def _log_days(db_path) -> list[str | None]:
+    with sqlite3.connect(db_path) as conn:
+        rows = conn.execute("SELECT day FROM logs ORDER BY id").fetchall()
+    return [row[0] for row in rows]
+
+
+def _logs_columns(db_path) -> dict[str, dict]:
+    with sqlite3.connect(db_path) as conn:
+        return _columns(conn, "logs")
+
+
+@pytest.fixture
+def fixed_timezone():
+    """Перевести процесс на фиксированную зону и корректно вернуть обратно.
+
+    Нужен, чтобы различать локальную дату и UTC: бэкалф обязан считать по
+    localtime, а не по UTC. tzset() зовётся и при входе, и при выходе — libc
+    кэширует зону, и без сброса последующие тесты увидели бы чужую.
+    """
+    original = os.environ.get("TZ")
+    os.environ["TZ"] = "Etc/GMT-12"
+    time.tzset()
+    yield
+    if original is None:
+        os.environ.pop("TZ", None)
+    else:
+        os.environ["TZ"] = original
+    time.tzset()
+
+
+class TestLogsDayMigration:
+    """Миграция 003: колонка logs.day, бэкалф локальной даты и индекс.
+
+    Оба пути обязаны работать: свежая БД получает колонку и индекс из
+    schema.sql, существующая — из файла миграции вместе с бэкалфом из ts.
+    """
+
+    def test_fresh_database_has_nullable_day_column(self, db_path):
+        migrations.migrate(db_path)
+
+        columns = _logs_columns(db_path)
+
+        assert "day" in columns, "свежая БД обязана получить колонку day"
+        assert columns["day"]["notnull"] == 0, (
+            "day заполняется писателем от ts, а не DEFAULT: у SQLite нет "
+            "выражения DEFAULT от другой колонки таблицы"
+        )
+
+    def test_fresh_database_indexes_day_level_browser(self, db_path):
+        migrations.migrate(db_path)
+
+        with sqlite3.connect(db_path) as conn:
+            names = _index_names(conn)
+
+        assert "idx_logs_day_level_browser" in names
+
+    def test_incremental_migration_adds_column_and_index_on_a_version_two_db(
+        self, db_path
+    ):
+        _make_v2_database(db_path)
+        assert "day" not in _logs_columns(db_path)
+
+        migrations.migrate(db_path)
+
+        assert "day" in _logs_columns(db_path)
+        with sqlite3.connect(db_path) as conn:
+            names = _index_names(conn)
+        assert "idx_logs_day_level_browser" in names
+        assert _user_version(db_path) == migrations.SCHEMA_VERSION
+
+    def test_incremental_backfill_splits_rows_on_the_local_day_boundary(self, db_path):
+        """23:59:59 и 00:00:00 локально — соседние сутки, а не один день."""
+        just_before_midnight = _local_ts(2024, 3, 31, 23, 59, 59)
+        midnight = _local_ts(2024, 4, 1, 0, 0, 0)
+        _make_v2_database(db_path)
+        _insert_logs(db_path, [just_before_midnight, midnight])
+
+        migrations.migrate(db_path)
+
+        assert _log_days(db_path) == ["2024-03-31", "2024-04-01"]
+
+    def test_incremental_backfill_uses_local_date_not_utc(self, db_path, fixed_timezone):
+        """С зоной UTC-12 запись в 00:30 UTC уходит в предыдущий локальный день."""
+        instant = datetime(2024, 7, 1, 0, 30, tzinfo=timezone.utc).timestamp()
+        if time.strftime("%Y-%m-%dT%H", instant) != "2024-06-30T12":
+            pytest.skip("зона Etc/GMT-12 недоступна в этом окружении")
+        _make_v2_database(db_path)
+        _insert_logs(db_path, [instant])
+
+        migrations.migrate(db_path)
+
+        assert _log_days(db_path) == ["2024-06-30"], (
+            "бэкалф обязан считать localtime, а не UTC"
+        )
+
+    def test_backfill_matches_python_localtime_for_every_inserted_row(self, db_path):
+        """Опора на одну и ту же localtime: SQL-бэкалф против time.localtime."""
+        timestamps = [
+            _local_ts(2023, 12, 31, 23, 59, 59),
+            _local_ts(2024, 1, 1, 0, 0, 0),
+            _local_ts(2024, 6, 15, 12, 0, 0),
+            _local_ts(2024, 12, 31, 23, 59, 59),
+        ]
+        _make_v2_database(db_path)
+        _insert_logs(db_path, timestamps)
+
+        migrations.migrate(db_path)
+
+        assert _log_days(db_path) == [
+            time.strftime("%Y-%m-%d", time.localtime(ts)) for ts in timestamps
+        ]
+
+    def test_incremental_logs_schema_matches_a_fresh_database(self, db_path, tmp_path):
+        fresh = tmp_path / "fresh.db"
+        migrations.migrate(fresh)
+        _make_v2_database(db_path)
+
+        migrations.migrate(db_path)
+
+        assert _logs_columns(db_path) == _logs_columns(fresh), (
+            "оба пути к схеме обязаны дать один и тот же logs"
+        )
+
+    def test_repeated_migration_is_a_no_op_for_backfilled_days(self, db_path):
+        _make_v2_database(db_path)
+        _insert_logs(db_path, [_local_ts(2024, 4, 1, 10, 0, 0)])
+        migrations.migrate(db_path)
+        first = _log_days(db_path)
+
+        migrations.migrate(db_path)
+
+        assert _log_days(db_path) == first, "повторная миграция не должна пересчитывать day"
+        assert _user_version(db_path) == migrations.SCHEMA_VERSION
+        with sqlite3.connect(db_path) as conn:
+            assert conn.execute("SELECT COUNT(*) FROM logs").fetchone()[0] == 1
