@@ -11,6 +11,7 @@ import hooks
 from clicklogs_db import ClickLogsDB
 from config_reader import config
 from engine.log import get_logger
+from engine.worker import proxy_from_environ
 from logger import update_log_formats
 from proxy import get_proxies
 from search_controller import SearchController
@@ -81,7 +82,15 @@ def resolve_query(args) -> str:
 
 
 def resolve_proxy(args) -> str | None:
-    """Один прокси для прогона: аргумент, файл со списком, конфиг, ничего."""
+    """Один прокси для прогона: env супервизора, аргумент, файл, конфиг, ничего.
+
+    ``ADCLICKER_PROXY`` главнее всех legacy-источников: супервизор закрепляет
+    прокси за воркером и передаёт его через окружение. Пустая переменная —
+    прежнее поведение, вплоть до ``random.choice`` по файлу.
+    """
+    assigned = proxy_from_environ()
+    if assigned is not None:
+        return assigned
     if args.proxy:
         return args.proxy
     if config.paths.proxy_file:
