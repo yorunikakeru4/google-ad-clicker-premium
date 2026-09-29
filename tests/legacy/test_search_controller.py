@@ -726,8 +726,17 @@ class LogRecorder:
 
 @pytest.fixture
 def record_log(monkeypatch):
+    """Логгер-заглушка для обеих точек пишущего кода.
+
+    В проде ``search_controller.log`` и ``engine.profile_apply.log`` — один и
+    тот же ``get_logger()``-инстанс, поэтому здесь оба атрибута подменяются
+    на один recorder: иначе запись про битый cookies-файл (её делает
+    profile_apply) не попала бы в проверку.
+    """
+
     recorder = LogRecorder()
     monkeypatch.setattr(search_controller, "log", recorder)
+    monkeypatch.setattr("engine.profile_apply.log", recorder)
     return recorder
 
 

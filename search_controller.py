@@ -26,6 +26,13 @@ from adb import adb_controller
 from clicklogs_db import ClickLogsDB
 from config_reader import config
 from engine.log import get_logger
+from engine.profile_apply import (
+    add_profile_cookies,
+    current_profile,
+    load_profile_cookies,
+    save_profile_cookies,
+    should_apply_cookies,
+)
 from stats import SearchStats
 from utils import (
     Direction,
@@ -86,6 +93,9 @@ class SearchController:
         self._exclude_list = None
         self._random_mouse_enabled = config.behavior.random_mouse
         self._use_custom_cookies = config.behavior.custom_cookies
+        # Строка профиля читается один раз на прогон: её видят и применение
+        # cookies (search_for_ads), и выгрузка обратно (end_search).
+        self._profile = current_profile()
         self._twocaptcha_apikey = config.behavior.twocaptcha_apikey
         self._max_scroll_limit = config.behavior.max_scroll_limit
         self._hooks_enabled = config.behavior.hooks_enabled
@@ -110,6 +120,46 @@ class SearchController:
 
         self._load()
 
+    def _apply_cookies(self) -> None:
+        """Применить cookies прогона: профильный набор или legacy cookies.txt.
+
+        Правило (план.md, §5 «Фаза 6», «Персистентные cookie отдельно на
+        профиль»), зафиксированное в :func:`engine.profile_apply.should_apply_cookies`:
+
+        * **профиль назначен** → набор берётся из его файла и применяется
+          **всегда**, независимо от ``behavior.custom_cookies``: cookies —
+          часть привязки профиля, а флаг отвечает за legacy-путь. Чужие
+          cookies при этом удаляются в любом случае, поэтому профиль без
+          файла стартует чистым, а не с общего ``cookies.txt``;
+        * **профиля нет** → прежнее поведение: ``custom_cookies`` и есть ответ
+          «применять cookies вообще», источник — общий ``cookies.txt``.
+
+        В лог уходят только имена cookies: значения — это сессионные креды
+        профиля, а записи уходят в ``logs`` и в UI.
+        """
+        if not should_apply_cookies(self._profile, self._use_custom_cookies):
+            return
+
+        self._driver.delete_all_cookies()
+
+        if self._profile is not None:
+            add_profile_cookies(self._driver, load_profile_cookies(self._profile["id"]))
+            source = "profile"
+        else:
+            add_cookies(self._driver)
+            source = "cookies.txt"
+
+        loaded = self._driver.get_cookies()
+        log.debug(
+            "browser",
+            "Cookies applied",
+            fields={
+                "source": source,
+                "count": len(loaded),
+                "names": [cookie.get("name") for cookie in loaded],
+            },
+        )
+
     def search_for_ads(
         self, non_ad_domains: Optional[list[str]] = None
     ) -> tuple[AdList, NonAdList]:
@@ -123,12 +173,7 @@ class SearchController:
         :returns: Tuple of [(ad, ad_link, ad_title), non_ad_links]
         """
 
-        if self._use_custom_cookies:
-            self._driver.delete_all_cookies()
-            add_cookies(self._driver)
-
-            for cookie in self._driver.get_cookies():
-                log.debug("browser", "Loaded cookie", fields={"cookie": cookie})
+        self._apply_cookies()
 
         self._check_captcha()
         self._close_cookie_dialog()
@@ -552,6 +597,11 @@ class SearchController:
         """
 
         if self._driver:
+            # Выгрузка профильных cookies — строго ДО удаления и закрытия:
+            # после этого выгружать уже нечего. Best-effort внутри, поэтому
+            # она не может ронять teardown.
+            self._save_profile_cookies()
+
             try:
                 self._delete_cache_and_cookies()
                 self._driver.quit()
@@ -560,6 +610,54 @@ class SearchController:
                 log.debug("browser", "Failed to close the browser", fields={"error": str(exp)})
 
             self._driver = None
+
+    def _save_profile_cookies(self) -> None:
+        """Сохранить cookies браузера в файл профиля. Best-effort, не бросает.
+
+        Персистентность cookies живёт здесь, а не в ad_clicker: эта точка
+        есть у каждого режима (UC и SeleniumBase) и выполняется на успехе и
+        на ошибке сценария — ровно тогда, когда браузер ещё содержит
+        актуальный набор. Любая причина отказа (драйвер уже умер, файл не
+        записывается) даёт ``WARNING`` в ``browser`` и не мешает закрытию:
+        потерять один прогон cookies дешевле, чем не закрыть браузер.
+        """
+        if self._profile is None:
+            return
+
+        profile_id = self._profile["id"]
+
+        try:
+            cookies = self._driver.get_cookies()
+        except Exception as exp:
+            log.warning(
+                "browser",
+                "Profile cookies were not read from the browser",
+                fields={
+                    "profile_id": profile_id,
+                    "error": str(exp),
+                    "error_type": type(exp).__name__,
+                },
+            )
+            return
+
+        try:
+            path = save_profile_cookies(profile_id, cookies)
+        except Exception as exp:
+            log.warning(
+                "browser",
+                "Profile cookies were not saved",
+                fields={
+                    "profile_id": profile_id,
+                    "error": str(exp),
+                    "error_type": type(exp).__name__,
+                },
+            )
+        else:
+            log.debug(
+                "browser",
+                "Profile cookies saved",
+                fields={"profile_id": profile_id, "path": str(path), "count": len(cookies)},
+            )
 
     def _load(self) -> None:
         """Load Google main page"""

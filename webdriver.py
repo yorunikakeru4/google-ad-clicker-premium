@@ -15,6 +15,7 @@ import undetected_chromedriver
 from config_reader import config
 from engine.cdp import CdpClient
 from engine.log import get_logger
+from engine.profile_apply import current_profile, resolve_locale, resolve_timezone
 from engine.proxy_auth import (
     PROXY_TRANSPORT_CDP_AUTH,
     PROXY_TRANSPORT_DIRECT,
@@ -299,6 +300,34 @@ def _start_proxy_auth(
         return None
 
 
+def _apply_locale(chrome_options, lang: Optional[object]) -> None:
+    """Поставить локаль в опции Chrome. None — нечего применять.
+
+    Форма строк сохранена до буквы: legacy складывает список локалей из
+    ``get_locale_language`` через ``str()`` в prefs и обрезает его в ``--lang``
+    как есть, а профильная локаль приходит строкой. Менять это значило бы
+    менять поведение для старых конфигов (см. тесты паритета).
+    """
+
+    if lang is None:
+        return
+    chrome_options.add_experimental_option("prefs", {"intl.accept_languages": str(lang)})
+    chrome_options.add_argument(f"--lang={lang[:2]}")
+
+
+def _override_timezone(driver, timezone: object, fields: Optional[dict] = None) -> None:
+    """Поставить часовой пояс через CDP и запомнить его на драйвере.
+
+    ``_custom_timezone`` читает ``execute_stealth_js_code``, поэтому атрибут
+    выставляется здесь же, а не в местах вызова. Список полей — контекст
+    записи в лог (прокси или профиль), сам часовой пояс добавляет всегда.
+    """
+
+    driver._custom_timezone = timezone
+    driver.execute_cdp_cmd("Emulation.setTimezoneOverride", {"timezoneId": timezone})
+    log.debug("browser", "Timezone of", fields={"timezone": timezone, **(fields or {})})
+
+
 def create_webdriver(
     proxy: str, user_agent: Optional[str] = None, plugin_folder_name: Optional[str] = None
 ) -> tuple[undetected_chromedriver.Chrome, Optional[str]]:
@@ -322,6 +351,12 @@ def create_webdriver(
     # ошибка конфигурации, и упасть она должна раньше, чем созданы каталоги
     # профиля и запущен Chrome.
     transport = resolve_proxy_transport(config.webdriver.proxy_transport)
+
+    # Настройки профиля читаются до опций Chrome: локаль обязана попасть в
+    # add_experimental_option до создания драйвера, а часовой пояс — в CDP
+    # сразу после. UA приходит аргументом, его разрешает ad_clicker.
+    profile = current_profile()
+    profile_timezone = resolve_timezone(profile, None)
 
     geolocation_db_client = GeolocationDB()
 
@@ -415,10 +450,13 @@ def create_webdriver(
         # get location of the proxy IP
         lat, long, country_code, timezone = get_location(geolocation_db_client, proxy)
 
-        if config.webdriver.language_from_proxy:
-            lang = get_locale_language(country_code)
-            chrome_options.add_experimental_option("prefs", {"intl.accept_languages": str(lang)})
-            chrome_options.add_argument(f"--lang={lang[:2]}")
+        # Профильная локаль главнее гео-вычисления; само гео вызывается
+        # только когда включён language_from_proxy, как и раньше.
+        geo_locale = (
+            get_locale_language(country_code) if config.webdriver.language_from_proxy else None
+        )
+        _apply_locale(chrome_options, resolve_locale(profile, geo_locale))
+        timezone = resolve_timezone(profile, timezone)
 
         driver = CustomChrome(
             driver_executable_path=(
@@ -451,20 +489,18 @@ def create_webdriver(
                 if response.status_code == 200:
                     timezone = response.json()["tz_name"]
 
-            driver._custom_timezone = timezone
+            _override_timezone(driver, timezone, fields={"proxy": host_port})
 
-            driver.execute_cdp_cmd("Emulation.setTimezoneOverride", {"timezoneId": timezone})
-
-            log.debug(
-                "browser",
-                "Timezone of",
-                fields={
-                    "proxy": host_port,
-                    "timezone": timezone,
-                },
-            )
+        elif profile_timezone:
+            # Координат нет — legacy часовой пояс не ставил вовсе, даже если
+            # geolocation вернул пояс отдельно от широты/долготы. Профильный
+            # применяется сам по себе: он к гео не привязан.
+            _override_timezone(driver, profile_timezone)
 
     else:
+        # Без прокси legacy локаль и пояс не ставил ни в каком виде; с профилем
+        # применяются только его значения (гео здесь неоткуда взять).
+        _apply_locale(chrome_options, resolve_locale(profile, None))
         driver = CustomChrome(
             driver_executable_path=(
                 driver_exe_path if multi_procs_enabled and Path(driver_exe_path).exists() else None
@@ -473,6 +509,8 @@ def create_webdriver(
             user_multi_procs=multi_procs_enabled,
             use_subprocess=False,
         )
+        if profile_timezone:
+            _override_timezone(driver, profile_timezone)
 
     if config.webdriver.window_size:
         width, height = config.webdriver.window_size.split(",")
@@ -511,9 +549,15 @@ def create_seleniumbase_driver(
     # Как и в UC-ветке: ошибка конфигурации раньше любых побочных эффектов.
     transport = resolve_proxy_transport(config.webdriver.proxy_transport)
 
+    # Настройки профиля — до get_driver: locale_code уходит в него аргументом,
+    # а часовой пояс ставится через CDP сразу после создания драйвера.
+    profile = current_profile()
+    profile_timezone = resolve_timezone(profile, None)
+
     country_code = None
     credentials: tuple[str, str] | None = None
     host_port = ""
+    lang = None
 
     if proxy:
         credentials = _proxy_credentials(proxy, transport)
@@ -528,6 +572,7 @@ def create_seleniumbase_driver(
 
         if config.webdriver.language_from_proxy:
             lang = get_locale_language(country_code)
+        timezone = resolve_timezone(profile, timezone)
 
     base_dir = Path(tempfile.gettempdir()) / "sb_profiles"
     base_dir.mkdir(exist_ok=True)
@@ -544,6 +589,10 @@ def create_seleniumbase_driver(
         else:
             proxy_string = host_port
 
+    # Профильная локаль главнее гео-вычисленной; без профиля и без
+    # language_from_proxy в аргумент уходит None, как и раньше.
+    lang = resolve_locale(profile, lang)
+
     driver = seleniumbase.get_driver(
         browser_name="chrome",
         undetectable=True,
@@ -553,7 +602,7 @@ def create_seleniumbase_driver(
         proxy_string=proxy_string,
         multi_proxy=config.behavior.browser_count > 1,
         incognito=config.webdriver.incognito,
-        locale_code=str(lang) if config.webdriver.language_from_proxy else None,
+        locale_code=str(lang) if lang is not None else None,
         user_data_dir=str(profile_dir),
     )
 
@@ -577,18 +626,12 @@ def create_seleniumbase_driver(
             if response.status_code == 200:
                 timezone = response.json()["tz_name"]
 
-        driver._custom_timezone = timezone
+        _override_timezone(driver, timezone, fields={"proxy": host_port})
 
-        driver.execute_cdp_cmd("Emulation.setTimezoneOverride", {"timezoneId": timezone})
-
-        log.debug(
-            "browser",
-            "Timezone of",
-            fields={
-                "proxy": host_port,
-                "timezone": timezone,
-            },
-        )
+    elif profile_timezone:
+        # Без координат legacy пояс не ставил вовсе; профильный применяется
+        # сам по себе — и в прокси-ветке, и без прокси.
+        _override_timezone(driver, profile_timezone)
 
     # handle window size and position
     if config.webdriver.window_size:
