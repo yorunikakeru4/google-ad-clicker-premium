@@ -2,9 +2,19 @@ import logging
 from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
+from engine.log_rotation import LEVEL_ORDER
+
 
 LOG_FILENAME = Path.cwd() / "logs" / "adclicker.log"
 LOG_FILENAME.parent.mkdir(exist_ok=True)
+
+# Имя уровня -> число logging. Валидация и установка идут по одному и тому же
+# словарю: допустимые значения не проверяются отдельным списком, а имена
+# приходят из engine.log_rotation — там же живут enum behavior.log_file_level
+# и фильтр дневного экспорта, поэтому словари не могут разойтись.
+FILE_LEVELS: dict[str, int] = {
+    name: logging.getLevelNamesMapping()[name] for name in LEVEL_ORDER
+}
 
 # Create a custom logger
 logger = logging.getLogger(__name__)
@@ -29,6 +39,33 @@ file_handler.setFormatter(file_formatter)
 # Add handlers to the logger
 logger.addHandler(console_handler)
 logger.addHandler(file_handler)
+
+
+def apply_file_level(name: str) -> int:
+    """Ставит уровень файлового обработчика ``adclicker.log``.
+
+    Валидация — по тому же словарю ``FILE_LEVELS``, что и установка:
+    неизвестное имя не доходит до ``setLevel`` и поднимает ``ValueError``
+    со списком допустимых значений. Консольный обработчик не трогается —
+    INFO в терминале остаётся прежним независимо от настройки.
+
+    Вызывается там, где читается ``config.json``: в ``config_reader`` при
+    каждом чтении (старт воркера и перечитывание настроек) и в
+    ``build_daemon`` при старте демона. Уровень — поле конфига
+    (``behavior.log_file_level``), поэтому legacy-зеркало двойной записи
+    подхватывает его без правки кода.
+
+    Возвращает установленный уровень (число logging).
+    """
+    try:
+        level = FILE_LEVELS[name]
+    except (KeyError, TypeError):
+        raise ValueError(
+            f"неизвестный уровень файлового лога: {name!r}; "
+            f"допустимы {list(FILE_LEVELS)}"
+        ) from None
+    file_handler.setLevel(level)
+    return level
 
 
 class MultiprocessLogFilter(logging.Filter):

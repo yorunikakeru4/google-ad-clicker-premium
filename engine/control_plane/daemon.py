@@ -834,6 +834,10 @@ def build_daemon(
     логов (``day_close_interval``, ``retention_interval``,
     ``db_size_interval``); у закрытия дня ``None`` из окружения означает
     расписание в 23:59, а не выключенный job.
+
+    Конфиг читается один раз здесь и передаётся демону: из него же
+    применяется уровень файлового лога (``behavior.log_file_level``) — до
+    первого обращения к legacy-зеркалу.
     """
     from engine.db import migrations
 
@@ -858,6 +862,15 @@ def build_daemon(
         db_size_interval_from_environ() if db_size_interval is None else db_size_interval
     )
     migrations.migrate(db_path)
+    config = Config.load(config_path)
+    # Уровень файлового лога — поле config.json, и читается конфиг именно
+    # здесь, при старте демона: legacy-зеркало пишет в adclicker.log уже с
+    # нужным уровнем. Импорт ленивый — logger.py создаёт каталог logs/ при
+    # импорте, и модуль демона не должен делать этого ни при разборе
+    # аргументов, ни при импорте из тестов.
+    from logger import apply_file_level
+
+    apply_file_level(str(config.get("behavior.log_file_level")))
 
     return Daemon(
         db_path=db_path,
@@ -865,6 +878,7 @@ def build_daemon(
         token=resolved_token,
         port=port,
         host=host,
+        config=config,
         proxy_check_interval=resolved_interval,
         captcha_check_interval=resolved_captcha_interval,
         day_close_interval=resolved_day_close,

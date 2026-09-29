@@ -14,7 +14,7 @@ from engine.log_rotation import (
     DEFAULT_LOG_RETENTION_DAYS,
 )
 from engine.proxy_transport import DEFAULT_PROXY_TRANSPORT
-from logger import logger
+from logger import apply_file_level, logger
 
 
 @dataclass
@@ -214,6 +214,19 @@ class ConfigReader:
                 "db_size_limit_mb", DEFAULT_DB_SIZE_LIMIT_MB
             ),
         )
+
+        # Уровень файлового лога применяется при каждом чтении конфига:
+        # поле behavior.log_file_level читается здесь же, поэтому воркер
+        # подхватывает его и на старте, и при перечитывании настроек. Опечатка
+        # в значении не должна ронять запуск — уровень остаётся прежним, а
+        # причина уходит в лог.
+        try:
+            apply_file_level(self.behavior.log_file_level)
+        except ValueError as exc:
+            logger.error(
+                f"Failed to apply 'log_file_level' from config file: {exc}. "
+                "Keeping the current file level."
+            )
 
 
 config = ConfigReader()

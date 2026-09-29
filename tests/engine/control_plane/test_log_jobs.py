@@ -630,3 +630,65 @@ class TestBuildDaemonFileLevel:
             assert applied == ["INFO"], "дефолт уровня — INFO, а не «не применять»"
         finally:
             daemon.shutdown()
+
+
+class TestLevelWiring:
+    """Уровень из конфига доводится до экспорта и до файлового логгера."""
+
+    def test_day_close_exports_only_records_at_or_above_the_configured_level(
+        self, db_path, config_path, registry, tmp_path, monkeypatch
+    ):
+        monkeypatch.chdir(tmp_path)
+        today = local_day(time.time())
+        insert_log(db_path, today, message="debug detail", level="DEBUG")
+        insert_log(db_path, today, message="hard failure", level="ERROR")
+        daemon = make_daemon(
+            db_path,
+            config_path,
+            registry,
+            day_close_interval=0.05,
+            config_data={
+                "behavior": {"browser_count": 2, "log_file_level": "ERROR"}
+            },
+        )
+
+        daemon.start()
+        try:
+            exported = tmp_path / "logs" / f"{today}.log"
+            assert wait_until(exported.exists), "закрытие дня не выгрузило файл"
+            body = exported.read_text(encoding="utf-8")
+        finally:
+            daemon.shutdown()
+
+        assert "hard failure" in body
+        assert "debug detail" not in body, "DEBUG обязан остаться только в БД"
+
+    def test_db_size_failure_is_logged_and_the_job_keeps_ticking(
+        self, db_path, config_path, registry, monkeypatch
+    ):
+        import engine.control_plane.daemon as daemon_module
+
+        calls = []
+
+        def exploding_guard(*args, **kwargs):
+            calls.append(args)
+            raise RuntimeError("диск отвалился")
+
+        monkeypatch.setattr(daemon_module, "enforce_db_size_limit", exploding_guard)
+        daemon = make_daemon(
+            db_path,
+            config_path,
+            registry,
+            db_size_interval=0.05,
+            config_data={"behavior": {"browser_count": 2, "db_size_limit_mb": 1}},
+        )
+
+        daemon.start()
+        try:
+            assert wait_until(lambda: len(calls) >= 2), "job остановился после ошибки"
+            assert get_health(daemon) == 200
+            assert wait_until(
+                lambda: any("db size check failed" in m for m in log_messages(db_path))
+            )
+        finally:
+            daemon.shutdown()

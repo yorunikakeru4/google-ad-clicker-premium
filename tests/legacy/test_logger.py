@@ -219,3 +219,24 @@ def test_failed_validation_keeps_the_previous_level(restore_levels):
         apply_file_level("TRACE")
 
     assert file_handler.level == logging.ERROR
+
+
+def test_applied_level_filters_records_reaching_the_file_handler(
+    restore_levels, monkeypatch
+):
+    """Не «число в атрибуте», а реально отфильтрованные записи.
+
+    Уровень применяется к обработчику, поэтому проверяется путь записи:
+    под INFO в файл не доходит ни одна запись ниже INFO, а сама INFO доходит.
+    Консоль при этом остаётся на своём уровне.
+    """
+
+    apply_file_level("INFO")
+    emitted = []
+    monkeypatch.setattr(file_handler, "emit", lambda record: emitted.append(record.levelno))
+
+    logger.debug("остаётся в БД")
+    logger.info("доходит до файла")
+
+    assert emitted == [logging.INFO]
+    assert console_handler.level == logging.INFO

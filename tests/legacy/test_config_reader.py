@@ -439,6 +439,6 @@ def test_unknown_file_level_is_reported_and_keeps_the_current_level(
 
     assert reader.behavior is not None, "чтение конфига обязано дойти до конца"
     assert file_handler.level == logging.ERROR, "уровень не меняется при ошибке"
-    assert any("log_file_level" in record.message for record in caplog.records), (
+    assert any("log_file_level" in record.getMessage() for record in caplog.records), (
         "причина отказа обязана быть видна в логе"
     )
