@@ -1810,10 +1810,14 @@ mod tests {
         let tmp = TempDb::new();
         let path = tmp.path();
         let writer = seed(&path, &[]);
+        // Схема движка содержит profiles.fields (миграция 002); старую схему
+        // для теста моделируем удалением колонки: читалка не должна падать,
+        // а поле на старой схеме отдаётся NULL.
+        writer
+            .execute("ALTER TABLE profiles DROP COLUMN fields", [])
+            .expect("колонка fields убирается для моделирования старой схемы");
         insert_profile(&writer, "старая схема", None);
 
-        // Схема движка в этом дереве ещё не содержит profiles.fields:
-        // читалка не должна падать, а поле отдаётся NULL.
         let reader = DbReader::open(&path).expect("БД открывается");
         let rows = reader.list_profiles().expect("список читается");
 
@@ -1826,9 +1830,7 @@ mod tests {
         let tmp = TempDb::new();
         let path = tmp.path();
         let writer = seed(&path, &[]);
-        writer
-            .execute("ALTER TABLE profiles ADD COLUMN fields TEXT", [])
-            .expect("колонка fields добавляется тестом");
+        // Колонка уже есть в схеме (миграция 002) — вставляем строку напрямую.
         writer
             .execute(
                 "INSERT INTO profiles (name, status, fields) \
@@ -1854,7 +1856,9 @@ mod tests {
             "fields должен отдаваться сырой JSON-строкой"
         );
         assert_eq!(with_fields.status, "blocked");
-        assert_eq!(rows[1].fields, None, "отсутствующие поля — NULL");
+        // На свежей схеме колонка NOT NULL DEFAULT '{}': «без полей» — это
+        // пустой JSON-объект, а не NULL (NULL остаётся для старых схем).
+        assert_eq!(rows[1].fields.as_deref(), Some("{}"));
     }
 
     #[test]
