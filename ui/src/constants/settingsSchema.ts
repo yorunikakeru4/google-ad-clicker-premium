@@ -2,7 +2,8 @@ export type SettingType = "bool" | "int" | "float" | "string" | "enum" | "path";
 
 export interface SettingOption {
   title: string;
-  value: number;
+  /** Число (multiprocess_style) или строка (proxy_transport) — как в движке. */
+  value: number | string;
 }
 
 export interface SettingFieldDef {
@@ -16,6 +17,8 @@ export interface SettingFieldDef {
   step?: number;
   options?: SettingOption[];
   restart?: boolean;
+  /** Секрет: движок отдаёт маску ********, в патч без правок не попадает. */
+  secret?: boolean;
 }
 
 export interface SettingSection {
@@ -24,6 +27,11 @@ export interface SettingSection {
   fields: SettingFieldDef[];
 }
 
+// Форма Settings (план §5, фаза 2). Состав секций, порядок ключей, типы и
+// дефолты — точная копия engine/control_plane/config.py::_SCHEMA, границы —
+// из _numeric_limits, секреты — из _SECRET_FIELDS. Держит их в согласии
+// тест settingsSchema.test.ts: правка _SCHEMA требует правки этой схемы и
+// фикстуры в тесте.
 export const settingsSections: SettingSection[] = [
   {
     key: "paths",
@@ -33,13 +41,13 @@ export const settingsSections: SettingSection[] = [
         key: "query_file",
         type: "path",
         hint: "Файл с поисковыми запросами, по одному в строке. Пусто — запрос берётся из behavior.query",
-        default: "queries.txt",
+        default: "",
       },
       {
         key: "proxy_file",
         type: "path",
-        hint: "Файл со списком прокси, по одному в строке. Пусто — используется behavior.proxy",
-        default: "proxies.txt",
+        hint: "Файл со списком прокси, по одному в строке. Пусто — используется webdriver.proxy",
+        default: "",
       },
       {
         key: "user_agents",
@@ -64,6 +72,7 @@ export const settingsSections: SettingSection[] = [
         type: "string",
         hint: "Один прокси в формате scheme://host:port. Взаимоисключимо с paths.proxy_file",
         default: "",
+        secret: true,
       },
       {
         key: "auth",
@@ -113,6 +122,17 @@ export const settingsSections: SettingSection[] = [
         hint: "Запуск через SeleniumBase вместо undetected-chromedriver",
         default: false,
       },
+      {
+        key: "proxy_transport",
+        type: "enum",
+        options: [
+          { title: "CDP-авторизация (по умолчанию)", value: "cdp_auth" },
+          { title: "Расширение браузера MV3", value: "extension" },
+          { title: "Прямое подключение, whitelist IP", value: "direct" },
+        ],
+        hint: "Как креды прокси доходят до Chrome: через DevTools, через расширение или без кредов вовсе",
+        default: "cdp_auth",
+      },
     ],
   },
   {
@@ -130,7 +150,8 @@ export const settingsSections: SettingSection[] = [
         type: "int",
         unit: "сек",
         min: 0,
-        hint: "Нижняя граница случайной паузы на странице с рекламой",
+        max: 3600,
+        hint: "Нижняя граница случайной паузы на странице с рекламой, 0–3600 сек",
         default: 10,
       },
       {
@@ -138,7 +159,8 @@ export const settingsSections: SettingSection[] = [
         type: "int",
         unit: "сек",
         min: 0,
-        hint: "Верхняя граница случайной паузы на странице с рекламой",
+        max: 3600,
+        hint: "Верхняя граница случайной паузы на странице с рекламой, 0–3600 сек, не меньше нижней",
         default: 15,
       },
       {
@@ -146,7 +168,8 @@ export const settingsSections: SettingSection[] = [
         type: "int",
         unit: "сек",
         min: 0,
-        hint: "Нижняя граница случайной паузы на странице без рекламы",
+        max: 3600,
+        hint: "Нижняя граница случайной паузы на странице без рекламы, 0–3600 сек",
         default: 15,
       },
       {
@@ -154,7 +177,8 @@ export const settingsSections: SettingSection[] = [
         type: "int",
         unit: "сек",
         min: 0,
-        hint: "Верхняя граница случайной паузы на странице без рекламы",
+        max: 3600,
+        hint: "Верхняя граница случайной паузы на странице без рекламы, 0–3600 сек, не меньше нижней",
         default: 20,
       },
       {
@@ -162,7 +186,8 @@ export const settingsSections: SettingSection[] = [
         type: "int",
         unit: "стр.",
         min: 0,
-        hint: "Максимум прокруток страницы, 0 — без ограничения",
+        max: 3600,
+        hint: "Максимум прокруток страницы, 0–3600, 0 — без ограничения",
         default: 0,
       },
       {
@@ -192,17 +217,17 @@ export const settingsSections: SettingSection[] = [
       {
         key: "click_order",
         type: "int",
-        min: 1,
-        max: 20,
-        hint: "Порядковый номер рекламного результата, по которому выполняется клик",
+        min: 0,
+        max: 1000,
+        hint: "Порядковый номер рекламного результата, по которому выполняется клик, 0–1000",
         default: 5,
       },
       {
         key: "browser_count",
         type: "int",
-        min: 0,
-        max: 32,
-        hint: "Число параллельных браузеров, 0 — по числу ядер процессора",
+        min: 1,
+        max: 8,
+        hint: "Число параллельных браузеров, 1–8",
         default: 2,
       },
       {
@@ -220,34 +245,37 @@ export const settingsSections: SettingSection[] = [
         type: "int",
         unit: "сек",
         min: 0,
-        hint: "Пауза между проходами по списку запросов",
+        max: 86400,
+        hint: "Пауза между проходами по списку запросов, 0–86400 сек",
         default: 60,
       },
       {
         key: "wait_factor",
         type: "float",
-        step: 0.1,
-        min: 0,
-        hint: "Множитель всех случайных пауз: 1 — как задано, 0.5 — вдвое быстрее",
+        step: 0.01,
+        min: 0.01,
+        max: 100,
+        hint: "Множитель всех случайных пауз: 1 — как задано, 0.5 — вдвое быстрее; 0.01–100",
         default: 1,
       },
       {
         key: "running_interval_start",
         type: "string",
-        hint: "Начало окна работы по расписанию в формате HH:MM",
-        default: "00:00",
+        hint: "Начало окна работы по расписанию, ЧЧ:ММ в пределах 00:00–23:59. Пусто — ограничения нет; заполняйте вместе с концом",
+        default: "",
       },
       {
         key: "running_interval_end",
         type: "string",
-        hint: "Конец окна работы по расписанию в формате HH:MM",
-        default: "00:00",
+        hint: "Конец окна работы по расписанию, ЧЧ:ММ в пределах 00:00–23:59. Пусто — ограничения нет; заполняйте вместе с началом",
+        default: "",
       },
       {
         key: "2captcha_apikey",
         type: "string",
         hint: "Ключ 2Captcha для автоматического решения CAPTCHA",
         default: "",
+        secret: true,
       },
       {
         key: "hooks_enabled",
