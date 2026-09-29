@@ -119,3 +119,36 @@ def test_quit_logs_swallowed_kill_error_instead_of_silencing_it(monkeypatch):
     assert records, "проглоченная ошибка нигде не залогирована"
     assert any("unexpected kill failure" in str(args) for args, _ in records)
     assert any(call[1].get("exc_info") for call in records)
+
+
+class TestMultiProcsMarker:
+    """Признак многопроцессного запуска.
+
+    Раньше его нёс файл ``.MULTI_BROWSERS_IN_USE``, создававшийся
+    ``run_ad_clicker.py``. Точка входа удалена, файл больше не создаётся, и
+    оставленная на диске копия от прошлой версии не должна была бы включать
+    многопроцессный путь одиночному ``ad_clicker.py`` — поэтому источником
+    признака осталось только окружение супервизора.
+    """
+
+    def test_marker_is_off_by_default(self, monkeypatch):
+        monkeypatch.delenv(webdriver.MULTI_BROWSERS_ENV, raising=False)
+
+        assert webdriver.is_multi_procs_enabled() is False
+
+    def test_env_from_supervisor_enables_marker(self, monkeypatch):
+        monkeypatch.setenv(webdriver.MULTI_BROWSERS_ENV, "1")
+
+        assert webdriver.is_multi_procs_enabled() is True
+
+    def test_env_other_than_one_keeps_marker_off(self, monkeypatch):
+        monkeypatch.setenv(webdriver.MULTI_BROWSERS_ENV, "0")
+
+        assert webdriver.is_multi_procs_enabled() is False
+
+    def test_leftover_marker_file_is_ignored(self, monkeypatch, tmp_path):
+        """Мусор прошлой версии не должен менять поведение одиночного запуска."""
+        monkeypatch.delenv(webdriver.MULTI_BROWSERS_ENV, raising=False)
+        (tmp_path / ".MULTI_BROWSERS_IN_USE").touch()
+
+        assert webdriver.is_multi_procs_enabled() is False

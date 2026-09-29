@@ -265,6 +265,7 @@ class Supervisor:
         self._command_for = command_for
         self._env_for = env_for or self._default_env
         self._workers: dict[str, _Worker] = {}
+        self._pool_size = 0
         self._lock = threading.RLock()
 
     def _default_env(self, browser_id: str) -> dict[str, str]:
@@ -272,6 +273,12 @@ class Supervisor:
         # Воркер должен знать, кто он: по этому значению он пишет свои строки
         # в логи и клики, и UI раскладывает их по воркерам.
         env["ADCLICKER_BROWSER_ID"] = browser_id
+        # Размер пула нужен для раздачи запросов, а признак многопроцессности —
+        # чтобы webdriver.py не патчил chromedriver одновременно в N процессах.
+        # Оба значения меняются только вместе с пулом, поэтому читаются здесь,
+        # а не в БД: env достаётся воркеру атомарно со спавном.
+        env["ADCLICKER_POOL_SIZE"] = str(max(0, self._pool_size))
+        env["ADCLICKER_MULTI_BROWSERS"] = "1" if self._pool_size > 1 else "0"
         return env
 
     # --- жизненный цикл пула --------------------------------------------
@@ -290,6 +297,10 @@ class Supervisor:
                     "Сначала остановите их (POST /control/stop)"
                 )
             self._validate_count(count)
+            # Размер пула ставится ДО спавна: он уходит воркерам через env и
+            # определяет, кому какой запрос достанется. Сброс — в stop() и в
+            # откате ниже, иначе env следующего пула соврал бы.
+            self._pool_size = count
 
             ids = self._browser_ids(count)
             self.store.set_run_state("running")
@@ -300,6 +311,7 @@ class Supervisor:
                 # Частично поднятый пул — худшее состояние: часть браузеров
                 # работает, часть нет, и демон это не показывает. Откатываем.
                 self._stop_all_locked(grace=self.settings.shutdown_grace_seconds)
+                self._pool_size = 0
                 self.store.set_run_state("stopped")
                 raise
             return ids
@@ -362,40 +374,44 @@ class Supervisor:
             self._finish_open_runs("stopped")
             self.store.clear_pause()
             self.store.set_run_state("stopped")
+            self._pool_size = 0
             self.store.log("INFO", "supervisor", "supervisor stopped", {"workers": 0})
 
     def _stop_all_locked(self, grace: float) -> None:
-        for worker in self._workers.values():
-            self._terminate_worker(worker, grace)
-        for browser_id in list(self._workers):
-            worker = self._workers.pop(browser_id)
-            if not worker.circuit_open:
-                self.store.set_status(browser_id, WorkerStatus.STOPPED)
+        """SIGTERM всем, общая выдержка, затем SIGKILL оставшимся.
 
-    def _terminate_worker(self, worker: _Worker, grace: float) -> None:
-        """SIGTERM -> пауза -> SIGKILL для конкретного воркера.
+        Сигналы рассылаются ПО ВСЕМ процессам до первого ожидания, а не по
+        одному «сигнал -> ждать -> следующий»: при последовательном порядке
+        остановка пула из N воркеров стоила бы N x grace, и Tauri-хост,
+        дающий демону 10 секунд, SIGKILL'ил бы его посреди работы — вместе
+        с ним погибал бы и остаток очереди, и воркеры (они в собственных
+        сессиях) оставались бы сиротами с открытыми Chrome.
 
-        Метод умеет снимать блокировку: сон на весь grace под RLock заморозил бы
-        и HTTP-ответы, и паузу, поэтому блокировку отпускаем и полагаемся на
-        повторную проверку живости под ней.
+        Общий дедлайн, а не свой у каждого: ждать grace на каждого — ровно
+        та арифметика, от которой мы уходим.
         """
-        if not worker.is_alive():
-            return
-
-        worker.process.terminate()
+        alive = [worker for worker in self._workers.values() if worker.is_alive()]
+        for worker in alive:
+            worker.process.terminate()
 
         deadline = self._clock.time() + grace
-        while self._clock.time() < deadline:
-            if not worker.is_alive():
-                return
-            self._clock.sleep(0.1)
+        for worker in alive:
+            while worker.is_alive() and self._clock.time() < deadline:
+                self._clock.sleep(0.1)
 
-        # Не послушался SIGTERM: Chrome внутри мог зависнуть на диалоге.
-        if worker.is_alive():
+        # SIGKILL уходит всем, кто остался, до первого ожидания — та же
+        # логика, что и с SIGTERM: иначе худший случай снова складывается
+        # в N x grace и не влезает в STOP_GRACE Tauri-хоста.
+        stragglers = [worker for worker in alive if worker.is_alive()]
+        for worker in stragglers:
+            # Не послушался SIGTERM: Chrome внутри мог зависнуть на диалоге.
             worker.process.kill()
-            try:
-                worker.process.wait(timeout=grace)
-            except (subprocess.TimeoutExpired, OSError):
+
+        kill_deadline = self._clock.time() + grace
+        for worker in stragglers:
+            while worker.is_alive() and self._clock.time() < kill_deadline:
+                self._clock.sleep(0.1)
+            if worker.is_alive():
                 self.store.log(
                     "WARN",
                     "supervisor",
@@ -403,6 +419,11 @@ class Supervisor:
                     {"pid": worker.process.pid},
                     browser_id=worker.browser_id,
                 )
+
+        for browser_id in list(self._workers):
+            worker = self._workers.pop(browser_id)
+            if not worker.circuit_open:
+                self.store.set_status(browser_id, WorkerStatus.STOPPED)
 
     def restart(self, count: int) -> list[str]:
         """Полная перезагрузка пула: stop, затем start с новым числом воркеров."""
@@ -412,6 +433,7 @@ class Supervisor:
             self._validate_count(count)
             self._stop_all_locked(grace=self.settings.shutdown_grace_seconds)
             self._finish_open_runs("stopped")
+            self._pool_size = count
             self.store.set_run_state("running")
             for browser_id in self._browser_ids(count):
                 self._start_worker(browser_id, restart_count=0)

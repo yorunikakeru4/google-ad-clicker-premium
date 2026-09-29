@@ -330,3 +330,10 @@ def main(argv: Sequence[str] | None = None) -> int:
     else:
         daemon.shutdown()
     return EXIT_OK
+
+
+if __name__ == "__main__":
+    # sys.exit, а не голый main(): код возврата должен дойти до вызывающей
+    # стороны (launchd, sidecar Tauri, прогон из терминала), иначе «нет
+    # токена» и «нормально отработал» неразличимы.
+    sys.exit(main())

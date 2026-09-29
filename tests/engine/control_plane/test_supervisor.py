@@ -94,7 +94,9 @@ class FakeProcessRegistry:
             raise self.spawn_error
         process = FakeProcess(pid, self, browser_id)
         self.created.append(process)
-        self.start_calls.append({"browser_id": browser_id, "command": list(command)})
+        self.start_calls.append(
+            {"browser_id": browser_id, "command": list(command), "env": dict(env)}
+        )
         if self.exit_immediately:
             process.exit(1)
         return process
@@ -1069,3 +1071,137 @@ class TestBackoffFunction:
     def test_does_not_explode_on_huge_attempt_count(self):
         """Потолок спасает и от переполнения: 10**6 попыток — всё равно maximum."""
         assert sup.backoff_delay(10**6, base=1.0, maximum=60.0) == 60.0
+
+
+class TestWorkerEnvironment:
+    """Переменные, которые супервизор передаёт воркеру через окружение.
+
+    Воркер — отдельный процесс, памятью с демоном не делится, поэтому канал
+    «факт о пуле -> воркер» обязан быть атомарным со спавном. Файл-маркер
+    ``.MULTI_BROWSERS_IN_USE`` раньше заводил ``run_ad_clicker.py``; после
+    удаления этой точки входа источником стал супервизор.
+    """
+
+    def test_pool_size_is_exported_into_spawned_workers(
+        self, store, registry, clock, settings
+    ):
+        supervisor = make_supervisor(store, registry, clock, settings)
+
+        supervisor.start(3)
+
+        assert [call["env"]["ADCLICKER_POOL_SIZE"] for call in registry.start_calls] == [
+            "3",
+            "3",
+            "3",
+        ]
+
+    def test_single_worker_is_not_marked_multi_browser(
+        self, store, registry, clock, settings
+    ):
+        supervisor = make_supervisor(store, registry, clock, settings)
+
+        supervisor.start(1)
+
+        env = registry.start_calls[0]["env"]
+        assert env["ADCLICKER_POOL_SIZE"] == "1"
+        assert env["ADCLICKER_MULTI_BROWSERS"] == "0"
+
+    def test_multi_browser_marker_is_set_when_pool_exceeds_one(
+        self, store, registry, clock, settings
+    ):
+        supervisor = make_supervisor(store, registry, clock, settings)
+
+        supervisor.start(2)
+
+        assert {call["env"]["ADCLICKER_MULTI_BROWSERS"] for call in registry.start_calls} == {
+            "1"
+        }
+
+    def test_pool_size_is_reset_after_stop(self, store, registry, clock, settings):
+        supervisor = make_supervisor(store, registry, clock, settings)
+        supervisor.start(2)
+
+        supervisor.stop()
+
+        env = supervisor._default_env("br-1")
+        assert env["ADCLICKER_POOL_SIZE"] == "0"
+        assert env["ADCLICKER_MULTI_BROWSERS"] == "0"
+
+    def test_failed_start_does_not_leave_a_stale_pool_size(
+        self, store, registry, clock, settings
+    ):
+        """Откат пула обязан сбрасывать иначе следующий спавн соврал бы о размере."""
+        supervisor = make_supervisor(store, registry, clock, settings)
+        registry.spawn_error = sup.WorkerSpawnError("нет места")
+
+        with pytest.raises(sup.WorkerSpawnError):
+            supervisor.start(3)
+
+        assert supervisor._default_env("br-1")["ADCLICKER_POOL_SIZE"] == "0"
+
+    def test_restart_updates_pool_size_for_the_new_pool(
+        self, store, registry, clock, settings
+    ):
+        supervisor = make_supervisor(store, registry, clock, settings)
+        supervisor.start(2)
+
+        supervisor.restart(3)
+
+        assert supervisor._default_env("br-1")["ADCLICKER_POOL_SIZE"] == "3"
+
+
+class TestParallelShutdown:
+    """Остановка пула должна стоить два grace, а не grace на каждого воркера.
+
+    Порядок из плана: «SIGTERM -> 10 с -> SIGKILL **по всем PID**». Обе фазы
+    рассылают сигналы всем до общего дедлайна, поэтому счёт для N воркеров —
+    ``2 * grace`` (SIGTERM-выдержка плюс SIGKILL-выдержка), а не
+    ``N * grace``. Последовательная реализация дала бы при N=3 тридцать
+    секунд и не влезла бы в ``STOP_GRACE`` Tauri-хоста: тот SIGKILL'ил бы
+    демон посреди остановки, а воркеры (собственная сессия у каждого)
+    пережили бы его как сироты с открытыми Chrome.
+
+    Оба прогона нужны: с ``ignores_sigterm`` меряется фаза SIGTERM, с
+    ``survives_kill`` — фаза SIGKILL, и только вместе они ловят возврат
+    «дедлайн на каждого» в любой из фаз.
+    """
+
+    def test_sigterm_phase_costs_a_single_grace_for_the_whole_pool(
+        self, store, clock, settings
+    ):
+        registry = FakeProcessRegistry(ignores_sigterm=True)
+        supervisor = make_supervisor(store, registry, clock, settings)
+        supervisor.start(3)
+
+        supervisor.stop()
+
+        limit = settings.shutdown_grace_seconds
+        assert clock.value <= limit * 2 + 1.0, (
+            f"остановка 3 воркеров заняла {clock.value:.1f}s при grace {limit}s — "
+            "сигналы, похоже, ждутся последовательно"
+        )
+        assert sorted(set(registry.terminated)) == ["br-1", "br-2", "br-3"], (
+            "SIGTERM должен уйти каждому воркеру"
+        )
+        assert sorted(set(registry.killed)) == ["br-1", "br-2", "br-3"], (
+            "не послушавшие SIGTERM обязаны получить SIGKILL"
+        )
+
+    def test_sigkill_phase_shares_one_deadline_too(self, store, clock, settings):
+        """Кто пережил SIGKILL, всё равно ждёт по общему дедлайну."""
+        registry = FakeProcessRegistry(ignores_sigterm=True, survives_kill=True)
+        supervisor = make_supervisor(store, registry, clock, settings)
+        supervisor.start(3)
+
+        supervisor.stop()
+
+        limit = settings.shutdown_grace_seconds
+        # 2 * grace (SIGTERM-выдержка + SIGKILL-выдержка) и ни дольше:
+        # последовательная схема дала бы здесь 3 * grace.
+        assert clock.value <= limit * 2 + 1.0, (
+            f"фаза SIGKILL заняла {clock.value:.1f}s при grace {limit}s — "
+            "дедлайн, похоже, считается на каждого воркера отдельно"
+        )
+        assert sorted(set(registry.killed)) == ["br-1", "br-2", "br-3"]
+        for worker in store.list_workers():
+            assert worker["status"] == WorkerStatus.STOPPED.value

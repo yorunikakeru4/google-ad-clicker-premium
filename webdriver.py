@@ -113,6 +113,26 @@ class CustomChrome(undetected_chromedriver.Chrome):
                 sleep(0.05 * config.behavior.wait_factor)
 
 
+# Признак многопроцессного запуска.
+#
+# Раньше его нёс файл ``.MULTI_BROWSERS_IN_USE``, который создавал
+# ``run_ad_clicker.py``. Эта точка входа удалена, файл больше не создаёт
+# никто, а читать его — значит реагировать на мусор прошлой версии и
+# включать многопроцессный путь одиночному запуску. Источник признака —
+# окружение, которое расставляет супервизор демона при пуле больше одного.
+MULTI_BROWSERS_ENV = "ADCLICKER_MULTI_BROWSERS"
+
+
+def is_multi_procs_enabled() -> bool:
+    """Участвует ли этот запуск в пуле из нескольких браузеров.
+
+    Нужно, чтобы N процессов не качали и не патчили один chromedriver
+    одновременно. Супервизор выставляет переменную только когда в пуле
+    больше одного воркера, поэтому одиночный ``ad_clicker.py`` её не видит.
+    """
+    return os.environ.get(MULTI_BROWSERS_ENV) == "1"
+
+
 def create_webdriver(
     proxy: str, user_agent: Optional[str] = None, plugin_folder_name: Optional[str] = None
 ) -> tuple[undetected_chromedriver.Chrome, Optional[str]]:
@@ -196,8 +216,7 @@ def create_webdriver(
 
     country_code = None
 
-    multi_browser_flag_file = Path(".MULTI_BROWSERS_IN_USE")
-    multi_procs_enabled = multi_browser_flag_file.exists()
+    multi_procs_enabled = is_multi_procs_enabled()
     driver_exe_path = None
 
     if multi_procs_enabled:
