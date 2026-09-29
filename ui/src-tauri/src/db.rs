@@ -75,14 +75,20 @@ pub struct LogEntry {
     pub fields: Option<String>,
 }
 
-/// Фильтры экрана логов: точное равенство по уровню, категории и `browser_id`.
-/// Пустое поле означает «фильтр не применять» — ровно то, что делают `None`
-/// в [`DbReader::list_logs`].
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+/// Фильтры экрана логов: точное равенство по уровню, категории и `browser_id`
+/// плюс окно времени `[since, until]` по `ts`. Пустое поле означает «фильтр
+/// не применять» — ровно то, что делают `None` в [`DbReader::list_logs`].
+/// `Eq` не выводится: окно времени задаётся `f64` — как и `ts` в самой таблице.
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct LogFilters {
     pub level: Option<String>,
     pub category: Option<String>,
     pub browser_id: Option<String>,
+    /// Нижняя граница окна включительно: `ts >= since`.
+    pub since: Option<f64>,
+    /// Верхняя граница окна включительно: `ts <= until`. `until < since` —
+    /// пустое окно, а не ошибка: запрос корректен, данных в нём просто нет.
+    pub until: Option<f64>,
 }
 
 /// Строка страницы логов: та же запись, что и в [`LogEntry`], плюс `id` —
@@ -159,6 +165,10 @@ impl DbReader {
             level: level.map(str::to_string),
             category: category.map(str::to_string),
             browser_id: browser_id.map(str::to_string),
+            // Окно времени у этого метода нет: экран идёт через
+            // [`Self::list_logs_page`] и [`Self::count_logs`], где `since`/
+            // `until` живут в самом фильтре.
+            ..LogFilters::default()
         };
         let page = self.fetch_log_page(&filters, None, None, limit)?;
         Ok(page.into_iter().map(|row| row.log).collect())
@@ -241,6 +251,9 @@ impl DbReader {
 
 /// WHERE и бинды для запросов логов: фильтры плюс, опционально, курсор.
 ///
+/// * `since`/`until` — окно времени `ts >= since AND ts <= until`, обе границы
+///   включаются; каждая сторона опциональна, `until < since` даёт пустую
+///   выборку без ошибки;
 /// * `before_ts` + `before_id` — «строже позиции курсора» в порядке
 ///   `ts DESC, id DESC`: `ts < ? OR (ts = ? AND id < ?)`. Равные `ts`
 ///   достаются странице целиком, поэтому потерь и дублей нет;
@@ -250,7 +263,8 @@ impl DbReader {
 ///
 /// Фильтры собираются динамически: равенство столбца индексируется
 /// (`idx_logs_browser_id` и др.), а вариант «? IS NULL OR col = ?»
-/// заставлял бы SQLite сканировать индекс по ts целиком.
+/// заставлял бы SQLite сканировать индекс по ts целиком. Окно времени идёт
+/// перед курсором: оба про по `ts`, и порядок биндов совпадает с порядком `?`.
 fn log_where<'a>(
     filters: &'a LogFilters,
     before_ts: Option<&'a f64>,
@@ -270,6 +284,14 @@ fn log_where<'a>(
     if filters.browser_id.is_some() {
         conditions.push("browser_id = ?");
         binds.push(&filters.browser_id);
+    }
+    if let Some(ts) = &filters.since {
+        conditions.push("ts >= ?");
+        binds.push(ts);
+    }
+    if let Some(ts) = &filters.until {
+        conditions.push("ts <= ?");
+        binds.push(ts);
     }
     if let Some(ts) = before_ts {
         match before_id {
@@ -1124,6 +1146,186 @@ mod tests {
                     ..LogFilters::default()
                 })
                 .expect("count по несуществующей категории"),
+            0
+        );
+    }
+
+    #[test]
+    fn list_logs_page_filters_by_time_window_inclusive_on_both_bounds() {
+        let tmp = TempDb::new();
+        let path = tmp.path();
+        let data = [
+            Row::new(10.0, "INFO", "до окна"),
+            Row::new(20.0, "INFO", "левая граница"),
+            Row::new(30.0, "INFO", "внутри"),
+            Row::new(40.0, "INFO", "правая граница"),
+            Row::new(50.0, "INFO", "после окна"),
+        ];
+        let _writer = seed(&path, &data);
+
+        let reader = DbReader::open(&path).expect("БД открывается");
+        let filters = LogFilters {
+            since: Some(20.0),
+            until: Some(40.0),
+            ..LogFilters::default()
+        };
+        let page = reader
+            .list_logs_page(&filters, None, None, 10)
+            .expect("окно времени читается");
+
+        assert_eq!(
+            page,
+            vec![paged(4, &data[3]), paged(3, &data[2]), paged(2, &data[1]),],
+            "обе границы окна включаются, строки вне окна не попадают"
+        );
+    }
+
+    #[test]
+    fn list_logs_page_time_window_works_with_only_one_bound() {
+        let tmp = TempDb::new();
+        let path = tmp.path();
+        let data = [
+            Row::new(10.0, "INFO", "старая"),
+            Row::new(20.0, "INFO", "свежая"),
+            Row::new(30.0, "INFO", "самая свежая"),
+        ];
+        let _writer = seed(&path, &data);
+
+        let reader = DbReader::open(&path).expect("БД открывается");
+
+        let since_only = reader
+            .list_logs_page(
+                &LogFilters {
+                    since: Some(20.0),
+                    ..LogFilters::default()
+                },
+                None,
+                None,
+                10,
+            )
+            .expect("только since");
+        assert_eq!(
+            since_only,
+            vec![paged(3, &data[2]), paged(2, &data[1])],
+            "since без until — верхняя граница не ограничена"
+        );
+
+        let until_only = reader
+            .list_logs_page(
+                &LogFilters {
+                    until: Some(20.0),
+                    ..LogFilters::default()
+                },
+                None,
+                None,
+                10,
+            )
+            .expect("только until");
+        assert_eq!(
+            until_only,
+            vec![paged(2, &data[1]), paged(1, &data[0])],
+            "until без since — нижняя граница не ограничена"
+        );
+    }
+
+    #[test]
+    fn list_logs_page_walks_time_window_by_cursor_without_loss_or_duplicates() {
+        let tmp = TempDb::new();
+        let path = tmp.path();
+        // 10..=50 шаг 5; окно [20, 45] берёт 45,40,35,30,25,20 — обе границы
+        // включительно.
+        let data: Vec<Row> = (10..=50)
+            .step_by(5)
+            .map(|ts| Row::new(f64::from(ts), "INFO", "строка"))
+            .collect();
+        let _writer = seed(&path, &data);
+
+        let reader = DbReader::open(&path).expect("БД открывается");
+        let filters = LogFilters {
+            since: Some(20.0),
+            until: Some(45.0),
+            ..LogFilters::default()
+        };
+        let mut read: Vec<f64> = Vec::new();
+        let mut before: Option<(f64, i64)> = None;
+        loop {
+            let (before_ts, before_id) = match before {
+                Some((ts, id)) => (Some(ts), Some(id)),
+                None => (None, None),
+            };
+            let page = reader
+                .list_logs_page(&filters, before_ts, before_id, 2)
+                .expect("страница читается");
+            if page.is_empty() {
+                break;
+            }
+            read.extend(page.iter().map(|row| row.log.ts));
+            before = page.last().map(|row| (row.log.ts, row.id));
+            assert!(read.len() <= 6, "пагинация должна завершиться");
+        }
+
+        assert_eq!(
+            read,
+            vec![45.0, 40.0, 35.0, 30.0, 25.0, 20.0],
+            "курсор ходит по окну без потерь и дублей, порядок ts DESC"
+        );
+        assert_eq!(
+            reader.count_logs(&filters).expect("count под окном"),
+            6,
+            "count_logs считает те же строки, что отдаёт list_logs_page"
+        );
+    }
+
+    #[test]
+    fn time_window_combines_with_level_filter_and_inverted_window_is_empty() {
+        let tmp = TempDb::new();
+        let path = tmp.path();
+        let data = [
+            Row::new(10.0, "ERROR", "ошибка до окна"),
+            Row::new(20.0, "ERROR", "ошибка в окне"),
+            Row::new(20.0, "INFO", "инфо в окне"),
+            Row::new(30.0, "ERROR", "ошибка после окна"),
+        ];
+        let _writer = seed(&path, &data);
+
+        let reader = DbReader::open(&path).expect("БД открывается");
+        let filters = LogFilters {
+            level: Some("ERROR".to_string()),
+            since: Some(15.0),
+            until: Some(25.0),
+            ..LogFilters::default()
+        };
+
+        let page = reader
+            .list_logs_page(&filters, None, None, 10)
+            .expect("окно + уровень читаются");
+        assert_eq!(
+            page,
+            vec![paged(2, &data[1])],
+            "окно времени применяется вместе с фильтром уровня"
+        );
+        assert_eq!(
+            reader.count_logs(&filters).expect("count"),
+            1,
+            "count_logs согласован с list_logs_page в окне"
+        );
+
+        let inverted = LogFilters {
+            since: Some(25.0),
+            until: Some(15.0),
+            ..LogFilters::default()
+        };
+        assert!(
+            reader
+                .list_logs_page(&inverted, None, None, 10)
+                .expect("инвертированное окно — не ошибка")
+                .is_empty(),
+            "until < since — пустое окно, а не ошибка"
+        );
+        assert_eq!(
+            reader
+                .count_logs(&inverted)
+                .expect("count инвертированного окна"),
             0
         );
     }

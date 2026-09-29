@@ -152,6 +152,12 @@ pub fn list_logs(
 /// Курсорная страница логов. Курсор — `(before_ts, before_id)` последней
 /// строки предыдущей страницы; `before_id` опционален, но без него равные
 /// `ts` на границе страниц теряются (см. [`DbReader::list_logs_page`]).
+/// `since`/`until` — включительное окно времени по `ts`, каждая граница
+/// опциональна; `until < since` — пустая страница, а не ошибка.
+// Восемь аргументов — потолок читаемости, но это плоский контракт с
+// фронтом (camelCase в invoke): отдельная структура параметров была бы
+// лишним слоем без выигрыша.
+#[allow(clippy::too_many_arguments)]
 #[tauri::command]
 pub fn list_logs_page(
     state: State<'_, DbState>,
@@ -159,6 +165,8 @@ pub fn list_logs_page(
     level: Option<String>,
     category: Option<String>,
     browser_id: Option<String>,
+    since: Option<f64>,
+    until: Option<f64>,
     before_ts: Option<f64>,
     before_id: Option<i64>,
 ) -> Result<Vec<LogPageEntry>, DbError> {
@@ -167,24 +175,31 @@ pub fn list_logs_page(
             level,
             category,
             browser_id,
+            since,
+            until,
         };
         reader.list_logs_page(&filters, before_ts, before_id, limit)
     })
 }
 
 /// Общее число строк логов под фильтрами — для пагинации экрана Logs.
+/// Окно времени `since`/`until` то же, что у [`list_logs_page`].
 #[tauri::command]
 pub fn count_logs(
     state: State<'_, DbState>,
     level: Option<String>,
     category: Option<String>,
     browser_id: Option<String>,
+    since: Option<f64>,
+    until: Option<f64>,
 ) -> Result<i64, DbError> {
     with_reader(&state.0, |reader| {
         let filters = LogFilters {
             level,
             category,
             browser_id,
+            since,
+            until,
         };
         reader.count_logs(&filters)
     })
