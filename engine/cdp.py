@@ -19,7 +19,6 @@ from __future__ import annotations
 
 import itertools
 import json
-import logging
 import threading
 import time
 import urllib.request
@@ -27,6 +26,8 @@ from pathlib import Path
 from typing import Any, Callable
 
 import websocket
+
+from engine.log import get_logger
 
 __all__ = [
     "CdpClient",
@@ -37,7 +38,7 @@ __all__ = [
     "ws_url_from_json_version",
 ]
 
-logger = logging.getLogger(__name__)
+log = get_logger()
 
 _WS_TIMEOUT = 0.5
 _MAX_PORT = 65535
@@ -235,12 +236,17 @@ class CdpClient:
             ws = self._ws
             if ws is None:
                 raise CdpError(f"CDP not connected, cannot send {method}")
+            # Лог до отправки и снаружи окна «отправлено → подписан на ответ»:
+            # запись в store и зеркало занимают время, а send_command ставит
+            # обработчик только после возврата отсюда. Всё, что стоит между
+            # ws.send() и этой подпиской, — это окно, в которое быстрый ответ
+            # CDP приходит раньше регистрации и теряется.
+            log.debug("browser", "CDP ->", fields={"method": method})
             try:
                 ws.send(json.dumps(message))
             except Exception as exc:
                 self._drop_connection()
                 raise CdpError(f"CDP send {method} failed: {type(exc).__name__}") from exc
-        logger.debug("CDP -> %s", method)
         return message["id"]
 
     def send_command(
@@ -288,7 +294,9 @@ class CdpClient:
                 try:
                     ws = self._ws_factory(self._url, self._timeout)
                 except Exception:
-                    logger.debug("CDP connect failed, retry in %.2fs", backoff)
+                    log.debug(
+                        "browser", "CDP connect failed", fields={"retry_in_s": round(backoff, 2)}
+                    )
                     time.sleep(backoff)
                     backoff = min(backoff * 2, self._max_backoff)
                     if not self._reconnect:
@@ -314,7 +322,7 @@ class CdpClient:
             except (TimeoutError, websocket.WebSocketTimeoutException):
                 continue
             except Exception:
-                logger.debug("CDP connection lost, reconnecting")
+                log.debug("browser", "CDP connection lost, reconnecting")
                 self._drop_connection()
                 if not self._reconnect:
                     self._running = False
@@ -328,7 +336,7 @@ class CdpClient:
         try:
             message = json.loads(raw)
         except (ValueError, TypeError):
-            logger.debug("CDP ignoring non-JSON frame")
+            log.debug("browser", "CDP ignoring non-JSON frame")
             return
         if not isinstance(message, dict):
             return
@@ -349,7 +357,7 @@ class CdpClient:
             try:
                 callback(message)
             except Exception:
-                logger.debug("CDP handler for %s failed", method)
+                log.debug("browser", "CDP handler failed", fields={"method": method})
 
     def __enter__(self) -> CdpClient:
         return self.start()

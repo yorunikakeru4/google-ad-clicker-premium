@@ -241,11 +241,15 @@ def test_credentials_never_reach_logs(caplog: pytest.LogCaptureFixture) -> None:
     ws = FakeWs()
     manager = _started_manager(ws)
     try:
-        with caplog.at_level(logging.DEBUG, logger="engine.proxy_auth"):
+        # Записи уходят зеркалом в legacy-логгер из logger.py, поэтому
+        # уровень поднимается именно для него.
+        with caplog.at_level(logging.DEBUG, logger="logger"):
             ws.incoming.put(json.dumps(_auth_event("REQ-1")))
             ws.incoming.put(json.dumps(_auth_event("REQ-1")))
             assert _wait_until(lambda: manager.fail_count == 1)
             manager.stop()
+        mirrored = [record for record in caplog.records if record.name == "logger"]
+        assert mirrored, "авторизация должна что-то логировать — иначе проверка пустая"
         assert PASSWORD not in caplog.text
         assert USERNAME not in caplog.text
     finally:
