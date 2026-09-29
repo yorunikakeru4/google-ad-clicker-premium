@@ -138,6 +138,13 @@ describe("CaptchaFeedCard: строки событий", () => {
 });
 
 describe("CaptchaFeedCard: состояния", () => {
+  it("первая загрузка — индикатор, а не «событий ещё не было»", async () => {
+    const html = await card([], { loading: true });
+
+    expect(html).toContain('data-test="captcha-feed-loading"');
+    expect(html).not.toContain("captcha-feed-empty");
+  });
+
   it("событий нет — пустое состояние, а не пустая таблица", async () => {
     const html = await card([]);
 
