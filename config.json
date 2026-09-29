@@ -40,6 +40,8 @@
         "telegram_enabled": false,
         "send_to_android": false,
         "request_boost": false,
-        "captcha_policy": "stop"
+        "captcha_policy": "stop",
+        "captcha_threshold_percent": 5.0,
+        "captcha_threshold_action": "warn"
     }
 }

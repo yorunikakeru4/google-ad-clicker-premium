@@ -52,7 +52,9 @@ in-memory ``last_heartbeat`` строго по факту роста значе�
 здорового воркера потолком рестартов); наблюдаемость дают ``proxy_usage``,
 логи и статус в ``/state``. Темп задаётся тем же ``backoff_delay``, что и у
 рестартов: повторная деградация сразу после подмены не превращается в
-плотный цикл.
+плотный цикл. Тот же путь подмены обслуживает публичный ``rotate_all`` —
+внешний триггер (политика порога CAPTCHA) без статуса ``degraded``; он берёт
+только свободный резерв и уважает тот же backoff.
 
 **Назначение профиля.** Каждый спавн (первый, респавн после падения, ротация
 прокси) начинается с ``ProfilePool.take_for_worker``: выданный профиль уходит
@@ -1014,6 +1016,67 @@ class Supervisor:
             self.store.clear_pause()
             self.store.set_run_state("running" if self._workers else "stopped")
             self.store.log("INFO", "supervisor", "pause cleared", {"workers": len(self._workers)})
+
+    def rotate_all(self, *, reason: str) -> int:
+        """Подменяет прокси у всех живых воркеров по запросу извне.
+
+        Триггер приходит не от статуса ``degraded``, а из периодического
+        job'а демона (политика порога CAPTCHA): job решает «пора», супервизор
+        делает это тем же путём, что и ротация по деградации (``_rotate_to``).
+        Возвращает число реально ротированных воркеров.
+
+        Правила фаз 5 и 6 сохраняются: процесс гасится и поднимается заново,
+        профиль воркера переживает подмену, ``restart_count`` и circuit
+        breaker не трогаются — ротация не является падением воркера.
+
+        Два ограничения, из-за которых метод и вынесен в публичный:
+
+        * берётся только свободный живой резерв (``allow_shared=False``) —
+          делить занятый прокси значило бы усадить несколько браузеров на
+          один IP, то есть ухудшить ту самую картину, ради которой политика
+          и ротирует; резерва нет — воркер остаётся на своём, пропуск идёт
+          в лог с ``reason``;
+        * темп — тот же backoff, что и у ``_handle_degraded``: вызов раньше
+          ``next_rotation_at`` ничего не делает, поэтому серия вызовов не
+          превращается в цикл «погасить-поднять».
+
+        Один неудачный спавн не срывает ротацию остальных: ошибка уходит в
+        лог, а воркер остаётся на обычном пути восстановления (падение
+        процесса подхватит ``tick()``).
+        """
+        with self._lock:
+            now = self._clock.wall()
+            rotated = 0
+            for browser_id, worker in list(self._workers.items()):
+                if worker.circuit_open or not worker.is_alive():
+                    continue
+                if now < worker.next_rotation_at:
+                    continue
+                stored = self.store.get_worker(browser_id)
+                current_id = None if stored is None else stored.get("proxy_id")
+                reserve = self._pick_proxy(browser_id, exclude=current_id, allow_shared=False)
+                if reserve is None:
+                    self.store.log(
+                        "WARNING",
+                        "proxy",
+                        "forced proxy rotation skipped: no free alive proxy",
+                        {"reason": reason},
+                        browser_id=browser_id,
+                    )
+                    continue
+                try:
+                    self._rotate_to(browser_id, worker, current_id, reserve, now)
+                except Exception as exc:  # noqa: BLE001 - остальные воркеры должны быть ротированы
+                    self.store.log(
+                        "ERROR",
+                        "proxy",
+                        "forced proxy rotation failed",
+                        {"reason": reason, "error": type(exc).__name__},
+                        browser_id=browser_id,
+                    )
+                    continue
+                rotated += 1
+            return rotated
 
     def _finish_open_runs(self, status: str) -> None:
         """Закрывает записи runs, оставшиеся незакрытыми.

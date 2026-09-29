@@ -15,6 +15,11 @@ from pathlib import Path
 import pytest
 
 from engine.captcha_policy import CAPTCHA_POLICIES, DEFAULT_CAPTCHA_POLICY
+from engine.captcha_threshold import (
+    CAPTCHA_THRESHOLD_ACTIONS,
+    DEFAULT_CAPTCHA_THRESHOLD_ACTION,
+    DEFAULT_CAPTCHA_THRESHOLD_PERCENT,
+)
 from engine.control_plane import config as config_module
 from engine.control_plane.config import Config, ConfigError, validate_settings
 from engine.proxy_auth import DEFAULT_PROXY_TRANSPORT, PROXY_TRANSPORTS
@@ -608,6 +613,122 @@ class TestCaptchaPolicy:
 
         assert patched.get("behavior.captcha_policy") == "solve"
         assert cfg.get("behavior.captcha_policy") == "stop"
+
+class TestCaptchaThreshold:
+    """``behavior.captcha_threshold_*``: процент и действие политики порога.
+
+    Процент — доля CAPTCHA в процентах (0..100), действие — enum из
+    ``engine.captcha_threshold``: значения и дефолты живут там, где их
+    читает политика, иначе два места правды разъехались бы уже на четвёртом
+    действии, а ошибка вылезла бы только на стенде.
+    """
+
+    @pytest.mark.parametrize("value", [0, 5, 50, 100])
+    def test_accepts_percentages_inside_the_range(self, value):
+        cfg = Config.from_dict(_raw(behavior__captcha_threshold_percent=value))
+
+        assert cfg.get("behavior.captcha_threshold_percent") == value
+
+    def test_default_percent_is_five(self):
+        assert config_module.default_config()["behavior"]["captcha_threshold_percent"] == 5.0
+        assert Config.from_dict(_raw()).get("behavior.captcha_threshold_percent") == 5.0
+
+    def test_default_matches_the_constant_from_the_policy_module(self):
+        assert config_module.default_config()["behavior"]["captcha_threshold_percent"] == (
+            DEFAULT_CAPTCHA_THRESHOLD_PERCENT
+        )
+
+    def test_accepts_integer_for_the_percent_field(self):
+        """JSON не различает 5 и 5.0 — то же правило, что и у ``wait_factor``."""
+        cfg = Config.from_dict(_raw(behavior__captcha_threshold_percent=7))
+
+        assert cfg.get("behavior.captcha_threshold_percent") == 7.0
+        assert isinstance(cfg.get("behavior.captcha_threshold_percent"), float)
+
+    @pytest.mark.parametrize("value", [101, -1, 100.5])
+    def test_rejects_percentages_outside_the_range(self, value):
+        with pytest.raises(ConfigError) as excinfo:
+            Config.from_dict(_raw(behavior__captcha_threshold_percent=value))
+
+        assert "behavior.captcha_threshold_percent" in str(excinfo.value)
+
+    def test_rejects_non_numeric_percent(self):
+        with pytest.raises(ConfigError) as excinfo:
+            Config.from_dict(_raw(behavior__captcha_threshold_percent="пять"))
+
+        problems = excinfo.value.problems
+        assert [problem["field"] for problem in problems] == ["behavior.captcha_threshold_percent"]
+        assert "float" in problems[0]["message"]
+
+    def test_rejects_bool_where_percent_expected(self):
+        with pytest.raises(ConfigError) as excinfo:
+            Config.from_dict(_raw(behavior__captcha_threshold_percent=True))
+
+        assert "behavior.captcha_threshold_percent" in str(excinfo.value)
+
+    def test_config_without_the_keys_keeps_working(self):
+        """Конфиг старой версии: ключей нет, но демон стартует на дефолтах."""
+        raw = _raw()
+        del raw["behavior"]["captcha_threshold_percent"]
+        del raw["behavior"]["captcha_threshold_action"]
+
+        cfg = Config.from_dict(raw)
+
+        assert cfg.get("behavior.captcha_threshold_percent") == 5.0
+        assert cfg.get("behavior.captcha_threshold_action") == "warn"
+
+    @pytest.mark.parametrize("value", ["warn", "pause", "rotate"])
+    def test_accepts_every_known_action(self, value):
+        cfg = Config.from_dict(_raw(behavior__captcha_threshold_action=value))
+
+        assert cfg.get("behavior.captcha_threshold_action") == value
+
+    def test_default_action_is_warn(self):
+        assert config_module.default_config()["behavior"]["captcha_threshold_action"] == "warn"
+        assert Config.from_dict(_raw()).get("behavior.captcha_threshold_action") == "warn"
+
+    def test_default_action_matches_the_policy_module(self):
+        assert config_module.default_config()["behavior"]["captcha_threshold_action"] == (
+            DEFAULT_CAPTCHA_THRESHOLD_ACTION
+        )
+
+    def test_unknown_action_is_a_readable_problem(self):
+        raw = _raw(behavior__captcha_threshold_action="explode")
+
+        with pytest.raises(ConfigError) as excinfo:
+            Config.from_dict(raw)
+
+        problems = excinfo.value.problems
+        assert [problem["field"] for problem in problems] == ["behavior.captcha_threshold_action"]
+        message = problems[0]["message"]
+        assert "ожидается одно из" in message
+        for value in CAPTCHA_THRESHOLD_ACTIONS:
+            assert value in message
+
+    def test_non_string_action_reports_the_expected_type(self):
+        with pytest.raises(ConfigError) as excinfo:
+            Config.from_dict(_raw(behavior__captcha_threshold_action=42))
+
+        problems = excinfo.value.problems
+        assert [problem["field"] for problem in problems] == ["behavior.captcha_threshold_action"]
+        assert "str" in problems[0]["message"]
+
+    def test_allowed_actions_are_exactly_the_policy_set(self):
+        """Страховка от второго места правды для словаря значений."""
+        assert config_module._ENUM_FIELDS["behavior.captcha_threshold_action"] == (
+            CAPTCHA_THRESHOLD_ACTIONS
+        )
+
+    def test_patch_can_change_threshold_and_action(self):
+        cfg = Config.from_dict(_raw())
+
+        patched = cfg.patch(
+            {"behavior": {"captcha_threshold_percent": 12.5, "captcha_threshold_action": "pause"}}
+        )
+
+        assert patched.get("behavior.captcha_threshold_percent") == 12.5
+        assert patched.get("behavior.captcha_threshold_action") == "pause"
+        assert cfg.get("behavior.captcha_threshold_percent") == 5.0
 
 
 class TestImportHasNoSideEffects:

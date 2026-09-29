@@ -1911,6 +1911,175 @@ class TestProxyRotation:
         ]
 
 
+class TestForcedRotation:
+    """Принудительная ротация из job'а политики порога: ``rotate_all``.
+
+    Триггер приходит не из ``degraded``-статуса воркера, а извне — но делается
+    тем же путём фазы 5 (``_rotate_to``): процесс гасится, поднимается новый с
+    резервным прокси, профиль переживает подмену, ``restart_count`` не растёт.
+    Резерва нет — воркер не трогается: делить занятый прокси значило бы
+    усадить несколько браузеров на один IP.
+    """
+
+    def test_rotate_all_respawns_every_alive_worker_with_a_free_reserve(
+        self, store, registry, clock, settings, db_path
+    ):
+        pool = make_pool(db_path)
+        pool.add_lines(
+            [
+                "alice:s3cr3t@10.0.0.1:8080",
+                "alice:s3cr3t@10.0.0.2:8080",
+                "alice:s3cr3t@10.0.0.3:8080",
+                "alice:s3cr3t@10.0.0.4:8080",
+            ]
+        )
+        ids = [row["id"] for row in pool.list_proxies()]
+        supervisor = make_supervisor(store, registry, clock, settings)
+        supervisor.start(2)
+        first_pids = [store.get_worker(b)["pid"] for b in ("br-1", "br-2")]
+
+        rotated = supervisor.rotate_all(reason="captcha_threshold")
+
+        assert rotated == 2, "оба живых воркера обязаны сменить прокси"
+        assert len(registry.created) == 4, "по новому процессу на каждого воркера"
+        assert all(process.poll() is not None for process in registry.created[:2])
+        assigned = [store.get_worker(b)["proxy_id"] for b in ("br-1", "br-2")]
+        assert assigned[0] not in ids[:2], "br-1 уходит с исходного прокси"
+        assert assigned[1] not in ids[:2], "br-2 уходит с исходного прокси"
+        assert assigned[0] != assigned[1], "ротация не должна сажать обоих на один прокси"
+        assert [store.get_worker(b)["pid"] for b in ("br-1", "br-2")] != first_pids
+
+    def test_rotate_all_keeps_profile_and_restart_count(
+        self, store, registry, clock, settings, db_path
+    ):
+        """Ротация — не падение: профиль остаётся, счётчик рестартов не крутится."""
+        pool = make_pool(db_path)
+        pool.add_lines(
+            ["alice:s3cr3t@10.0.0.1:8080", "bob:hunter2@10.0.0.2:9090"]
+        )
+        ids = [row["id"] for row in pool.list_proxies()]
+        supervisor = make_supervisor(store, registry, clock, settings)
+        supervisor.start(1)
+        profile_id = assign_profile(store, "br-1")
+
+        # Один честный рестарт до ротации: счётчик должен пережить подмену.
+        registry.created[-1].exit(1)
+        supervisor.tick()
+        clock.advance(sup.RESTART_BACKOFF_BASE_SECONDS)
+        supervisor.tick()
+        assert store.get_worker("br-1")["restart_count"] == 1
+
+        rotated = supervisor.rotate_all(reason="captcha_threshold")
+
+        assert rotated == 1
+        worker = store.get_worker("br-1")
+        assert worker["proxy_id"] == ids[1]
+        assert worker["profile_id"] == profile_id, (
+            "профиль обязан пережить ротацию из job'а, как и из degraded"
+        )
+        assert profile_status(db_path, profile_id) == "assigned"
+        assert worker["restart_count"] == 1, "ротация не должна крутить restart_count"
+        assert [(row["proxy_id"], row["result"]) for row in usage_rows(store)] == [
+            (ids[0], "assigned"),
+            (ids[0], "assigned"),
+            (ids[1], "rotated"),
+        ]
+
+    def test_rotate_all_without_reserve_keeps_the_process_and_warns(
+        self, store, registry, clock, settings, db_path
+    ):
+        """Свободного живого прокси нет — делить чужой нельзя, воркер цел."""
+        pool = make_pool(db_path)
+        pool.add_lines(["alice:s3cr3t@10.0.0.1:8080"])
+        supervisor = make_supervisor(store, registry, clock, settings)
+        supervisor.start(1)
+        supervisor.tick()
+        assert store.get_worker("br-1")["status"] == WorkerStatus.RUNNING.value
+
+        rotated = supervisor.rotate_all(reason="captcha_threshold")
+
+        assert rotated == 0
+        assert len(registry.created) == 1, "без резерва процесс не убиваем"
+        assert registry.created[0].poll() is None
+        assert store.get_worker("br-1")["status"] == WorkerStatus.RUNNING.value
+        warnings = proxy_logs(store, level="WARNING")
+        assert any("no free alive proxy" in row["message"] for row in warnings), (
+            "пропуск ротации обязан быть виден в логе"
+        )
+
+    def test_rotate_all_does_not_share_a_busy_proxy(
+        self, store, registry, clock, settings, db_path
+    ):
+        """Пул ровно по числу воркеров: резерва нет ни у кого, никто не тронут."""
+        pool = make_pool(db_path)
+        pool.add_lines(
+            ["alice:s3cr3t@10.0.0.1:8080", "alice:s3cr3t@10.0.0.2:9090"]
+        )
+        supervisor = make_supervisor(store, registry, clock, settings)
+        supervisor.start(2)
+        pids = [store.get_worker(b)["pid"] for b in ("br-1", "br-2")]
+
+        assert supervisor.rotate_all(reason="captcha_threshold") == 0
+        assert [store.get_worker(b)["pid"] for b in ("br-1", "br-2")] == pids
+        assert len(registry.created) == 2
+        used = sorted((row["proxy_id"], row["result"]) for row in usage_rows(store))
+        assert used == sorted((row["id"], "assigned") for row in pool.list_proxies())
+
+    def test_rotate_all_without_running_workers_is_a_noop(
+        self, store, registry, clock, settings
+    ):
+        """Остановленный пул — не ошибка: job обязан пережить такой тик."""
+        supervisor = make_supervisor(store, registry, clock, settings)
+
+        assert supervisor.rotate_all(reason="captcha_threshold") == 0
+        assert registry.created == []
+
+    def test_rotate_all_respects_the_rotation_backoff(
+        self, store, registry, clock, settings, db_path
+    ):
+        """Темп — тот же backoff, что и у degraded-ротации: не цикл по тикам."""
+        pool = make_pool(db_path)
+        pool.add_lines(
+            [
+                "alice:s3cr3t@10.0.0.1:8080",
+                "alice:s3cr3t@10.0.0.2:9090",
+                "alice:s3cr3t@10.0.0.3:10000",
+            ]
+        )
+        supervisor = make_supervisor(store, registry, clock, settings)
+        supervisor.start(1)
+
+        assert supervisor.rotate_all(reason="captcha_threshold") == 1
+        assert len(registry.created) == 2
+
+        assert supervisor.rotate_all(reason="captcha_threshold") == 0, (
+            "повторная ротация раньше backoff — плотный цикл"
+        )
+        assert len(registry.created) == 2
+
+        clock.advance(sup.RESTART_BACKOFF_BASE_SECONDS)
+        assert supervisor.rotate_all(reason="captcha_threshold") == 1
+        assert len(registry.created) == 3
+
+    def test_rotate_all_logs_without_credentials(
+        self, store, registry, clock, settings, db_path
+    ):
+        pool = make_pool(db_path)
+        pool.add_lines(
+            ["alice:s3cr3t@10.0.0.1:8080", "bob:hunter2@10.0.0.2:9090"]
+        )
+        supervisor = make_supervisor(store, registry, clock, settings)
+        supervisor.start(1)
+
+        supervisor.rotate_all(reason="captcha_threshold")
+
+        logs = proxy_logs(store)
+        assert any(row["message"] == "proxy rotated" for row in logs)
+        assert all(row["category"] == "proxy" for row in logs)
+        assert "s3cr3t" not in all_log_text(store)
+        assert "hunter2" not in all_log_text(store)
+
+
 # --- профили ----------------------------------------------------------------
 
 

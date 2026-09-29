@@ -72,6 +72,32 @@ def test_proxy_transport_default_is_the_constant_from_proxy_auth(make_config, ba
     assert make_config(base_config).webdriver.proxy_transport == DEFAULT_PROXY_TRANSPORT
 
 
+def test_captcha_threshold_defaults_when_the_keys_are_absent(make_config, base_config):
+    """Старый config.json без ключей порога обязан читаться, дефолты на месте."""
+
+    assert "captcha_threshold_percent" not in base_config["behavior"]
+    assert "captcha_threshold_action" not in base_config["behavior"]
+
+    behavior = make_config(base_config).behavior
+
+    assert behavior.captcha_threshold_percent == 5.0
+    assert behavior.captcha_threshold_action == "warn"
+
+
+def test_captcha_threshold_defaults_match_the_policy_module(make_config, base_config):
+    """Дефолт legacy-чтения не должен разъезжаться с engine.captcha_threshold."""
+
+    from engine.captcha_threshold import (
+        DEFAULT_CAPTCHA_THRESHOLD_ACTION,
+        DEFAULT_CAPTCHA_THRESHOLD_PERCENT,
+    )
+
+    behavior = make_config(base_config).behavior
+
+    assert behavior.captcha_threshold_percent == DEFAULT_CAPTCHA_THRESHOLD_PERCENT
+    assert behavior.captcha_threshold_action == DEFAULT_CAPTCHA_THRESHOLD_ACTION
+
+
 def test_read_parameters_maps_every_behavior_option(make_config, base_config):
     base_config["paths"]["query_file"] = ""  # иначе конфликтует с behavior.query
     base_config["behavior"] = {
@@ -98,6 +124,8 @@ def test_read_parameters_maps_every_behavior_option(make_config, base_config):
         "send_to_android": True,
         "request_boost": True,
         "captcha_policy": "solve",
+        "captcha_threshold_percent": 12.5,
+        "captcha_threshold_action": "rotate",
     }
 
     behavior = make_config(base_config).behavior
@@ -124,6 +152,8 @@ def test_read_parameters_maps_every_behavior_option(make_config, base_config):
     assert behavior.send_to_android is True
     assert behavior.request_boost is True
     assert behavior.captcha_policy == "solve"
+    assert behavior.captcha_threshold_percent == 12.5
+    assert behavior.captcha_threshold_action == "rotate"
 
 
 def test_captcha_policy_defaults_to_stop_when_the_key_is_absent(make_config, base_config):

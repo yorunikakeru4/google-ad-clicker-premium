@@ -21,6 +21,7 @@ import threading
 from pathlib import Path
 from typing import Any, Sequence
 
+from engine.captcha_threshold import CaptchaThresholdPolicy
 from engine.control_plane.api import (
     LOOPBACK_HOST,
     ControlPlaneServer,
@@ -65,6 +66,45 @@ PROXY_CHECK_INTERVAL_ENV_VAR = "ADCLICKER_PROXY_CHECK_INTERVAL"
 # Имя нити расписания: тесты ищут его при остановке, как "supervisor".
 PROXY_CHECK_THREAD_NAME = "proxy-check"
 
+# Интервал периодической проверки доли CAPTCHA в секундах. Дефолт — раз в
+# минуту: порог считается по скользящему часу, и более частые опросы ничего
+# не решают, а раз в секунду держали бы лишнее соединение с БД. 0 (и любое
+# отрицательное) расписание выключает — политика молчит, доля в дашборде при
+# этом считается независимо.
+DEFAULT_CAPTCHA_CHECK_INTERVAL_SECONDS = 60.0
+
+# Интервал задаётся окружением, а не config.json — та же причина, что и у
+# PROXY_CHECK_INTERVAL_ENV_VAR: частота фоновой задачи относится к запуску
+# демона (systemd/launchd), а не к настройкам кликера. Порог и действие при
+# этом остаются полями config.json и читаются на каждом тике.
+CAPTCHA_CHECK_INTERVAL_ENV_VAR = "ADCLICKER_CAPTCHA_CHECK_INTERVAL"
+
+# Имя нити расписания порога: отдельное от proxy-check, чтобы остановка и
+# диагностика не путали два независимых job'а.
+CAPTCHA_CHECK_THREAD_NAME = "captcha-check"
+
+
+def captcha_check_interval_from_environ(environ: dict[str, str] | None = None) -> float:
+    """Интервал периодической проверки порога CAPTCHA в секундах.
+
+    Пустая/не заданная переменная — дефолт модуля, ``0`` и отрицательные —
+    расписание выключено, нечисловое значение — ``ValueError`` с именем
+    переменной: демон не стартует и говорит, что именно не так, а не молча
+    включает интервал, которого никто не заказывал.
+    """
+    source = os.environ if environ is None else environ
+    raw = source.get(CAPTCHA_CHECK_INTERVAL_ENV_VAR, "")
+    if not raw.strip():
+        return DEFAULT_CAPTCHA_CHECK_INTERVAL_SECONDS
+    try:
+        interval = float(raw)
+    except ValueError as exc:
+        raise ValueError(
+            f"{CAPTCHA_CHECK_INTERVAL_ENV_VAR} должна быть числом секунд, "
+            f"получено {raw.strip()!r}"
+        ) from exc
+    return interval if interval > 0 else 0.0
+
 
 def proxy_check_interval_from_environ(environ: dict[str, str] | None = None) -> float:
     """Интервал периодической проверки прокси в секундах.
@@ -103,6 +143,8 @@ class Daemon:
         config: Config | None = None,
         proxy_check_interval: float = DEFAULT_PROXY_CHECK_INTERVAL_SECONDS,
         proxy_checker: Any = None,
+        captcha_check_interval: float = DEFAULT_CAPTCHA_CHECK_INTERVAL_SECONDS,
+        captcha_policy: Any = None,
     ):
         self.db_path = Path(db_path)
         self.config_path = Path(config_path)
@@ -111,6 +153,9 @@ class Daemon:
         self.store = store or StateStore(self.db_path)
         self.config = config or Config.load(self.config_path)
         self.proxy_check_interval = proxy_check_interval
+        # Период проверки порога CAPTCHA — своя настройка запуска, а не
+        # соседний интервал: выключить один job'ом можно, не выключая другой.
+        self.captcha_check_interval = captcha_check_interval
         # Пул и проверяющий — свои у демона, а не у HTTP-сервера: та же пара
         # обслуживает и /control/proxies, и расписание, иначе ручная проверка
         # и фоновая не знали бы друг о друге и шли бы параллельно.
@@ -142,10 +187,19 @@ class Daemon:
             profile_pool=self.profile_pool,
             proxy_checker=self.proxy_checker,
         )
+        # Политика порога — своя у демона, как и проверяющий прокси: она
+        # работает в своём расписании, а действия (pause/rotate) делает через
+        # тот же экземпляр супервизора, что и HTTP-кнопки.
+        self.captcha_policy = (
+            captcha_policy
+            if captcha_policy is not None
+            else CaptchaThresholdPolicy(store=self.store, supervisor=self.supervisor)
+        )
         self._stop_event = threading.Event()
         self._shutdown_lock = threading.Lock()
         self._supervisor_thread: threading.Thread | None = None
         self._proxy_check_thread: threading.Thread | None = None
+        self._captcha_check_thread: threading.Thread | None = None
         self._shutdown_thread: threading.Thread | None = None
         self._previous_handlers: dict[int, Any] = {}
         self._started = False
@@ -153,7 +207,7 @@ class Daemon:
     # --- жизненный цикл ---------------------------------------------------
 
     def start(self) -> None:
-        """Поднимает сервер и фоновый цикл супервизора."""
+        """Поднимает сервер, цикл супервизора и фоновые расписания."""
         if self._started:
             return
         self._stop_event.clear()
@@ -161,6 +215,7 @@ class Daemon:
         self.port = self.server.port
         self._supervisor_thread = self.supervisor.start_background()
         self._proxy_check_thread = self._start_proxy_check_loop()
+        self._captcha_check_thread = self._start_captcha_check_loop()
         self._started = True
         # Токен в лог не пишется никогда: логи демона читаются из UI и
         # попадают в отчёты о поддержке.
@@ -198,6 +253,14 @@ class Daemon:
             if check_thread is not None:
                 check_thread.join(timeout=SHUTDOWN_GRACE_SECONDS)
             self._proxy_check_thread = None
+
+            # Проверка порога засыпает на своём интервале и просыпается по
+            # тому же stop_event, поэтому join не ждёт истечения интервала —
+            # как и у расписания прокси.
+            captcha_thread = self._captcha_check_thread
+            if captcha_thread is not None:
+                captcha_thread.join(timeout=SHUTDOWN_GRACE_SECONDS)
+            self._captcha_check_thread = None
 
             thread = self._supervisor_thread
             if thread is not None:
@@ -344,6 +407,64 @@ class Daemon:
         """Ошибки фоновой проверки — в таблицу logs, а не в stderr демона."""
         self.store.log("ERROR", "proxy", "proxy health check failed", {"error": str(exc)})
 
+    # --- периодическая проверка порога CAPTCHA ---------------------------
+
+    def _start_captcha_check_loop(self) -> threading.Thread | None:
+        """Поднимает нить расписания; None — расписание выключено (интервал <= 0)."""
+        if self.captcha_check_interval <= 0:
+            return None
+        thread = threading.Thread(
+            target=self._run_captcha_check_loop,
+            kwargs={"stop_event": self._stop_event},
+            name=CAPTCHA_CHECK_THREAD_NAME,
+            daemon=True,
+        )
+        thread.start()
+        return thread
+
+    def _run_captcha_check_loop(self, stop_event: threading.Event) -> None:
+        """Ждёт интервал, сверяет долю CAPTCHA с порогом, повторяет.
+
+        Первый запуск — через интервал после старта, как и у проверки
+        прокси: немедленная проверка на каждом рестарте добавила бы шума ровно
+        в тот момент, когда данных ещё нет. Остановка идёт по тому же
+        stop_event, что и у остальных фоновых работ демона.
+
+        Порог и действие читаются из конфига на каждом тике, а не запоминаются
+        при сборке демона: это поля config.json, а не константы запуска.
+        Edge-семантика (одно действие на переход) живёт внутри политики, здесь
+        только расписание.
+
+        Ни упавшая формула, ни упавшее действие не убивают нить: ошибка тика
+        уходит в лог с категорией ``captcha`` и именем типа (текст исключения
+        БД в лог не попадает — там может быть путь к файлу пользователя).
+        """
+        while True:
+            if stop_event.wait(self.captcha_check_interval):
+                return
+            try:
+                threshold_percent, action = self._captcha_threshold_settings()
+                self.captcha_policy.check(threshold_percent, action)
+            except Exception as exc:  # noqa: BLE001 - расписание обязано пережить сбой
+                self.store.log(
+                    "ERROR",
+                    "captcha",
+                    "periodic captcha threshold check failed",
+                    {"error": type(exc).__name__},
+                )
+
+    def _captcha_threshold_settings(self) -> tuple[float, str]:
+        """Порог и действие с текущего конфига демона: ``(процент, действие)``.
+
+        Конфиг уже прошёл валидацию при загрузке (диапазон 0..100, enum
+        действий), поэтому здесь только приведение типа: нечисловое значение
+        должно упасть здесь, в читаемом месте, а не внутри сравнения доли.
+        """
+        return (
+            float(self.config.get("behavior.captcha_threshold_percent")),
+            str(self.config.get("behavior.captcha_threshold_action")),
+        )
+
 
 def supervisor_settings_from_config(config: Config) -> SupervisorSettings:
     """Собирает настройки супервизора из конфига.
@@ -369,6 +490,7 @@ def build_daemon(
     port: int = 8787,
     host: str = LOOPBACK_HOST,
     proxy_check_interval: float | None = None,
+    captcha_check_interval: float | None = None,
 ) -> Daemon:
     """Собирает демона для запуска как самостоятельного процесса.
 
@@ -376,11 +498,11 @@ def build_daemon(
     шага "применить миграции" нет, и без этого первый же запрос упал бы с
     "no such table: workers".
 
-    ``proxy_check_interval=None`` — прочитать интервал проверки прокси из
-    окружения; явное значение важнее окружения (так тесты и встраиваемый
-    запуск задают своё, не меняя.environ). Нечисловое значение окружения —
-    ``ValueError``: молчаливый дефолт при опечатке включил бы таймер,
-    который никто не заказывал.
+    ``proxy_check_interval=None`` и ``captcha_check_interval=None`` — прочитать
+    соответствующий интервал из окружения; явное значение важнее окружения
+    (так тесты и встраиваемый запуск задают своё, не меняя environ). Нечисловое
+    значение окружения — ``ValueError``: молчаливый дефолт при опечатке включил
+    бы таймер, который никто не заказывал.
     """
     from engine.db import migrations
 
@@ -389,6 +511,11 @@ def build_daemon(
         proxy_check_interval_from_environ()
         if proxy_check_interval is None
         else proxy_check_interval
+    )
+    resolved_captcha_interval = (
+        captcha_check_interval_from_environ()
+        if captcha_check_interval is None
+        else captcha_check_interval
     )
     migrations.migrate(db_path)
 
@@ -399,6 +526,7 @@ def build_daemon(
         port=port,
         host=host,
         proxy_check_interval=resolved_interval,
+        captcha_check_interval=resolved_captcha_interval,
     )
 
 
