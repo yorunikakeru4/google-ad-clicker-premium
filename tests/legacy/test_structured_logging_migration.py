@@ -135,3 +135,56 @@ def test_adb_failure_logs_stderr(fake_adb):
     rows = _rows("Error during swipe")
     assert [(row["level"], row["category"]) for row in rows] == [("ERROR", "browser")]
     assert json.loads(rows[-1]["fields"]) == {"stderr": "adb: device offline"}
+
+
+# --- search_controller ----------------------------------------------------
+
+
+def test_search_controller_logs_filter_words_as_click(make_search_controller):
+    import search_controller
+
+    make_search_controller("wireless keyboard@amazon#ebay")
+    search_controller.log.flush()
+
+    rows = _rows("Filter words")
+    assert rows, "фильтры запроса должны попасть в logs"
+    assert rows[-1]["category"] == "click"
+    assert json.loads(rows[-1]["fields"]) == {"filter_words": ["amazon", "ebay"]}
+
+
+def test_search_controller_cache_cleanup_logged_as_cleanup(make_search_controller):
+    import search_controller
+
+    controller = make_search_controller()
+    controller._delete_cache_and_cookies()
+    search_controller.log.flush()
+
+    rows = _rows("Deleting browser cache and cookies...")
+    assert rows, "очистка кэша должна попасть в logs"
+    assert rows[-1]["category"] == "cleanup"
+
+
+# --- ad_clicker: --id перебиндывает общий логгер ---------------------------
+
+
+def test_bound_browser_id_reaches_records_of_every_module(make_search_controller):
+    """ad_clicker --id должен попасть в записи всех модулей процесса.
+
+    Модули берут один и тот же инстанс из get_logger(), поэтому bind() в
+    main() перебиндывает и их — иначе browser_id в logs остался бы NULL.
+    """
+
+    import ad_clicker
+    import hooks
+
+    assert ad_clicker.log is hooks.log
+
+    ad_clicker.log.bind("br-42")
+    try:
+        hooks.before_search_hook(None)
+        hooks.log.flush()
+
+        rows = _rows("Executing before search hook...")
+        assert any(row["browser_id"] == "br-42" for row in rows)
+    finally:
+        ad_clicker.log.bind(None)
