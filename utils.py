@@ -430,6 +430,21 @@ def add_cookies(driver: undetected_chromedriver.Chrome) -> None:
         driver.add_cookie(cookie)
 
 
+# --- таймауты и ретраи 2captcha ------------------------------------------------
+
+# Ретраи протокола: in.php отвечает «не сейчас» на ERROR_NO_SLOT_AVAILABLE,
+# res.php — на CAPCHA_NOT_READY, и обе петли крутятся столько запросов
+# подряд, прежде чем признать неудачу. Внешний бюджет на решение одной
+# капчи — CAPTCHA_SOLVE_TIMEOUT_S в search_controller: эти числа границы
+# сетевого протокола, а не сценария.
+SOLVE_MAX_RETRIES = 20
+
+# Пауза перед первым опросом res.php, сек: сервис распределяет задачу по
+# своим воркерам, и без этой паузы первые опросы гарантированно вернут
+# CAPCHA_NOT_READY, сжигая ретраи вхолостую.
+SOLVE_INITIAL_WAIT_S = 15
+
+
 def solve_recaptcha(
     apikey: str,
     sitekey: str,
@@ -467,10 +482,9 @@ def solve_recaptcha(
     if cookies:
         params["cookies"] = cookies
 
-    max_retry_count = 20
     request_retry_count = 0
 
-    while request_retry_count < max_retry_count:
+    while request_retry_count < SOLVE_MAX_RETRIES:
         response = requests.get(api_url, params=params)
 
         log.debug("captcha", "Response", fields={"response": response.text})
@@ -489,8 +503,7 @@ def solve_recaptcha(
             request_retry_count += 1
             continue
 
-    initial_captcha_response_wait = 15
-    sleep(initial_captcha_response_wait * config.behavior.wait_factor)
+    sleep(SOLVE_INITIAL_WAIT_S * config.behavior.wait_factor)
 
     # check if the CAPTCHA has been solved
     response_api_url = "http://2captcha.com/res.php"
@@ -499,7 +512,7 @@ def solve_recaptcha(
     response_retry_count = 0
     captcha_response = None
 
-    while response_retry_count < max_retry_count:
+    while response_retry_count < SOLVE_MAX_RETRIES:
         response = requests.get(response_api_url, params=params)
 
         log.debug("captcha", "Response", fields={"response": response.text})

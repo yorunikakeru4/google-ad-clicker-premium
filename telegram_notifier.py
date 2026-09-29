@@ -1,5 +1,6 @@
 import asyncio
 import os
+from html import escape
 from pathlib import Path
 from typing import Optional
 
@@ -115,6 +116,50 @@ def notify_matching_ads(query: str, links: list, stats: Optional[SearchStats] = 
         log.debug("click", "Telegram send error", fields={"error": str(exp)})
         log.error("click", "Failed to send notification!")
         log.debug("click", "Message", fields={"message": message})
+
+
+def notify_captcha_event(
+    *,
+    browser_id: Optional[str],
+    page_url: Optional[str],
+    screenshot_path: Optional[str],
+    solved: bool,
+    policy: str,
+) -> None:
+    """Notify about a CAPTCHA event the moment it happens (план §5, фаза 8).
+
+    ``notify_matching_ads`` срабатывает по результатам прогона, а CAPTCHA —
+    событие посреди сценария: оператор должен узнать о нём до того, как
+    воркер уйдёт в паузу. Отличия от result-уведомлений:
+
+    * нет chat id — INFO и выход, без ``SystemExit``: сценарий уже принял
+      решение, ломать его из-за ненастроенного бота нельзя;
+    * ошибка отправки гасится здесь же (WARNING/ERROR в логе), наружу не
+      выходит — вызывающая сторона уже записала событие в БД;
+    * URL и путь к скриншоту экранируются: сообщение уходит с
+      ``parse_mode=HTML``, а ``&`` в URL ломает разбор.
+    """
+
+    if not telegram_chat_id_file.exists():
+        log.info("captcha", "Please start the messaging with bot to get a chat ID!")
+        return
+
+    with open(telegram_chat_id_file, encoding="utf-8") as chat_id_file:
+        chat_id = chat_id_file.read().strip()
+
+    message = f"<b>CAPTCHA detected</b> (policy: {escape(policy)})\n"
+    message += f"<b>Browser:</b> {escape(browser_id or 'unknown')}\n"
+    message += f"<b>URL:</b> {escape(page_url or 'unknown')}\n"
+    message += f"<b>Solved:</b> {'yes' if solved else 'no'}\n"
+    if screenshot_path:
+        message += f"<b>Screenshot:</b> {escape(str(screenshot_path))}\n"
+
+    try:
+        log.info("captcha", "Sending Telegram CAPTCHA notification...")
+        asyncio.run(send_message(chat_id=chat_id, message=message))
+    except Exception as exp:
+        log.debug("captcha", "Telegram send error", fields={"error": str(exp)})
+        log.error("captcha", "Failed to send CAPTCHA notification!")
 
 
 def start_bot() -> None:
