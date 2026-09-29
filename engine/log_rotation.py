@@ -38,7 +38,7 @@ import re
 import sqlite3
 import time
 from dataclasses import dataclass
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -125,6 +125,23 @@ def default_export_dir() -> Path:
     """Каталог дневных экспортов. Считается на каждый вызов, а не при импорте:
     тесты и одноразовые запуски меняют cwd, а каталог привязан к нему."""
     return Path.cwd() / EXPORT_DIRNAME
+
+
+def seconds_until_day_close(now: float) -> float:
+    """Секунд до следующих локальных 23:59 — всегда строго больше нуля.
+
+    До наступления 23:59 текущих суток ждём их, ровно с 23:59 и далее —
+    следующих: иначе job, проснувшийся ровно в 23:59, ждал бы ещё сутки,
+    закрывая уже чужие сутки. Именно это и проверяется на «переходе через
+    полночь»: цель прыгает с сегодняшних 23:59 на завтрашние, а повтор в
+    следующие сутки даёт цель ещё на день позже.
+    """
+    local = time.localtime(now)
+    close = time.mktime((local.tm_year, local.tm_mon, local.tm_mday, 23, 59, 0, 0, 0, -1))
+    if now >= close:
+        tomorrow = date(local.tm_year, local.tm_mon, local.tm_mday) + timedelta(days=1)
+        close = time.mktime((tomorrow.year, tomorrow.month, tomorrow.day, 23, 59, 0, 0, 0, -1))
+    return close - now
 
 
 def _validate_day(day: str) -> None:
@@ -475,4 +492,5 @@ __all__ = [
     "purge_logs_before",
     "retention_cutoff",
     "run_retention",
+    "seconds_until_day_close",
 ]

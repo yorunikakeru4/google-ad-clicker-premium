@@ -18,6 +18,7 @@ import os
 import signal
 import sys
 import threading
+import time
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -38,6 +39,14 @@ from engine.control_plane.supervisor import (
     SHUTDOWN_GRACE_SECONDS,
     Supervisor,
     SupervisorSettings,
+)
+from engine.log_rotation import (
+    default_export_dir,
+    enforce_db_size_limit,
+    export_day,
+    local_day,
+    run_retention,
+    seconds_until_day_close,
 )
 from engine.proxy_health import ProxyHealthChecker
 from engine.profile_pool import ProfilePool
@@ -128,6 +137,95 @@ def proxy_check_interval_from_environ(environ: dict[str, str] | None = None) -> 
     return interval if interval > 0 else 0.0
 
 
+# --- ротация логов (план §5, фаза 9) ---------------------------------------
+#
+# Три нити на stop_event, тот же паттерн, что у proxy-check и captcha-check.
+# Все три интервала — настройки запуска демона (окружение), а не config.json:
+# как часто ходить фоновой задаче, решает systemd/launchd, а сами настройки
+# хранения (log_retention_days, log_file_level, db_size_limit_mb) — поля
+# config.json и читаются из конфига на каждом тике.
+
+# Имена нитей: тесты ищут их при остановке, как "supervisor"/"proxy-check".
+DAY_CLOSE_THREAD_NAME = "day-close"
+RETENTION_THREAD_NAME = "retention"
+DB_SIZE_THREAD_NAME = "db-size"
+
+# Закрытие дня. Пусто/не задано — расписание: экспорт в 23:59 локального
+# времени (значение по умолчанию и нормальный режим). Больше нуля — период
+# в секундах вместо расписания (ускоренный режим для тестов и стенда).
+# Ноль и отрицательные — job выключен. Нечисловое — ValueError: демон не
+# стартует и говорит, что именно не так, а не молча закрывает день не тогда.
+DAY_CLOSE_INTERVAL_ENV_VAR = "ADCLICKER_DAY_CLOSE_INTERVAL"
+
+# Чистка старых дней: после каждого закрытия дня и, независимо от него, раз
+# в сутки; 0 (и любое отрицательное) расписание выключает.
+RETENTION_INTERVAL_ENV_VAR = "ADCLICKER_RETENTION_INTERVAL"
+DEFAULT_RETENTION_INTERVAL_SECONDS = 86400.0
+
+# Защита от роста БД: по умолчанию раз в час; 0 (и любое отрицательное)
+# выключает. Сам лимит — db_size_limit_mb из config.json, 0 там тоже выключает.
+DB_SIZE_INTERVAL_ENV_VAR = "ADCLICKER_DB_SIZE_INTERVAL"
+DEFAULT_DB_SIZE_INTERVAL_SECONDS = 3600.0
+
+
+def _seconds_from_environ(env_var: str, default: float, environ: dict[str, str] | None) -> float:
+    """Секунды из окружения: пусто — дефолт, 0/минус — выключено, мусор — ValueError.
+
+    Повторяет договорённость proxy/captcha-расписаний: ноль означает «job
+    выключен», а не «каждый тик», иначе опечатка в env превратилась бы в
+    горячий цикл.
+    """
+    source = os.environ if environ is None else environ
+    raw = source.get(env_var, "")
+    if not raw.strip():
+        return default
+    try:
+        interval = float(raw)
+    except ValueError as exc:
+        raise ValueError(
+            f"{env_var} должна быть числом секунд, получено {raw.strip()!r}"
+        ) from exc
+    return interval if interval > 0 else 0.0
+
+
+def retention_interval_from_environ(environ: dict[str, str] | None = None) -> float:
+    """Интервал чистки старых дней логов в секундах (см. ``_seconds_from_environ``)."""
+    return _seconds_from_environ(
+        RETENTION_INTERVAL_ENV_VAR, DEFAULT_RETENTION_INTERVAL_SECONDS, environ
+    )
+
+
+def db_size_interval_from_environ(environ: dict[str, str] | None = None) -> float:
+    """Интервал защиты от роста БД в секундах (см. ``_seconds_from_environ``)."""
+    return _seconds_from_environ(
+        DB_SIZE_INTERVAL_ENV_VAR, DEFAULT_DB_SIZE_INTERVAL_SECONDS, environ
+    )
+
+
+def day_close_interval_from_environ(environ: dict[str, str] | None = None) -> float | None:
+    """Расписание закрытия дня.
+
+    Возвращает ``None`` — закрывать день по расписанию, в 23:59 локального
+    времени (это дефолт, а не «выключено»); положительное число — период в
+    секундах вместо расписания (тесты/стенд); ``0`` — job выключен, как у
+    остальных расписаний демона. Нечисловое значение — ``ValueError`` с именем
+    переменной: опечатка не должна молча превращаться в выключенное закрытие
+    дня, из-за которого экспорт и retention не сработали бы вообще.
+    """
+    source = os.environ if environ is None else environ
+    raw = source.get(DAY_CLOSE_INTERVAL_ENV_VAR, "")
+    if not raw.strip():
+        return None
+    try:
+        interval = float(raw)
+    except ValueError as exc:
+        raise ValueError(
+            f"{DAY_CLOSE_INTERVAL_ENV_VAR} должна быть числом секунд, "
+            f"получено {raw.strip()!r}"
+        ) from exc
+    return interval if interval > 0 else 0.0
+
+
 class Daemon:
     """Демон целиком: HTTP-сервер плюс супервизор в отдельном потоке."""
 
@@ -145,6 +243,12 @@ class Daemon:
         proxy_checker: Any = None,
         captcha_check_interval: float = DEFAULT_CAPTCHA_CHECK_INTERVAL_SECONDS,
         captcha_policy: Any = None,
+        # Ротация логов: None — закрытие дня по расписанию (23:59), 0 —
+        # выключено, >0 — период в секундах. Retention и защита от роста —
+        # как у proxy-check: дефолтный интервал, 0 выключает.
+        day_close_interval: float | None = None,
+        retention_interval: float = DEFAULT_RETENTION_INTERVAL_SECONDS,
+        db_size_interval: float = DEFAULT_DB_SIZE_INTERVAL_SECONDS,
     ):
         self.db_path = Path(db_path)
         self.config_path = Path(config_path)
@@ -156,6 +260,11 @@ class Daemon:
         # Период проверки порога CAPTCHA — своя настройка запуска, а не
         # соседний интервал: выключить один job'ом можно, не выключая другой.
         self.captcha_check_interval = captcha_check_interval
+        # Три job'а ротации логов — свои интервалы по той же причине:
+        # выключить защиту от роста не должно значить отключить закрытие дня.
+        self.day_close_interval = day_close_interval
+        self.retention_interval = retention_interval
+        self.db_size_interval = db_size_interval
         # Пул и проверяющий — свои у демона, а не у HTTP-сервера: та же пара
         # обслуживает и /control/proxies, и расписание, иначе ручная проверка
         # и фоновая не знали бы друг о друге и шли бы параллельно.
@@ -200,6 +309,9 @@ class Daemon:
         self._supervisor_thread: threading.Thread | None = None
         self._proxy_check_thread: threading.Thread | None = None
         self._captcha_check_thread: threading.Thread | None = None
+        self._day_close_thread: threading.Thread | None = None
+        self._retention_thread: threading.Thread | None = None
+        self._db_size_thread: threading.Thread | None = None
         self._shutdown_thread: threading.Thread | None = None
         self._previous_handlers: dict[int, Any] = {}
         self._started = False
@@ -216,6 +328,9 @@ class Daemon:
         self._supervisor_thread = self.supervisor.start_background()
         self._proxy_check_thread = self._start_proxy_check_loop()
         self._captcha_check_thread = self._start_captcha_check_loop()
+        self._day_close_thread = self._start_day_close_loop()
+        self._retention_thread = self._start_retention_loop()
+        self._db_size_thread = self._start_db_size_loop()
         self._started = True
         # Токен в лог не пишется никогда: логи демона читаются из UI и
         # попадают в отчёты о поддержке.
@@ -261,6 +376,18 @@ class Daemon:
             if captcha_thread is not None:
                 captcha_thread.join(timeout=SHUTDOWN_GRACE_SECONDS)
             self._captcha_check_thread = None
+
+            # Три job'а ротации логов спят до 23:59 / до суток / до часа,
+            # поэтому остановка идёт по взведённому stop_event, а не по
+            # таймеру — иначе shutdown ждал бы закрытия дня.
+            for attribute, thread in (
+                ("_day_close_thread", self._day_close_thread),
+                ("_retention_thread", self._retention_thread),
+                ("_db_size_thread", self._db_size_thread),
+            ):
+                if thread is not None:
+                    thread.join(timeout=SHUTDOWN_GRACE_SECONDS)
+                setattr(self, attribute, None)
 
             thread = self._supervisor_thread
             if thread is not None:
@@ -465,6 +592,204 @@ class Daemon:
             str(self.config.get("behavior.captcha_threshold_action")),
         )
 
+    # --- ротация логов: закрытие дня, retention, защита от роста ----------
+
+    def _current_config(self) -> Config:
+        """Конфиг с последним применённым патчем из UI.
+
+        POST /control/config заменяет объект у HTTP-сервера (и у его
+        bound-обработчика), но не у демона — а план требует, чтобы настройка
+        хранения логов применялась без рестарта. Поэтому чтение идёт от
+        сервера: при сборке демон передал ему тот же объект, что и держит
+        сам, так что инъекция конфига в тестах работает как раньше.
+        """
+        return getattr(self.server, "config", self.config)
+
+    def _day_close_tick(self) -> None:
+        """Закрыть день: экспорт в ``logs/YYYY-MM-DD.log``, затем retention.
+
+        Порядок из плана: сначала снимок дня уходит в файл, потом старое
+        удаляется — иначе retention могла бы выкинуть ещё не выгруженный день.
+        Настройки берутся с каждого тика (``_current_config``), а не
+        запоминаются при сборке: это поля config.json.
+        """
+        day = local_day(time.time())
+        config = self._current_config()
+        export_dir = default_export_dir()
+        exported = export_day(
+            self.db_path, day, export_dir, str(config.get("behavior.log_file_level"))
+        )
+        result = run_retention(
+            self.db_path, day, int(config.get("behavior.log_retention_days")), export_dir
+        )
+        self.store.log(
+            "INFO",
+            "scheduler",
+            "day closed",
+            {
+                "day": day,
+                "exported": exported is not None,
+                "deleted_rows": result.deleted_rows,
+                "deleted_files": len(result.deleted_files),
+            },
+        )
+
+    def _retention_tick(self) -> None:
+        """Удалить дни старше ``log_retention_days``: строки и файлы экспорта."""
+        config = self._current_config()
+        result = run_retention(
+            self.db_path,
+            local_day(time.time()),
+            int(config.get("behavior.log_retention_days")),
+            default_export_dir(),
+        )
+        if result.deleted_rows or result.deleted_files:
+            self.store.log(
+                "INFO",
+                "cleanup",
+                "expired logs purged",
+                {
+                    "cutoff": result.cutoff,
+                    "rows": result.deleted_rows,
+                    "files": len(result.deleted_files),
+                },
+            )
+
+    def _db_size_tick(self) -> None:
+        """Держать размер БД в ``db_size_limit_mb``; 0 — лимит выключен.
+
+        Недостижимый лимит — WARNING, а не остановка: защита не имеет права
+        блокировать запись логов, иначе полный диск превращался бы в потерю
+        видимости именно в тот момент, когда она нужнее всего.
+        """
+        limit_mb = int(self._current_config().get("behavior.db_size_limit_mb"))
+        if limit_mb <= 0:
+            return
+        result = enforce_db_size_limit(
+            self.db_path, limit_mb, export_dir=default_export_dir()
+        )
+        fields = {
+            "limit_mb": limit_mb,
+            "size_bytes": result.size_bytes,
+            "deleted_days": len(result.deleted_days),
+        }
+        if not result.fits:
+            self.store.log(
+                "WARNING",
+                "cleanup",
+                "db size limit is not reachable",
+                {**fields, "error": result.error},
+            )
+        elif result.deleted_days:
+            self.store.log(
+                "INFO",
+                "cleanup",
+                "oldest log days removed to fit db size limit",
+                fields,
+            )
+
+    # --- нити расписаний ---------------------------------------------------
+
+    def _start_day_close_loop(self) -> threading.Thread | None:
+        """Поднимает нить закрытия дня; None — job выключен (интервал <= 0)."""
+        if self.day_close_interval is not None and self.day_close_interval <= 0:
+            return None
+        thread = threading.Thread(
+            target=self._run_day_close_loop,
+            kwargs={"stop_event": self._stop_event},
+            name=DAY_CLOSE_THREAD_NAME,
+            daemon=True,
+        )
+        thread.start()
+        return thread
+
+    def _run_day_close_loop(self, stop_event: threading.Event) -> None:
+        """Спит до 23:59 (или до env-периода), закрывает день, повторяет.
+
+        Первого запуска «сразу при старте» тут намеренно нет: закрытие дня —
+        момент расписания, а экспорт в момент старта переписал бы уже
+        закрытый файл и ничего не добавил. Ноль в интервале нить не поднимает
+        (см. ``_start_day_close_loop``), поэтому busy-loop исключён.
+        Остановка идёт по тому же stop_event, что и у остальных фоновых работ
+        демона: shutdown не ждёт наступления 23:59.
+
+        Сбой тика (нет места, БД занята) логируется и не роняет ни нить, ни
+        демон — тот же паттерн, что у проверки прокси.
+        """
+        while True:
+            wait = (
+                self.day_close_interval
+                if self.day_close_interval is not None
+                else seconds_until_day_close(time.time())
+            )
+            if stop_event.wait(wait):
+                return
+            try:
+                self._day_close_tick()
+            except Exception as exc:  # noqa: BLE001 - расписание обязано пережить сбой
+                self.store.log(
+                    "ERROR", "scheduler", "day close failed", {"error": type(exc).__name__}
+                )
+
+    def _start_retention_loop(self) -> threading.Thread | None:
+        """Поднимает нить чистки старых дней; None — расписание выключено."""
+        if self.retention_interval <= 0:
+            return None
+        thread = threading.Thread(
+            target=self._run_retention_loop,
+            kwargs={"stop_event": self._stop_event},
+            name=RETENTION_THREAD_NAME,
+            daemon=True,
+        )
+        thread.start()
+        return thread
+
+    def _run_retention_loop(self, stop_event: threading.Event) -> None:
+        """Ждёт интервал (сутки по умолчанию), чистит, повторяет.
+
+        Первый запуск — через интервал после старта, как и у проверки прокси:
+        retention и так идёт после каждого закрытия дня, а немедленная чистка
+        на каждом рестарте удвоила бы нагрузку в и без того нагруженный момент.
+        """
+        while True:
+            if stop_event.wait(self.retention_interval):
+                return
+            try:
+                self._retention_tick()
+            except Exception as exc:  # noqa: BLE001 - расписание обязано пережить сбой
+                self.store.log(
+                    "ERROR", "cleanup", "retention failed", {"error": type(exc).__name__}
+                )
+
+    def _start_db_size_loop(self) -> threading.Thread | None:
+        """Поднимает нить защиты от роста БД; None — расписание выключено."""
+        if self.db_size_interval <= 0:
+            return None
+        thread = threading.Thread(
+            target=self._run_db_size_loop,
+            kwargs={"stop_event": self._stop_event},
+            name=DB_SIZE_THREAD_NAME,
+            daemon=True,
+        )
+        thread.start()
+        return thread
+
+    def _run_db_size_loop(self, stop_event: threading.Event) -> None:
+        """Ждёт интервал (час по умолчанию), сверяет размер БД, повторяет.
+
+        Сам лимит читается из конфига на каждом тике: ``db_size_limit_mb`` —
+        поле config.json, а ``0`` выключает защиту прямо во время работы.
+        """
+        while True:
+            if stop_event.wait(self.db_size_interval):
+                return
+            try:
+                self._db_size_tick()
+            except Exception as exc:  # noqa: BLE001 - расписание обязано пережить сбой
+                self.store.log(
+                    "ERROR", "cleanup", "db size check failed", {"error": type(exc).__name__}
+                )
+
 
 def supervisor_settings_from_config(config: Config) -> SupervisorSettings:
     """Собирает настройки супервизора из конфига.
@@ -491,6 +816,9 @@ def build_daemon(
     host: str = LOOPBACK_HOST,
     proxy_check_interval: float | None = None,
     captcha_check_interval: float | None = None,
+    day_close_interval: float | None = None,
+    retention_interval: float | None = None,
+    db_size_interval: float | None = None,
 ) -> Daemon:
     """Собирает демона для запуска как самостоятельного процесса.
 
@@ -502,7 +830,10 @@ def build_daemon(
     соответствующий интервал из окружения; явное значение важнее окружения
     (так тесты и встраиваемый запуск задают своё, не меняя environ). Нечисловое
     значение окружения — ``ValueError``: молчаливый дефолт при опечатке включил
-    бы таймер, который никто не заказывал.
+    бы таймер, который никто не заказывал. То же для трёх интервалов ротации
+    логов (``day_close_interval``, ``retention_interval``,
+    ``db_size_interval``); у закрытия дня ``None`` из окружения означает
+    расписание в 23:59, а не выключенный job.
     """
     from engine.db import migrations
 
@@ -517,6 +848,15 @@ def build_daemon(
         if captcha_check_interval is None
         else captcha_check_interval
     )
+    resolved_day_close = (
+        day_close_interval_from_environ() if day_close_interval is None else day_close_interval
+    )
+    resolved_retention = (
+        retention_interval_from_environ() if retention_interval is None else retention_interval
+    )
+    resolved_db_size = (
+        db_size_interval_from_environ() if db_size_interval is None else db_size_interval
+    )
     migrations.migrate(db_path)
 
     return Daemon(
@@ -527,6 +867,9 @@ def build_daemon(
         host=host,
         proxy_check_interval=resolved_interval,
         captcha_check_interval=resolved_captcha_interval,
+        day_close_interval=resolved_day_close,
+        retention_interval=resolved_retention,
+        db_size_interval=resolved_db_size,
     )
 
 
