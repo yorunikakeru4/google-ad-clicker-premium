@@ -110,13 +110,17 @@ export function createProxies(
     } finally {
       loaded = true;
       loading.value = false;
-      inFlight = null;
     }
   }
 
   function tick(): Promise<void> {
     if (inFlight !== null) return inFlight;
-    const load = runLoad();
+    // Отвязка guard'а — здесь, а не в runLoad: API, бросающий синхронно,
+    // завершает runLoad раньше, чем у промиса появится имя, и guard
+    // навсегда остался бы «в полёте», зажав опрос.
+    const load = runLoad().finally(() => {
+      if (inFlight === load) inFlight = null;
+    });
     inFlight = load;
     return load;
   }
