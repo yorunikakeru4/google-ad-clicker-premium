@@ -1129,6 +1129,187 @@ mod tests {
     }
 
     #[test]
+    fn list_logs_page_filters_by_time_window_inclusive_on_both_bounds() {
+        let tmp = TempDb::new();
+        let path = tmp.path();
+        let data = [
+            Row::new(10.0, "INFO", "до окна"),
+            Row::new(20.0, "INFO", "левая граница"),
+            Row::new(30.0, "INFO", "внутри"),
+            Row::new(40.0, "INFO", "правая граница"),
+            Row::new(50.0, "INFO", "после окна"),
+        ];
+        let _writer = seed(&path, &data);
+
+        let reader = DbReader::open(&path).expect("БД открывается");
+        let filters = LogFilters {
+            since: Some(20.0),
+            until: Some(40.0),
+            ..LogFilters::default()
+        };
+        let page = reader
+            .list_logs_page(&filters, None, None, 10)
+            .expect("окно времени читается");
+
+        assert_eq!(
+            page,
+            vec![
+                paged(4, &data[3]),
+                paged(3, &data[2]),
+                paged(2, &data[1]),
+            ],
+            "обе границы окна включаются, строки вне окна не попадают"
+        );
+    }
+
+    #[test]
+    fn list_logs_page_time_window_works_with_only_one_bound() {
+        let tmp = TempDb::new();
+        let path = tmp.path();
+        let data = [
+            Row::new(10.0, "INFO", "старая"),
+            Row::new(20.0, "INFO", "свежая"),
+            Row::new(30.0, "INFO", "самая свежая"),
+        ];
+        let _writer = seed(&path, &data);
+
+        let reader = DbReader::open(&path).expect("БД открывается");
+
+        let since_only = reader
+            .list_logs_page(
+                &LogFilters {
+                    since: Some(20.0),
+                    ..LogFilters::default()
+                },
+                None,
+                None,
+                10,
+            )
+            .expect("только since");
+        assert_eq!(
+            since_only,
+            vec![paged(3, &data[2]), paged(2, &data[1])],
+            "since без until — верхняя граница не ограничена"
+        );
+
+        let until_only = reader
+            .list_logs_page(
+                &LogFilters {
+                    until: Some(20.0),
+                    ..LogFilters::default()
+                },
+                None,
+                None,
+                10,
+            )
+            .expect("только until");
+        assert_eq!(
+            until_only,
+            vec![paged(2, &data[1]), paged(1, &data[0])],
+            "until без since — нижняя граница не ограничена"
+        );
+    }
+
+    #[test]
+    fn list_logs_page_walks_time_window_by_cursor_without_loss_or_duplicates() {
+        let tmp = TempDb::new();
+        let path = tmp.path();
+        // 10..=50 шаг 5; окно [20, 45] берёт 40,35,30,25,20.
+        let data: Vec<Row> = (10..=50)
+            .step_by(5)
+            .map(|ts| Row::new(f64::from(ts), "INFO", "строка"))
+            .collect();
+        let _writer = seed(&path, &data);
+
+        let reader = DbReader::open(&path).expect("БД открывается");
+        let filters = LogFilters {
+            since: Some(20.0),
+            until: Some(45.0),
+            ..LogFilters::default()
+        };
+        let mut read: Vec<f64> = Vec::new();
+        let mut before: Option<(f64, i64)> = None;
+        loop {
+            let (before_ts, before_id) = match before {
+                Some((ts, id)) => (Some(ts), Some(id)),
+                None => (None, None),
+            };
+            let page = reader
+                .list_logs_page(&filters, before_ts, before_id, 2)
+                .expect("страница читается");
+            if page.is_empty() {
+                break;
+            }
+            read.extend(page.iter().map(|row| row.log.ts));
+            before = page.last().map(|row| (row.log.ts, row.id));
+            assert!(read.len() <= 5, "пагинация должна завершиться");
+        }
+
+        assert_eq!(
+            read,
+            vec![40.0, 35.0, 30.0, 25.0, 20.0],
+            "курсор ходит по окну без потерь и дублей, порядок ts DESC"
+        );
+        assert_eq!(
+            reader.count_logs(&filters).expect("count под окном"),
+            5,
+            "count_logs считает те же строки, что отдаёт list_logs_page"
+        );
+    }
+
+    #[test]
+    fn time_window_combines_with_level_filter_and_inverted_window_is_empty() {
+        let tmp = TempDb::new();
+        let path = tmp.path();
+        let data = [
+            Row::new(10.0, "ERROR", "ошибка до окна"),
+            Row::new(20.0, "ERROR", "ошибка в окне"),
+            Row::new(20.0, "INFO", "инфо в окне"),
+            Row::new(30.0, "ERROR", "ошибка после окна"),
+        ];
+        let _writer = seed(&path, &data);
+
+        let reader = DbReader::open(&path).expect("БД открывается");
+        let filters = LogFilters {
+            level: Some("ERROR".to_string()),
+            since: Some(15.0),
+            until: Some(25.0),
+            ..LogFilters::default()
+        };
+
+        let page = reader
+            .list_logs_page(&filters, None, None, 10)
+            .expect("окно + уровень читаются");
+        assert_eq!(
+            page,
+            vec![paged(2, &data[1])],
+            "окно времени применяется вместе с фильтром уровня"
+        );
+        assert_eq!(
+            reader.count_logs(&filters).expect("count"),
+            1,
+            "count_logs согласован с list_logs_page в окне"
+        );
+
+        let inverted = LogFilters {
+            since: Some(25.0),
+            until: Some(15.0),
+            ..LogFilters::default()
+        };
+        assert!(
+            reader
+                .list_logs_page(&inverted, None, None, 10)
+                .expect("инвертированное окно — не ошибка")
+                .is_empty(),
+            "until < since — пустое окно, а не ошибка"
+        );
+        assert_eq!(
+            reader.count_logs(&inverted).expect("count инвертированного окна"),
+            0
+        );
+    }
+
+    #[test]
     fn count_logs_on_empty_database_is_zero_not_an_error() {
         let tmp = TempDb::new();
         let path = tmp.path();
