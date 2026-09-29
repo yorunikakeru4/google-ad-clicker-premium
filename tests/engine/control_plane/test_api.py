@@ -666,6 +666,12 @@ class TestConfigEndpoint:
         assert saved["behavior"]["click_order"] == 9
 
     def test_post_with_masked_secret_keeps_real_value(self, supervisor, tmp_path, registry, clock):
+        """Патч, в котором секрет пришёл маской, не затирает настоящий ключ.
+
+        Тело — то, что UI собрал из GET-ответа: маска возвращается как есть.
+        До фикса ``_deep_merge`` клал бы её значением, а ``save()`` закрепил
+        потерю в config.json.
+        """
         real = config_module.Config.from_dict(config_module.default_config()).patch(
             {"behavior": {"2captcha_apikey": "REAL-KEY"}}
         )
@@ -674,12 +680,66 @@ class TestConfigEndpoint:
         )
         instance.start()
         try:
-            masked = real.to_dict()["behavior"]["2captcha_apikey"]
-            request(instance, "/control/config", method="POST", body={"behavior": {"click_order": 3}})
+            status, body, _ = request(
+                instance,
+                "/control/config",
+                method="POST",
+                body={
+                    "behavior": {
+                        "2captcha_apikey": config_module.SECRET_MASK,
+                        "click_order": 3,
+                    }
+                },
+            )
         finally:
             instance.stop()
 
-        assert masked == config_module.SECRET_MASK
+        assert status == 200
+        assert body["config"]["behavior"]["2captcha_apikey"] == config_module.SECRET_MASK
+        assert body["config"]["behavior"]["click_order"] == 3
+        # Живой конфиг демона — на bound-классе обработчика, не на сервере.
+        live = instance.handler_class.config
+        assert live.get("behavior.2captcha_apikey") == "REAL-KEY"
+        saved = json.loads((tmp_path / "config.json").read_text(encoding="utf-8"))
+        assert saved["behavior"]["2captcha_apikey"] == "REAL-KEY"
+
+    def test_get_then_post_round_trip_keeps_secret(self, supervisor, tmp_path, registry, clock):
+        """GET → POST того же конфига: секрет цел и в памяти, и на диске."""
+        real = config_module.Config.from_dict(config_module.default_config()).patch(
+            {
+                "behavior": {"2captcha_apikey": "REAL-KEY"},
+                "webdriver": {"proxy": "http://user:pw@1.2.3.4:8080"},
+            }
+        )
+        instance = ControlPlaneServer(
+            supervisor=supervisor, config=real, token=TOKEN, config_path=tmp_path / "config.json"
+        )
+        instance.start()
+        try:
+            _, got, _ = request(instance, "/control/config")
+            assert got["config"]["behavior"]["2captcha_apikey"] == config_module.SECRET_MASK
+            assert got["config"]["webdriver"]["proxy"] == config_module.SECRET_MASK
+            assert "REAL-KEY" not in json.dumps(got)
+
+            status, posted, _ = request(
+                instance, "/control/config", method="POST", body=got["config"]
+            )
+        finally:
+            instance.stop()
+
+        assert status == 200
+        assert posted["config"]["behavior"]["2captcha_apikey"] == config_module.SECRET_MASK
+        # Живой конфиг демона — на bound-классе обработчика, не на сервере.
+        live = instance.handler_class.config
+        assert live.get("behavior.2captcha_apikey") == "REAL-KEY"
+        assert live.get("webdriver.proxy") == "http://user:pw@1.2.3.4:8080"
+        text = (tmp_path / "config.json").read_text(encoding="utf-8")
+        assert config_module.SECRET_MASK not in text
+        assert "REAL-KEY" in text
+        assert "user:pw" in text
+        reloaded = config_module.Config.load(tmp_path / "config.json")
+        assert reloaded.get("behavior.2captcha_apikey") == "REAL-KEY"
+        assert reloaded.get("webdriver.proxy") == "http://user:pw@1.2.3.4:8080"
 
     def test_post_invalid_value_returns_400_with_problems(self, server, tmp_path):
         status, body, _ = request(

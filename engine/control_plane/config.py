@@ -6,11 +6,14 @@
 
 Два решения, которые стоит знать:
 
-1. **Секреты маскируются на выходе.** ``behavior.2captcha_apikey`` и
+1. **Секреты маскируются только наружу.** ``behavior.2captcha_apikey`` и
    ``webdriver.proxy`` (там может быть логин:пароль) не попадают в
-   ``to_dict()``/``to_json()``: наружу уходит ``SECRET_MASK``. Маска
-   round-trip'ится, поэтому ``GET`` + ``POST`` того же конфига не затирает
-   ключ пустым значением.
+   ``to_dict()``/``to_json()`` — в HTTP-ответах уходит ``SECRET_MASK``.
+   Маска значима ровно для полей из ``_SECRET_FIELDS``: пришла она в
+   ``patch()`` — поле «не менять», поэтому ``GET`` + ``POST`` того же
+   конфига не затирает ключ. Файл при этом хранит настоящие значения
+   (см. ``save()``): ``config.json`` — source of truth, и после рестарта
+   демон читает реальный ключ, а не строку ``********``.
 2. **Пустое значение значит "не задано"**, а не "выключено". Legacy-код
    различает эти случаи через ``if config.behavior.query:``, и валидация
    сохраняет это различие: пустая строка проходит проверку, а мусор — нет.
@@ -81,7 +84,7 @@ _SCHEMA: dict[str, dict[str, tuple[type | tuple[type, ...], Any]]] = {
     },
 }
 
-# Секреты: наружу уходят замаскированными.
+# Секреты: наружу уходят замаскированными, в patch маска значит «не менять».
 _SECRET_FIELDS = frozenset({"behavior.2captcha_apikey", "webdriver.proxy"})
 
 # Поля-перечисления: путь поля -> допустимые значения. Словаря значений здесь
@@ -401,6 +404,29 @@ def _deep_merge(base: dict[str, Any], patch: dict[str, Any]) -> dict[str, Any]:
     return merged
 
 
+def _strip_masked_secrets(patch_data: dict[str, Any]) -> dict[str, Any]:
+    """Убирает из патча маску по секретным полям: маска = «не менять».
+
+    UI получил маску из ``to_dict()`` и может вернуть её же — в том числе
+    целиком, переслав конфиг как есть. Без вычистки ``_deep_merge`` положил бы
+    маску значением, и следующий ``save()`` закрепил бы потерю ключа.
+    Несекретные поля и осознанная очистка пустой строкой не трогаются.
+    """
+    cleaned: dict[str, Any] = {}
+    for section, values in patch_data.items():
+        if not isinstance(values, dict):
+            cleaned[section] = values
+            continue
+        kept = {
+            key: value
+            for key, value in values.items()
+            if not (value == SECRET_MASK and f"{section}.{key}" in _SECRET_FIELDS)
+        }
+        if kept:
+            cleaned[section] = kept
+    return cleaned
+
+
 class Config:
     """Валидированный конфиг control plane.
 
@@ -448,14 +474,15 @@ class Config:
         return self._data[section][key]
 
     def as_dict(self) -> dict[str, dict[str, Any]]:
-        """Копия внутренних данных без маскирования — только для кода.
+        """Копия внутренних данных без маскирования — для кода и файла.
 
-        Наружу (HTTP, файл) уходит исключительно to_dict().
+        Наружу в HTTP идёт ``to_dict()``; ``save()`` пишет файл по этой
+        сериализации, потому что файл — source of truth с реальными секретами.
         """
         return {section: dict(values) for section, values in self._data.items()}
 
     def to_dict(self) -> dict[str, dict[str, Any]]:
-        """Представление для JSON наружу: секреты заменены на маску."""
+        """Представление для JSON наружу (HTTP): секреты заменены на маску."""
         plain = self.as_dict()
         for dotted in _SECRET_FIELDS:
             section, _, key = dotted.partition(".")
@@ -464,6 +491,7 @@ class Config:
         return plain
 
     def to_json(self) -> str:
+        """JSON наружу (HTTP) — секреты замаскированы, см. ``to_dict()``."""
         return json.dumps(self.to_dict(), ensure_ascii=False, sort_keys=True)
 
     def patch(self, patch_data: dict[str, Any]) -> Config:
@@ -471,26 +499,34 @@ class Config:
 
         Валидация идёт по результату слияния, а не по патчу: patch может
         нарушить правило между полями (например, поднять min выше max) уже
-        существующим значением соседа.
+        существующим значением соседа. Маска ``SECRET_MASK`` у секретного
+        поля из ``_SECRET_FIELDS`` означает «не менять»: существующее
+        значение сохраняется (round-trip ``GET`` → ``POST``). Пустая строка —
+        осознанная очистка секрета, а не «не менять».
         """
         if not isinstance(patch_data, dict):
             raise ConfigError([{"field": "config", "message": "ожидается объект конфигурации"}])
-        return Config.from_dict(_deep_merge(self._data, patch_data))
+        return Config.from_dict(_deep_merge(self._data, _strip_masked_secrets(patch_data)))
 
     def save(self, path: str | Path) -> None:
         """Атомарная запись: временный файл рядом и rename.
 
-        Демон перезаписывает конфиг по запросу UI, и падение посреди записи
-        оставило бы пользователя с нечитаемым config.json.
+        Файл — source of truth для поведения (план §1), поэтому пишутся
+        **настоящие** значения секретов, а не маска: маска существует только
+        для HTTP-ответов, и в config.json она убила бы ключ навсегда —
+        после рестарта и legacy ``config_reader`` прочитали бы ``********``.
+        Формат не меняется: отсортированный JSON, trailing newline.
+
+        mode 0o600: секреты в файле реальные, поэтому доступ — только
+        владельцу. Демон перезаписывает конфиг по запросу UI, и падение
+        посреди записи оставило бы пользователя с нечитаемым config.json.
         """
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
-        # mode 0o600: в маскированном виде секретов там нет, но сам файл
-        # конфигурации пользователь считает чувствительным.
         fd, tmp_name = tempfile.mkstemp(dir=str(path.parent), prefix=".config-", suffix=".json")
         try:
             with os.fdopen(fd, "w", encoding="utf-8") as handle:
-                handle.write(self.to_json())
+                handle.write(json.dumps(self.as_dict(), ensure_ascii=False, sort_keys=True))
                 handle.write("\n")
             os.chmod(tmp_name, 0o600)
             os.replace(tmp_name, path)
