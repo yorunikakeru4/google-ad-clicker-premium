@@ -122,6 +122,9 @@ class Daemon:
         self.supervisor = supervisor or Supervisor(
             store=self.store,
             settings=supervisor_settings_from_config(self.config),
+            # Тот же пул, что у /control/proxies и расписания: иначе
+            # назначения супервизора и то, что видит UI, разъезжались бы.
+            proxy_pool=self.proxy_pool,
         )
         self.server = ControlPlaneServer(
             supervisor=self.supervisor,

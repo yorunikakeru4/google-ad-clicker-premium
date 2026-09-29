@@ -42,11 +42,17 @@ class WorkerStatus(str, Enum):
 
     ``str, Enum`` — не украшение: статус пишется прямо в SQLite, и строковое
     значение в схеме совпадает с тем, что показывает UI.
+
+    ``degraded`` ставит сам воркер (``StoreWriter.mark_degraded``), когда
+    прокси или CDP-соединение перестало работать: процесс жив, поэтому
+    статус не терминальный — PID остаётся, а супервизор по нему делает
+    ротацию. Остальные статусы ставит супервизор.
     """
 
     STARTING = "starting"
     RUNNING = "running"
     BACKOFF = "backoff"
+    DEGRADED = "degraded"
     STOPPED = "stopped"
     CIRCUIT_OPEN = "circuit_open"
 
@@ -164,6 +170,53 @@ class StateStore:
                 conn.execute(sql, params)
                 conn.commit()
 
+
+    def assign_proxy(self, browser_id: str, proxy_id: int) -> None:
+        """Закрепляет прокси за воркером (``workers.proxy_id``).
+
+        Назначением владеет супервизор, и делает он это ПОСЛЕ
+        ``register_worker``: здесь только UPDATE существующей строки, а для
+        нового воркера её ещё нет. ``profile_id`` не трогается — профиль
+        выдаётся отдельной фазой и снимается только через
+        :meth:`release_assignment`.
+
+        Значение берётся подзапросом, а не напрямую: ``DELETE`` из
+        ``/control/proxies`` не берёт блокировку супервизора и может упасть
+        между выбором прокси и этой записью. Прямое значение дало бы
+        IntegrityError посреди спавна (полузапущенный пул), а подзапрос
+        честно запишет NULL — «прокси исчез, назначения нет». Наблюдаемость
+        на этом пути даёт ``record_usage`` в супервизоре: он так же заметит
+        исчезновение и положит WARNING в лог.
+        """
+        with self._connect() as conn:
+            with self._lock:
+                conn.execute(
+                    "UPDATE workers SET proxy_id = (SELECT id FROM proxies WHERE id = ?) "
+                    "WHERE browser_id = ?",
+                    (proxy_id, browser_id),
+                )
+                conn.commit()
+
+    def release_assignment(self, browser_id: str) -> None:
+        """Снимает назначение: ``proxy_id`` и ``profile_id`` → NULL.
+
+        Назначение живёт ровно столько, сколько живёт процесс: на stop/kill
+        и перед ротацией прокси и профиль освобождаются, а respawn (новый
+        start или ротация) поднимает воркера с чистым ``profile_id`` и новым
+        ``ADCLICKER_PROXY`` — план.md, фаза 5 «Отказоустойчивость».
+
+        Вызов для несуществующего browser_id — не ошибка: снятие назначения
+        идёт в обоих направлениях (stop уже убранного воркера), и исключение
+        здесь заставило бы вызывающего код отличать «был» от «не был».
+        """
+        with self._connect() as conn:
+            with self._lock:
+                conn.execute(
+                    "UPDATE workers SET proxy_id = NULL, profile_id = NULL "
+                    "WHERE browser_id = ?",
+                    (browser_id,),
+                )
+                conn.commit()
 
     def increment_restart_count(self, browser_id: str) -> int:
         """Увеличивает счётчик рестартов и возвращает новое значение.
