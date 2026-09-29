@@ -61,7 +61,9 @@ function worker(browser_id: string): ActiveWorker {
 /** Читалка с управляемыми ответами: две команды, которые дергает экран. */
 function fakeDb() {
   const listDiagnostics = vi.fn(async (): Promise<DiagnosticSnapshot[]> => []);
-  const activeWorkers = vi.fn(async (): Promise<ActiveWorker[]> => []);
+  const activeWorkers = vi.fn(
+    async (_now: number, _thresholdSecs: number): Promise<ActiveWorker[]> => [],
+  );
   const db: Pick<DbApi, "listDiagnostics" | "activeWorkers"> = {
     listDiagnostics,
     activeWorkers,
@@ -290,8 +292,9 @@ describe("createDiagnosticsApi: чтение", () => {
     expect(fake.listDiagnostics).toHaveBeenCalledTimes(1);
     expect(fake.activeWorkers).toHaveBeenCalledTimes(1);
 
+    // now — текущая эпоха в секундах, порог — константа экрана.
     const [now, threshold] = fake.activeWorkers.mock.calls[0];
-    expect(now).toBeGreaterThan(1_700_000_000, "now — текущая эпоха в секундах");
+    expect(now).toBeGreaterThan(1_700_000_000);
     expect(threshold).toBe(DIAGNOSTICS_WORKER_STALE_SECS);
     expect(DIAGNOSTICS_WORKER_STALE_SECS).toBeGreaterThan(0);
     expect(DIAGNOSTICS_WORKER_STALE_SECS).toBeLessThanOrEqual(600);
@@ -299,7 +302,9 @@ describe("createDiagnosticsApi: чтение", () => {
 
   it("ошибка читалки проходит наружу без поглощения", async () => {
     const fake = fakeDb();
-    fake.listDiagnostics.mockRejectedValue({ kind: "NotOpen", message: "нет базы" });
+    fake.listDiagnostics.mockImplementation(() =>
+      Promise.reject({ kind: "NotOpen", message: "нет базы" }),
+    );
     const api = createDiagnosticsApi(fake.db, transportOf({ status: 200, body: "{}" }).transport);
 
     await expect(api.list()).rejects.toEqual({ kind: "NotOpen", message: "нет базы" });
@@ -408,7 +413,7 @@ describe("diagnosticToCsv: экспорт снимка", () => {
     expect(lines).toHaveLength(2);
     expect(lines[0]).toBe(DIAGNOSTIC_CSV_COLUMNS.join(","));
     expect(lines[1]).toBe(
-      '1.5,br-1,7,,"DE","Mozilla/5.0, ""Beta""",de-DE,Europe/Berlin,1920,1080,' +
+      '1.5,br-1,7,,DE,"Mozilla/5.0, ""Beta""",de-DE,Europe/Berlin,1920,1080,' +
         'Linux x86_64,Google Inc.,ANGLE (LLVM 15),153.0.0,,"[""a"",""b""]"',
     );
   });
