@@ -24,6 +24,8 @@ export function hourBucket(ts: number): number {
 export function buildHourlyBuckets(from: number, to: number): number[] {
   let first = hourBucket(from);
   const last = hourBucket(to);
+  // NaN/Infinity не должны крутить цикл: garbage in — пустое окно.
+  if (!Number.isFinite(first) || !Number.isFinite(last)) return [];
   if (last < first) return [];
 
   const needed = Math.floor((last - first) / HOUR_SECONDS) + 1;
@@ -32,7 +34,11 @@ export function buildHourlyBuckets(from: number, to: number): number[] {
   }
 
   const buckets: number[] = [];
-  for (let bucket = first; bucket <= last; bucket += HOUR_SECONDS) {
+  for (
+    let bucket = first;
+    bucket <= last && buckets.length < MAX_HOURLY_BUCKETS;
+    bucket += HOUR_SECONDS
+  ) {
     buckets.push(bucket);
   }
   return buckets;
