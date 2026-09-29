@@ -16,6 +16,7 @@ const props = withDefaults(
     error?: string | null;
     dirty?: boolean;
     restart?: boolean;
+    secret?: boolean;
   }>(),
   {
     modelValue: "",
@@ -28,6 +29,7 @@ const props = withDefaults(
     error: null,
     dirty: false,
     restart: false,
+    secret: false,
   },
 );
 
@@ -82,6 +84,14 @@ function onNumber(value: unknown) {
           title="Требует перезапуска демона"
           aria-label="Требует перезапуска демона"
         />
+        <v-icon
+          v-if="secret"
+          icon="mdi-lock"
+          size="14px"
+          class="text-muted"
+          title="Секрет: значение скрыто; чтобы заменить, введите новое"
+          aria-label="Секретное значение"
+        />
         <span
           v-if="dirty"
           class="setting__dot"
@@ -91,6 +101,9 @@ function onNumber(value: unknown) {
       </div>
 
       <div class="setting__control">
+        <!-- Рендер строго по типу. type="path" уходит в обычное текстовое
+             поле: файловый диалог — это отдельный @tauri-apps/plugin-dialog,
+             а кнопка Browse без диалога была бы заглушкой. -->
         <v-switch
           v-if="type === 'bool'"
           :model-value="switchValue"
@@ -102,7 +115,7 @@ function onNumber(value: unknown) {
 
         <v-select
           v-else-if="type === 'enum'"
-          :model-value="typeof modelValue === 'number' ? modelValue : Number(modelValue)"
+          :model-value="modelValue"
           :items="selectItems"
           hide-details
           density="compact"
@@ -122,21 +135,9 @@ function onNumber(value: unknown) {
           @update:model-value="onNumber"
         />
 
-        <div v-else-if="type === 'path'" class="d-flex align-center ga-2">
-          <v-text-field
-            :model-value="modelValue"
-            hide-details
-            density="compact"
-            @update:model-value="onText"
-          />
-          <v-btn
-            icon="mdi-folder-open"
-            variant="text"
-            size="small"
-            :aria-label="`Выбрать каталог для ${name}`"
-          />
-        </div>
-
+        <!-- type="path": строка, как и любая другая — файловый диалог даст
+             подключаемый @tauri-apps/plugin-dialog, кнопка без диалога была
+             бы заглушкой. -->
         <v-text-field
           v-else
           :model-value="modelValue"

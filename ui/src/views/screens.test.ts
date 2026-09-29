@@ -14,10 +14,12 @@ import { renderToString } from "vue/server-renderer";
 import vuetify from "../plugins/vuetify";
 import FilterBar from "../components/data/FilterBar.vue";
 import MetricCard from "../components/data/MetricCard.vue";
+import SettingField from "../components/forms/SettingField.vue";
 import DashboardView from "./DashboardView.vue";
 import LogsView from "./LogsView.vue";
 import ProfilesView from "./ProfilesView.vue";
 import ProxiesView from "./ProxiesView.vue";
+import SettingsView from "./SettingsView.vue";
 
 // useLogs читает localStorage в момент создания — до первого рендера Logs.
 const storage = new Map<string, string>();
@@ -71,6 +73,51 @@ describe("компоненты шаблона", () => {
     const idle = await render(FilterBar, {});
     expect(idle).not.toContain("filter-active");
     expect(idle).not.toContain("filter-reset");
+  });
+
+  it("SettingField: контроль по типу, маска и ошибка рядом с полем", async () => {
+    const booleanField = await render(SettingField, {
+      name: "flag",
+      type: "bool",
+      modelValue: true,
+    });
+    expect(booleanField).toContain('type="checkbox"');
+
+    const numberField = await render(SettingField, {
+      name: "browser_count",
+      type: "int",
+      modelValue: 5,
+      min: 1,
+      max: 8,
+    });
+    expect(numberField).toContain('type="number"');
+    expect(numberField).toContain('min="1"');
+    expect(numberField).toContain('max="8"');
+
+    const enumField = await render(SettingField, {
+      name: "proxy_transport",
+      type: "enum",
+      modelValue: "cdp_auth",
+      options: [{ title: "CDP-авторизация (по умолчанию)", value: "cdp_auth" }],
+    });
+    expect(enumField).toContain("CDP-авторизация (по умолчанию)");
+
+    const maskedField = await render(SettingField, {
+      name: "proxy",
+      type: "string",
+      modelValue: "********",
+      secret: true,
+    });
+    expect(maskedField).toContain("********");
+
+    const invalidField = await render(SettingField, {
+      name: "click_order",
+      type: "int",
+      modelValue: 5000,
+      error: "значение больше максимума 1000",
+    });
+    expect(invalidField).toContain("значение больше максимума 1000");
+    expect(invalidField).toContain('role="alert"');
   });
 });
 
@@ -196,5 +243,32 @@ describe("экраны на шаблоне", () => {
     expect(html).not.toContain("profiles-unassign-dialog");
     // без данных таблица не показывает статусы и прочерки строк
     expect(html).not.toContain("profiles-status-free");
+  });
+
+  it("Settings: тулбар, три секции и поля из схемы без ошибок", async () => {
+    const html = await render(SettingsView);
+
+    expect(html).toContain("Settings");
+    for (const hook of [
+      "settings-save",
+      "settings-reset",
+      "settings-section-paths",
+      "settings-section-webdriver",
+      "settings-section-behavior",
+    ]) {
+      expect(html).toContain(`data-test="${hook}"`);
+    }
+
+    // до первого ответа демона: ни ошибок, ни успеха, ни пометки «изменено»
+    expect(html).not.toContain("settings-load-error");
+    expect(html).not.toContain("settings-save-error");
+    expect(html).not.toContain("settings-success");
+    expect(html).not.toContain("settings-dirty");
+
+    // поля схемы и подсказки дошли в разметку, включая поздно добавленные
+    expect(html).toContain("proxy_transport");
+    expect(html).toContain("running_interval_start");
+    expect(html).toContain("2captcha_apikey");
+    expect(html).toContain("Нижняя граница случайной паузы на странице с рекламой");
   });
 });
