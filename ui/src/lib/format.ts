@@ -46,3 +46,20 @@ export function formatClockTime(epochMs: number | null | undefined): string {
   const date = new Date(epochMs);
   return `${pad(date.getHours())}:${pad(date.getMinutes())}:${pad(date.getSeconds())}`;
 }
+
+/**
+ * Последнее использование профиля: `YYYY-MM-DD HH:MM` локального пояса.
+ *
+ * `epochSeconds` — эпоха в секундах (REAL в SQLite, как `last_used_at`),
+ * в отличие от [`formatClockTime`], которому нужны миллисекунды. Дата
+ * обязательна: профиль мог не использоваться неделю, и одного времени суток
+ * для «когда» было бы мало.
+ */
+export function formatLastUsed(epochSeconds: number | null | undefined): string {
+  if (epochSeconds == null) return EM_DASH;
+  const date = new Date(Math.floor(epochSeconds) * 1000);
+  const year = date.getFullYear();
+  const month = pad(date.getMonth() + 1);
+  const day = pad(date.getDate());
+  return `${year}-${month}-${day} ${pad(date.getHours())}:${pad(date.getMinutes())}`;
+}

@@ -8,7 +8,7 @@ use tauri::Manager;
 
 use commands::{
     active_workers, captcha_share, clicks_per_hour, count_logs, db_open, list_logs, list_logs_page,
-    list_proxies, requests_last_hour, runs_summary, DbState,
+    list_profiles, list_proxies, requests_last_hour, runs_summary, DbState,
 };
 use daemon::{DaemonSpec, DaemonStatus, DaemonSupervisor, SupervisorOptions};
 
@@ -55,6 +55,7 @@ pub fn run() {
             captcha_share,
             active_workers,
             list_proxies,
+            list_profiles,
             daemon_status,
         ])
         .build(tauri::generate_context!())

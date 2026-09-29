@@ -126,6 +126,37 @@ pub struct ProxyRow {
     pub usage_count: i64,
 }
 
+/// Строка списка профилей — экран Profiles (контракт GET /control/profiles).
+///
+/// Два поля выходят за колонки самой таблицы: `assigned_browser_id` — воркер,
+/// сидящий на профиле (`workers.profile_id`), `proxy_label`/`proxy_address` —
+/// прокси профиля через LEFT JOIN: у профиля может не быть прокси, и тогда все
+/// три поля NULL, а не пустые строки.
+///
+/// `fields` остаётся сырой JSON-строкой: колонка появляется миграцией
+/// `engine/db/migrations/002_profile_fields.sql`, поэтому читалка проверяет её
+/// наличие и до миграции читает NULL. Разбор JSON — на стороне фронтенда.
+///
+/// Креды (`username`, `password`) прокси в выборку не входят: полей нет в
+/// [`ProfileRow`], поэтому в JSON для UI их не может быть по построению.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ProfileRow {
+    pub id: i64,
+    pub name: String,
+    pub key_ref: Option<String>,
+    pub proxy_id: Option<i64>,
+    pub user_agent: Option<String>,
+    pub locale: Option<String>,
+    pub timezone: Option<String>,
+    pub status: String,
+    pub last_used_at: Option<f64>,
+    pub fields: Option<String>,
+    pub assigned_browser_id: Option<String>,
+    pub proxy_label: Option<String>,
+    /// `host:port` прокси либо NULL, если у профиля прокси нет.
+    pub proxy_address: Option<String>,
+}
+
 /// Читатель боевой БД: одно соединение, строго на чтение.
 ///
 /// Соединение не разделяется между потоками (`SQLITE_OPEN_NO_MUTEX`):
@@ -282,6 +313,71 @@ impl DbReader {
         rows.map(|row| row.map_err(read_failed)).collect()
     }
 
+    /// Список профилей для экрана Profiles: строки `profiles` плюс назначенный
+    /// воркер, прокси и сырые `fields`. Порядок — по `id`, как у
+    /// [`Self::list_proxies`]: стабильный и совпадает с порядком вставки.
+    ///
+    /// Назначение — подзапросом, а не JOIN: два воркера на одном профиле
+    /// размножили бы строку, а экрану нужен ровно один профиль на строку. При
+    /// нескольких воркерах отдаётся первый `browser_id` по алфавиту — выбор
+    /// детерминирован, а не зависит от порядка в таблице.
+    ///
+    /// Прокси — LEFT JOIN: профиль может быть без прокси, и в этом случае
+    /// `proxy_id`/`proxy_label`/`proxy_address` остаются NULL.
+    ///
+    /// Колонки `fields` в схеме ещё нет (миграция 002 параллельной ветки):
+    /// читалка спрашивает `pragma_table_info` и до миграции отдаёт NULL, а не
+    /// падает с «no such column». Это терпимо для read-only читалки, потому что
+    /// сама БД остаётся старой — ошибка возникла бы на каждом вызове.
+    pub fn list_profiles(&self) -> Result<Vec<ProfileRow>, DbError> {
+        let has_fields = self
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('profiles') WHERE name = 'fields'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(read_failed)?
+            > 0;
+        let fields_column = if has_fields { "p.fields" } else { "NULL" };
+
+        let sql = format!(
+            "SELECT p.id, p.name, p.key_ref, p.proxy_id, p.user_agent, p.locale, \
+                    p.timezone, p.status, p.last_used_at, {fields_column}, \
+                    (SELECT w.browser_id FROM workers w \
+                      WHERE w.profile_id = p.id \
+                      ORDER BY w.browser_id LIMIT 1) AS assigned_browser_id, \
+                    x.label AS proxy_label, \
+                    CASE WHEN x.id IS NULL THEN NULL \
+                         ELSE x.host || ':' || x.port END AS proxy_address \
+               FROM profiles p \
+               LEFT JOIN proxies x ON x.id = p.proxy_id \
+              ORDER BY p.id"
+        );
+
+        let mut stmt = self.conn.prepare(&sql).map_err(read_failed)?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(ProfileRow {
+                    id: row.get(0)?,
+                    name: row.get(1)?,
+                    key_ref: row.get(2)?,
+                    proxy_id: row.get(3)?,
+                    user_agent: row.get(4)?,
+                    locale: row.get(5)?,
+                    timezone: row.get(6)?,
+                    status: row.get(7)?,
+                    last_used_at: row.get(8)?,
+                    fields: row.get(9)?,
+                    assigned_browser_id: row.get(10)?,
+                    proxy_label: row.get(11)?,
+                    proxy_address: row.get(12)?,
+                })
+            })
+            .map_err(read_failed)?;
+
+        rows.map(|row| row.map_err(read_failed)).collect()
+    }
     /// Общий путь запросов логов: одна страница в порядке `ts DESC, id DESC`.
     fn fetch_log_page(
         &self,
@@ -1589,6 +1685,215 @@ mod tests {
             "last_error",
             "assigned_browser_id",
             "usage_count",
+        ] {
+            assert!(
+                object.contains_key(field),
+                "контрактная колонка {field} должна попасть в ответ"
+            );
+        }
+    }
+
+    /// Строка `profiles` для тестов списка: прокси и статус проставляются
+    /// явно, остальные поля остаются NULL, как в реальных «сырых» профилях.
+    fn insert_profile(conn: &Connection, name: &str, proxy_id: Option<i64>) -> i64 {
+        conn.execute(
+            "INSERT INTO profiles (name, proxy_id, status) VALUES (?1, ?2, 'free')",
+            rusqlite::params![name, proxy_id],
+        )
+        .expect("строка profiles вставляется");
+        conn.last_insert_rowid()
+    }
+
+    /// Прокси для тестов профилей: с меткой и с теми же кредами, что в
+    /// реальных данных, — маскирование проверяется на живых значениях.
+    fn insert_labelled_proxy(conn: &Connection, label: &str, host: &str, port: i64) -> i64 {
+        conn.execute(
+            "INSERT INTO proxies (label, scheme, host, port, username, password) \
+             VALUES (?1, 'http', ?2, ?3, 'user', 'secret-password')",
+            rusqlite::params![label, host, port],
+        )
+        .expect("строка proxies вставляется");
+        conn.last_insert_rowid()
+    }
+
+    fn insert_worker_on_profile(conn: &Connection, browser_id: &str, profile_id: i64) {
+        conn.execute(
+            "INSERT INTO workers (browser_id, profile_id) VALUES (?1, ?2)",
+            rusqlite::params![browser_id, profile_id],
+        )
+        .expect("строка workers вставляется");
+    }
+
+    #[test]
+    fn list_profiles_on_empty_db_returns_nothing() {
+        let tmp = TempDb::new();
+        let path = tmp.path();
+        let _writer = seed(&path, &[]);
+
+        let reader = DbReader::open(&path).expect("БД открывается");
+
+        assert_eq!(
+            reader.list_profiles().expect("пустая БД — пустой список"),
+            vec![] as Vec<ProfileRow>,
+            "отсутствие профилей — не ошибка чтения"
+        );
+    }
+
+    #[test]
+    fn list_profiles_joins_proxy_and_worker_without_row_multiplication() {
+        let tmp = TempDb::new();
+        let path = tmp.path();
+        let writer = seed(&path, &[]);
+
+        let proxy = insert_labelled_proxy(&writer, "немецкий", "a.example", 8080);
+        // Два профиля на одном прокси: join не размножает строки.
+        let assigned = insert_profile(&writer, "alpha", Some(proxy));
+        let idle = insert_profile(&writer, "beta", Some(proxy));
+        // Два воркера на одном профиле: строка не размножается, а выбор
+        // обязан быть детерминированным — берём первый browser_id.
+        insert_worker_on_profile(&writer, "br-2", assigned);
+        insert_worker_on_profile(&writer, "br-1", assigned);
+        let bare = insert_profile(&writer, "gamma", None);
+
+        let reader = DbReader::open(&path).expect("БД открывается");
+        let rows = reader.list_profiles().expect("список читается");
+
+        assert_eq!(rows.len(), 3, "join не размножает строки профилей");
+        assert_eq!(
+            rows.iter().map(|row| row.id).collect::<Vec<_>>(),
+            vec![assigned, idle, bare],
+            "порядок — по id"
+        );
+        assert_eq!(
+            rows[0].assigned_browser_id.as_deref(),
+            Some("br-1"),
+            "назначение — browser_id воркера на этом профиле"
+        );
+        assert_eq!(rows[0].proxy_id, Some(proxy));
+        assert_eq!(rows[0].proxy_label.as_deref(), Some("немецкий"));
+        assert_eq!(rows[0].proxy_address.as_deref(), Some("a.example:8080"));
+        // Тот же прокси у второго профиля: строка профиля остаётся одна.
+        assert_eq!(rows[1].assigned_browser_id, None);
+        assert_eq!(rows[1].proxy_label.as_deref(), Some("немецкий"));
+        assert_eq!(rows[1].proxy_address.as_deref(), Some("a.example:8080"));
+    }
+
+    #[test]
+    fn list_profiles_reports_nulls_for_profile_without_proxy() {
+        let tmp = TempDb::new();
+        let path = tmp.path();
+        let writer = seed(&path, &[]);
+        let bare = insert_profile(&writer, "без всего", None);
+
+        let reader = DbReader::open(&path).expect("БД открывается");
+        let rows = reader.list_profiles().expect("список читается");
+
+        assert_eq!(rows.len(), 1);
+        let row = &rows[0];
+        assert_eq!(row.id, bare);
+        assert_eq!(row.name, "без всего");
+        assert_eq!(row.status, "free");
+        // Профиль без прокси: и сам прокси, и его поля — NULL, а не пустые строки.
+        assert_eq!(row.proxy_id, None);
+        assert_eq!(row.proxy_label, None);
+        assert_eq!(row.proxy_address, None);
+        assert_eq!(row.assigned_browser_id, None);
+        assert_eq!(row.key_ref, None);
+        assert_eq!(row.user_agent, None);
+        assert_eq!(row.locale, None);
+        assert_eq!(row.timezone, None);
+        assert_eq!(row.last_used_at, None);
+    }
+
+    #[test]
+    fn list_profiles_without_fields_column_reports_null() {
+        let tmp = TempDb::new();
+        let path = tmp.path();
+        let writer = seed(&path, &[]);
+        insert_profile(&writer, "старая схема", None);
+
+        // Схема движка в этом дереве ещё не содержит profiles.fields:
+        // читалка не должна падать, а поле отдаётся NULL.
+        let reader = DbReader::open(&path).expect("БД открывается");
+        let rows = reader.list_profiles().expect("список читается");
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].fields, None);
+    }
+
+    #[test]
+    fn list_profiles_returns_raw_fields_json_when_column_exists() {
+        let tmp = TempDb::new();
+        let path = tmp.path();
+        let writer = seed(&path, &[]);
+        writer
+            .execute("ALTER TABLE profiles ADD COLUMN fields TEXT", [])
+            .expect("колонка fields добавляется тестом");
+        writer
+            .execute(
+                "INSERT INTO profiles (name, status, fields) \
+                 VALUES ('с полями', 'blocked', '{\"note\":\"осторожно\",\"n\":2}')",
+                [],
+            )
+            .expect("строка profiles с fields вставляется");
+        let filled = writer.last_insert_rowid();
+        insert_profile(&writer, "без полей", None);
+
+        let reader = DbReader::open(&path).expect("БД открывается");
+        let rows = reader.list_profiles().expect("список читается");
+
+        assert_eq!(rows.len(), 2);
+        let with_fields = rows
+            .iter()
+            .find(|row| row.id == filled)
+            .expect("строка с fields в списке");
+        // Сырая строка, а не разобранный объект: JSON разбирает фронтенд.
+        assert_eq!(
+            with_fields.fields.as_deref(),
+            Some(r#"{"note":"осторожно","n":2}"#),
+            "fields должен отдаваться сырой JSON-строкой"
+        );
+        assert_eq!(with_fields.status, "blocked");
+        assert_eq!(rows[1].fields, None, "отсутствующие поля — NULL");
+    }
+
+    #[test]
+    fn list_profiles_serializes_contract_fields_and_hides_proxy_credentials() {
+        let tmp = TempDb::new();
+        let path = tmp.path();
+        let writer = seed(&path, &[]);
+        let proxy = insert_labelled_proxy(&writer, "с кредами", "cred.example", 3128);
+        insert_profile(&writer, "аккаунт", Some(proxy));
+
+        let reader = DbReader::open(&path).expect("БД открывается");
+        let rows = reader.list_profiles().expect("список читается");
+
+        let json = serde_json::to_value(&rows[0]).expect("строка сериализуется");
+        let object = json.as_object().expect("JSON — объект");
+        assert!(
+            !object.contains_key("username") && !object.contains_key("password"),
+            "креды прокси не должны покидать читалку: {object:?}"
+        );
+        assert!(
+            !serde_json::to_string(&rows[0])
+                .expect("строка сериализуется")
+                .contains("secret-password"),
+            "пароль прокси не должен попасть в выдачу"
+        );
+        for field in [
+            "id",
+            "name",
+            "key_ref",
+            "proxy_id",
+            "user_agent",
+            "locale",
+            "timezone",
+            "status",
+            "last_used_at",
+            "fields",
+            "assigned_browser_id",
+            "proxy_label",
+            "proxy_address",
         ] {
             assert!(
                 object.contains_key(field),

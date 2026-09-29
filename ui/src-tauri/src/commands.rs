@@ -9,7 +9,7 @@ use std::sync::{Mutex, MutexGuard};
 
 use tauri::State;
 
-use crate::db::{DbError, DbReader, LogEntry, LogFilters, LogPageEntry, ProxyRow};
+use crate::db::{DbError, DbReader, LogEntry, LogFilters, LogPageEntry, ProfileRow, ProxyRow};
 use crate::metrics::{ActiveWorker, HourlyClicks, RequestsLastHour, RunsSummary};
 
 /// Имя переменной окружения с путём к БД — зеркало `DB_ENV_VAR` из
@@ -256,6 +256,14 @@ pub fn active_workers(
 #[tauri::command]
 pub fn list_proxies(state: State<'_, DbState>) -> Result<Vec<ProxyRow>, DbError> {
     with_reader(&state.0, |reader| reader.list_proxies())
+}
+
+/// Список профилей экрана Profiles: строки таблицы + назначенный воркер, прокси
+/// и сырые `fields`. Креды прокси в ответ не входят (см. [`ProfileRow`]),
+/// мутации списка идут только через control API демона, не через эту команду.
+#[tauri::command]
+pub fn list_profiles(state: State<'_, DbState>) -> Result<Vec<ProfileRow>, DbError> {
+    with_reader(&state.0, |reader| reader.list_profiles())
 }
 
 #[cfg(test)]

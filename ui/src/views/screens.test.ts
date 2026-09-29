@@ -16,6 +16,7 @@ import FilterBar from "../components/data/FilterBar.vue";
 import MetricCard from "../components/data/MetricCard.vue";
 import DashboardView from "./DashboardView.vue";
 import LogsView from "./LogsView.vue";
+import ProfilesView from "./ProfilesView.vue";
 import ProxiesView from "./ProxiesView.vue";
 
 // useLogs читает localStorage в момент создания — до первого рендера Logs.
@@ -168,5 +169,32 @@ describe("экраны на шаблоне", () => {
     expect(html).not.toContain("proxies-add-dialog");
     expect(html).not.toContain("proxies-delete-dialog");
     expect(html).not.toContain("proxies-check-progress");
+  });
+
+  it("Profiles: PageLayout, фильтры, массовые действия и пустое состояние", async () => {
+    const html = await render(ProfilesView);
+
+    expect(html).toContain("Profiles");
+    for (const hook of [
+      "profiles-add",
+      "profiles-import",
+      "profiles-assign",
+      "profiles-unassign",
+      "profiles-filter-status",
+      "profiles-filter-name",
+      "profiles-empty",
+    ]) {
+      expect(html).toContain(`data-test="${hook}"`);
+    }
+
+    // ни ошибок, ни итогов, ни открытых диалогов — экран только открылся
+    expect(html).not.toContain("profiles-action-error");
+    expect(html).not.toContain("profiles-add-dialog");
+    expect(html).not.toContain("profiles-import-dialog");
+    expect(html).not.toContain("profiles-assign-dialog");
+    expect(html).not.toContain("profiles-delete-dialog");
+    expect(html).not.toContain("profiles-unassign-dialog");
+    // без данных таблица не показывает статусы и прочерки строк
+    expect(html).not.toContain("profiles-status-free");
   });
 });

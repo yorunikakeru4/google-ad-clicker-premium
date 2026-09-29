@@ -73,6 +73,84 @@ export function proxiesRequest(action: ProxiesAction): ProxiesRequest {
   }
 }
 
+/** Новый профиль для POST /control/profiles: только name обязателен. */
+export interface NewProfile {
+  name: string;
+  key_ref?: string;
+  proxy_id?: number;
+  user_agent?: string;
+  locale?: string;
+  timezone?: string;
+  fields?: string;
+}
+
+/** Контрактный статус профиля для POST /control/profiles/status. */
+export type WritableProfileStatus = "free" | "blocked" | "error";
+
+/** Действия API профилей (контракт /control/profiles* параллельной ветки). */
+export type ProfilesAction =
+  | { kind: "list" }
+  | { kind: "add"; profiles: NewProfile[] }
+  | { kind: "import"; lines: string[] }
+  | { kind: "delete"; id: number }
+  | { kind: "assign"; start_id: number; end_id: number }
+  | { kind: "unassign" }
+  | { kind: "status"; id: number; status: WritableProfileStatus };
+
+export interface ProfilesRequest {
+  method: "GET" | "POST";
+  path: string;
+  /** JSON-тело POST; у GET его нет вовсе. */
+  body?: string;
+}
+
+/**
+ * Билдер запросов к API профилей.
+ *
+ * Тот же принцип, что у [`proxiesRequest`]: контракт (`{"profiles": [...]}`,
+ * `{"lines": [...]}`, `{"start_id", "end_id"}`, `{"id", "status"}`) живёт
+ * здесь, а не в вызывающем коде, — тесты видят ровно то, что уйдёт в
+ * control_request.
+ */
+export function profilesRequest(action: ProfilesAction): ProfilesRequest {
+  switch (action.kind) {
+    case "list":
+      return { method: "GET", path: "/control/profiles" };
+    case "add":
+      return {
+        method: "POST",
+        path: "/control/profiles",
+        body: JSON.stringify({ profiles: action.profiles }),
+      };
+    case "import":
+      return {
+        method: "POST",
+        path: "/control/profiles/import",
+        body: JSON.stringify({ lines: action.lines }),
+      };
+    case "delete":
+      return {
+        method: "POST",
+        path: "/control/profiles/delete",
+        body: JSON.stringify({ id: action.id }),
+      };
+    case "assign":
+      return {
+        method: "POST",
+        path: "/control/profiles/assign",
+        body: JSON.stringify({ start_id: action.start_id, end_id: action.end_id }),
+      };
+    case "unassign":
+      return { method: "POST", path: "/control/profiles/unassign", body: "{}" };
+    case "status":
+      return {
+        method: "POST",
+        path: "/control/profiles/status",
+        body: JSON.stringify({ id: action.id, status: action.status }),
+      };
+  }
+}
+
 /** Сводное состояние, из которого считаются disabled-правила. */
 export interface StatusView {
   online: boolean;
