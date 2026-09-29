@@ -30,8 +30,6 @@
 
 use std::collections::HashMap;
 use std::env;
-use std::fs;
-use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -673,6 +671,7 @@ fn pid_alive(_pid: u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::fs;
 
     fn fast_options() -> SupervisorOptions {
         SupervisorOptions {
