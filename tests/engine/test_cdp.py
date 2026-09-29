@@ -770,7 +770,7 @@ class TestConnectionLostCallback:
         try:
             first.fail = True
             assert _wait_until(lambda: len(lost) == 1, timeout=3.0), lost
-            assert _wait_until(client.connected, timeout=3.0)
+            assert _wait_until(lambda: client.connected, timeout=3.0)
             second.fail = True
             assert _wait_until(lambda: len(lost) == 2, timeout=3.0), lost
         finally:

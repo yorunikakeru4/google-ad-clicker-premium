@@ -146,6 +146,12 @@ class CdpClient:
     вызывающий код после него может сразу слать команды. Дальнейшие
     обрывы переживаются внутри: backoff от ``initial_backoff`` с удвоением
     до ``max_backoff``, счётчик сбрасывается после успешного подключения.
+
+    ``on_connection_lost`` — колбэк на потерю установленного соединения: один
+    раз на эпизод обрыва, не на штатном ``stop()`` и не на каждой неудачной
+    попытке переподключения. Воркер по нему помечает себя деградировавшим
+    (план.md §2.1), поэтому исключение внутри колбэба гасится debug-записью,
+    а не роняет поток приёма.
     """
 
     def __init__(
@@ -156,6 +162,7 @@ class CdpClient:
         initial_backoff: float = 0.2,
         max_backoff: float = 5.0,
         timeout: float = 5.0,
+        on_connection_lost: Callable[[], None] | None = None,
     ) -> None:
         self._url = url
         self._ws_factory = ws_factory or _default_ws_factory
@@ -163,6 +170,8 @@ class CdpClient:
         self._initial_backoff = initial_backoff
         self._max_backoff = max_backoff
         self._timeout = timeout
+        self._on_connection_lost = on_connection_lost
+        self._lost_notified = False
         self._ids = itertools.count(1)
         self._send_lock = threading.Lock()
         self._pending: dict[int, tuple[threading.Event, dict[str, Any]]] = {}
@@ -279,12 +288,32 @@ class CdpClient:
     def _drop_connection(self) -> None:
         with self._ws_lock:
             ws, self._ws = self._ws, None
+            # Обрыв — это потеря УЖЕ установленного соединения, и сигнал на
+            # эпизод ровно один: повторные неудачи переподключения не должны
+            # слать деградацию на каждую попытку. Штатный stop() обрывом не
+            # считается: там _running уже снят.
+            callback = None
+            if (ws is not None or self._connected.is_set()) and self._running:
+                if not self._lost_notified:
+                    self._lost_notified = True
+                    callback = self._on_connection_lost
         self._connected.clear()
         if ws is not None:
             try:
                 ws.close()
             except Exception:
                 pass
+        if callback is not None:
+            try:
+                callback()
+            except Exception as exc:
+                # Колбэк приёмного потока не должен его убивать: причина
+                # обрыва уже залогирована, падение отражаем debug-записью.
+                log.debug(
+                    "browser",
+                    "connection lost callback failed",
+                    fields={"error_type": type(exc).__name__, "error": str(exc)},
+                )
 
     def _run(self) -> None:
         backoff = self._initial_backoff
@@ -305,6 +334,9 @@ class CdpClient:
                     continue
                 with self._ws_lock:
                     self._ws = ws
+                    # Свежее подключение открывает новый эпизод: следующий
+                    # обрыв снова имеет право сообщить о себе.
+                    self._lost_notified = False
                 backoff = self._initial_backoff
                 self._connected.set()
                 # websocket-client не принимает timeout в recv(): таймаут
