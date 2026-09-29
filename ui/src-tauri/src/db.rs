@@ -1,16 +1,217 @@
-//! Контракт read-only читалки боевой БД (TDD: красный → зелёный).
+//! Read-only читалка боевой БД для экрана Logs.
 //!
-//! Движок (`engine/db`) пишет в WAL, UI читает тот же файл, но только
-//! соединением `SQLITE_OPEN_READ_ONLY`: без создания файла, без записи и
-//! с `busy_timeout`, зеркальным `BUSY_TIMEOUT_MS` движка.
+//! Контракт: движок (`engine/db`) пишет в WAL, UI читает тот же файл, но
+//! только соединением `SQLITE_OPEN_READ_ONLY` — без создания файла и без
+//! какой-либо записи из фронтенда. `journal_mode` читалка не трогает:
+//! журнал выставляет писатель (`engine/db/migrations.py`).
+
+use std::fmt;
+use std::fs;
+use std::io;
+use std::path::Path;
+use std::time::Duration;
+
+use rusqlite::{Connection, OpenFlags, ToSql};
+use serde::Serialize;
+
+/// Зеркало `BUSY_TIMEOUT_MS` из `engine/db/migrations.py`: читатель ждёт
+/// освобождения блокировки ровно столько же, сколько ждёт движок, вместо
+/// ошибки SQLITE_BUSY, пока писатель дописывает батч под WAL.
+pub const BUSY_TIMEOUT_MS: u64 = 5000;
+
+/// Потолок строк на один запрос: экран логов не должен выгружать в память
+/// UI миллионы строк. Запрос с большим `limit` усекается до этой величины.
+pub const MAX_LOGS_LIMIT: u32 = 1000;
+
+/// Ошибка читалки. `Display` отдаёт готовый текст для UI, `kind` в сериализованном
+/// виде различает случаи для фронтенда.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[serde(tag = "kind", content = "message")]
+pub enum DbError {
+    /// Файла нет. Читалка не создаёт БД: это ошибка запуска, а не «пустая база».
+    DatabaseNotFound { path: String },
+    /// Файл есть, но это не база движка: каталог, не-SQLite файл или
+    /// неприменённая схема (нет таблицы `logs`).
+    OpenFailed { path: String, reason: String },
+    /// Соединение открыто, но запрос к базе не удался.
+    ReadFailed { reason: String },
+}
+
+impl fmt::Display for DbError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            DbError::DatabaseNotFound { path } => write!(
+                f,
+                "База данных не найдена: {path}. Запустите движок — он создаст \
+                 файл при первом запуске."
+            ),
+            DbError::OpenFailed { path, reason } => {
+                write!(f, "Не удалось открыть базу {path}: {reason}")
+            }
+            DbError::ReadFailed { reason } => write!(f, "Ошибка чтения из базы: {reason}"),
+        }
+    }
+}
+
+impl std::error::Error for DbError {}
+
+/// Строка лога для экрана Logs. `fields` остаётся сырой строкой: JSON
+/// разбирается на стороне фронтенда, Rust его не интерпретирует.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct LogEntry {
+    pub ts: f64,
+    pub level: String,
+    pub browser_id: Option<String>,
+    pub category: Option<String>,
+    pub message: String,
+    pub fields: Option<String>,
+}
+
+/// Читатель боевой БД: одно соединение, строго на чтение.
+///
+/// Соединение не разделяется между потоками (`SQLITE_OPEN_NO_MUTEX`):
+/// каждый поток держит своего читателя.
+#[derive(Debug)]
+pub struct DbReader {
+    conn: Connection,
+}
+
+impl DbReader {
+    /// Открывает существующую базу строго на чтение.
+    ///
+    /// Несуществующий путь — ошибка `DatabaseNotFound`, а не созданная «с нуля»
+    /// пустая БД: файл создаёт только движок.
+    pub fn open(path: impl AsRef<Path>) -> Result<Self, DbError> {
+        let path = path.as_ref();
+        ensure_openable(path)?;
+
+        // Флаги осознанно без SQLITE_OPEN_CREATE: read-only соединение не имеет
+        // права создавать ни файл, ни -wal/-shm — журнал ведёт писатель.
+        let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
+        let conn =
+            Connection::open_with_flags(path, flags).map_err(|err| open_failed(path, err))?;
+        conn.busy_timeout(Duration::from_millis(BUSY_TIMEOUT_MS))
+            .map_err(|err| open_failed(path, err))?;
+
+        // Файл должен быть базой движка. Чужой или неприменённый файл ловим
+        // здесь, а не глубоко внутри запроса, чтобы UI получил внятный текст.
+        let has_logs: bool = conn
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'logs')",
+                [],
+                |row| row.get(0),
+            )
+            .map_err(|err| open_failed(path, err))?;
+        if !has_logs {
+            return Err(DbError::OpenFailed {
+                path: path.display().to_string(),
+                reason: "в базе нет таблицы logs: схема движка не применена".to_string(),
+            });
+        }
+
+        Ok(Self { conn })
+    }
+
+    /// Строки `logs` по убыванию `ts`, с точным фильтром по уровню,
+    /// категории и `browser_id` (любой параметр можно опустить).
+    ///
+    /// `limit = 0` возвращает пустой список; значения выше
+    /// [`MAX_LOGS_LIMIT`] усекаются до него. `browser_id IS NULL` не
+    /// совпадает ни с каким значением фильтра.
+    pub fn list_logs(
+        &self,
+        limit: u32,
+        level: Option<&str>,
+        category: Option<&str>,
+        browser_id: Option<&str>,
+    ) -> Result<Vec<LogEntry>, DbError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let limit = limit.min(MAX_LOGS_LIMIT);
+
+        // Фильтры собираются динамически: равенство столбца индексируется
+        // (`idx_logs_browser_id` и др.), а вариант «? IS NULL OR col = ?»
+        // заставлял бы SQLite сканировать индекс по ts целиком.
+        let mut sql =
+            String::from("SELECT ts, level, browser_id, category, message, fields FROM logs");
+        let mut conditions: Vec<&str> = Vec::new();
+        let mut binds: Vec<&dyn ToSql> = Vec::new();
+
+        if level.is_some() {
+            conditions.push("level = ?");
+            binds.push(&level);
+        }
+        if category.is_some() {
+            conditions.push("category = ?");
+            binds.push(&category);
+        }
+        if browser_id.is_some() {
+            conditions.push("browser_id = ?");
+            binds.push(&browser_id);
+        }
+        if !conditions.is_empty() {
+            sql.push_str(" WHERE ");
+            sql.push_str(&conditions.join(" AND "));
+        }
+        // id — детерминированный разрыв равных ts: свежевставленная строка
+        // идёт первой, и пагинация фазы 4 не будет терять и дублировать строки.
+        sql.push_str(" ORDER BY ts DESC, id DESC LIMIT ?");
+        binds.push(&limit);
+
+        let mut stmt = self.conn.prepare(&sql).map_err(read_failed)?;
+        let rows = stmt
+            .query_map(binds.as_slice(), |row| {
+                Ok(LogEntry {
+                    ts: row.get(0)?,
+                    level: row.get(1)?,
+                    browser_id: row.get(2)?,
+                    category: row.get(3)?,
+                    message: row.get(4)?,
+                    fields: row.get(5)?,
+                })
+            })
+            .map_err(read_failed)?;
+
+        rows.map(|row| row.map_err(read_failed)).collect()
+    }
+}
+
+/// Путь существует и не является каталогом.
+fn ensure_openable(path: &Path) -> Result<(), DbError> {
+    match fs::metadata(path) {
+        Ok(meta) if meta.is_dir() => Err(DbError::OpenFailed {
+            path: path.display().to_string(),
+            reason: "путь указывает на каталог, а не на файл базы".to_string(),
+        }),
+        Ok(_) => Ok(()),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Err(DbError::DatabaseNotFound {
+            path: path.display().to_string(),
+        }),
+        Err(err) => Err(DbError::OpenFailed {
+            path: path.display().to_string(),
+            reason: format!("нет доступа к файлу: {err}"),
+        }),
+    }
+}
+
+fn open_failed(path: &Path, err: impl fmt::Display) -> DbError {
+    DbError::OpenFailed {
+        path: path.display().to_string(),
+        reason: err.to_string(),
+    }
+}
+
+fn read_failed(err: rusqlite::Error) -> DbError {
+    DbError::ReadFailed {
+        reason: err.to_string(),
+    }
+}
 
 #[cfg(test)]
 mod tests {
-    use std::fs;
-    use std::path::{Path, PathBuf};
+    use std::path::PathBuf;
     use std::sync::atomic::{AtomicU32, Ordering};
-
-    use rusqlite::Connection;
 
     use super::*;
 
@@ -105,7 +306,8 @@ mod tests {
         // Данные остаются в -wal до закрытия: читалке придётся читать журнал.
         conn.execute_batch("PRAGMA wal_autocheckpoint = 0;")
             .expect("авточекпоинт отключается");
-        conn.execute_batch(SCHEMA_SQL).expect("схема движка применяется");
+        conn.execute_batch(SCHEMA_SQL)
+            .expect("схема движка применяется");
         for row in rows {
             conn.execute(
                 "INSERT INTO logs (ts, level, browser_id, category, message, fields) \
@@ -163,7 +365,10 @@ mod tests {
 
         let err = DbReader::open(&tmp.dir).expect_err("каталог — не БД");
 
-        assert!(matches!(err, DbError::OpenFailed { .. }), "получено: {err:?}");
+        assert!(
+            matches!(err, DbError::OpenFailed { .. }),
+            "получено: {err:?}"
+        );
         assert!(
             err.to_string().contains("каталог"),
             "текст должен объяснять причину: {err}"
@@ -174,12 +379,17 @@ mod tests {
     fn open_rejects_foreign_file_without_modifying_it() {
         let tmp = TempDb::new();
         let path = tmp.path();
-        let garbage = "это не sqlite, а обычный текстовый файл".as_bytes().to_vec();
+        let garbage = "это не sqlite, а обычный текстовый файл"
+            .as_bytes()
+            .to_vec();
         fs::write(&path, &garbage).expect("файл пишется тестом");
 
         let err = DbReader::open(&path).expect_err("не-SQLite файл должен быть отвергнут");
 
-        assert!(matches!(err, DbError::OpenFailed { .. }), "получено: {err:?}");
+        assert!(
+            matches!(err, DbError::OpenFailed { .. }),
+            "получено: {err:?}"
+        );
         assert_eq!(
             fs::read(&path).expect("файл читается"),
             garbage,
@@ -198,7 +408,10 @@ mod tests {
 
         let err = DbReader::open(&path).expect_err("нет таблицы logs — ошибка");
 
-        assert!(matches!(err, DbError::OpenFailed { .. }), "получено: {err:?}");
+        assert!(
+            matches!(err, DbError::OpenFailed { .. }),
+            "получено: {err:?}"
+        );
         assert!(
             err.to_string().contains("logs"),
             "текст должен назвать отсутствующую таблицу: {err}"
@@ -223,7 +436,7 @@ mod tests {
 
         assert_eq!(
             rows,
-            vec![entry(&data[2]), entry(&data[1]), entry(&data[0])],
+            vec![entry(&data[1]), entry(&data[2]), entry(&data[0])],
             "строки отдаются по убыванию ts, а не по порядку вставки"
         );
     }
@@ -246,7 +459,7 @@ mod tests {
         assert_eq!(
             rows,
             vec![entry(&data[1]), entry(&data[0])],
-            "при равном ts свежее вставленная строка идёт первой"
+            "при равном ts свежевставленная строка идёт первой"
         );
     }
 
@@ -271,7 +484,10 @@ mod tests {
         let debug = reader
             .list_logs(10, Some("DEBUG"), None, None)
             .expect("фильтр по несуществующему уровню");
-        assert!(debug.is_empty(), "неизвестный уровень не должен ничего возвращать");
+        assert!(
+            debug.is_empty(),
+            "неизвестный уровень не должен ничего возвращать"
+        );
     }
 
     #[test]
@@ -282,7 +498,9 @@ mod tests {
             Row::new(1.0, "INFO", "клик")
                 .category("click")
                 .browser("b1"),
-            Row::new(2.0, "INFO", "прокси").category("proxy").browser("b1"),
+            Row::new(2.0, "INFO", "прокси")
+                .category("proxy")
+                .browser("b1"),
             Row::new(3.0, "INFO", "клик без категории").browser("b1"),
         ];
         let _writer = seed(&path, &data);
@@ -366,7 +584,10 @@ mod tests {
             Some(r#"{"query":"купить кроссовки","http_status":200}"#),
             "fields отдаётся сырой строкой, JSON разбирает фронтенд"
         );
-        assert_eq!(rows[0].browser_id, None, "NULL browser_id должен стать None");
+        assert_eq!(
+            rows[0].browser_id, None,
+            "NULL browser_id должен стать None"
+        );
         assert_eq!(rows[0].category.as_deref(), Some("click"));
     }
 
@@ -488,8 +709,7 @@ mod tests {
             .expect("pragma busy_timeout читается");
 
         assert_eq!(
-            timeout_ms,
-            BUSY_TIMEOUT_MS as i64,
+            timeout_ms, BUSY_TIMEOUT_MS as i64,
             "читатель ждёт ровно столько, сколько ждёт движок"
         );
     }
