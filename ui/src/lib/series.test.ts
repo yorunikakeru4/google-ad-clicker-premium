@@ -34,6 +34,11 @@ describe("buildHourlyBuckets", () => {
     expect(buckets).toHaveLength(MAX_HOURLY_BUCKETS);
     expect(buckets.at(-1)).toBe(3600 * 5000, "самый свежий час сохраняется");
   });
+
+  it("нефинитные границы — пустое окно, а не бесконечный цикл", () => {
+    expect(buildHourlyBuckets(Number.NaN, 1000)).toEqual([]);
+    expect(buildHourlyBuckets(0, Number.POSITIVE_INFINITY)).toEqual([]);
+  });
 });
 
 describe("countByHour", () => {
