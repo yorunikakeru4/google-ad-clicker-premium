@@ -301,6 +301,40 @@ export const settingsSections: SettingSection[] = [
         hint: "Ускорять загрузку страницы отключением тяжёлых ресурсов",
         default: false,
       },
+      // Пороговая политика CAPTCHA (план §5, фаза 8): что делать при самом
+      // событии и что делать, когда доля CAPTCHA за час вышла за порог.
+      {
+        key: "captcha_policy",
+        type: "enum",
+        options: [
+          { title: "Стоп: ждать оператора (по умолчанию)", value: "stop" },
+          { title: "Авто-решение", value: "solve" },
+          { title: "Решать, при неудаче — стоп", value: "both" },
+        ],
+        hint: "Что делать при обнаружении CAPTCHA: ждать оператора, решать через 2Captcha автоматически или решать, а при неудаче — остановиться",
+        default: "stop",
+      },
+      {
+        key: "captcha_threshold_percent",
+        type: "float",
+        unit: "%",
+        step: 1,
+        min: 0,
+        max: 100,
+        hint: "Порог доли CAPTCHA за скользящий час, в процентах, 0–100: 0 — срабатывать на любой доле; по умолчанию 5%",
+        default: 5,
+      },
+      {
+        key: "captcha_threshold_action",
+        type: "enum",
+        options: [
+          { title: "Только предупреждение", value: "warn" },
+          { title: "Автопауза", value: "pause" },
+          { title: "Ротация прокси", value: "rotate" },
+        ],
+        hint: "Что делать при превышении порога: только предупредить, поставить сценарий на автопаузу или ротировать прокси",
+        default: "warn",
+      },
     ],
   },
 ];
