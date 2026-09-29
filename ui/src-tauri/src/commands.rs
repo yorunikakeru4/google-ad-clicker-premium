@@ -10,7 +10,8 @@ use std::sync::{Mutex, MutexGuard};
 use tauri::State;
 
 use crate::db::{
-    DbError, DbReader, DiagnosticRow, LogEntry, LogFilters, LogPageEntry, ProfileRow, ProxyRow,
+    CaptchaEventRow, DbError, DbReader, DiagnosticRow, LogEntry, LogFilters, LogPageEntry,
+    ProfileRow, ProxyRow,
 };
 use crate::metrics::{ActiveWorker, HourlyClicks, RequestsLastHour, RunsSummary};
 
@@ -276,6 +277,16 @@ pub fn list_profiles(state: State<'_, DbState>) -> Result<Vec<ProfileRow>, DbErr
 #[tauri::command]
 pub fn list_diagnostics(state: State<'_, DbState>) -> Result<Vec<DiagnosticRow>, DbError> {
     with_reader(&state.0, |reader| reader.list_diagnostics())
+}
+
+/// Последние события CAPTCHA — лента и подсветка воркеров на Dashboard.
+/// `limit` усекается тем же потолком, что и логи; порядок `ts DESC, id DESC`.
+#[tauri::command]
+pub fn list_captcha_events(
+    state: State<'_, DbState>,
+    limit: u32,
+) -> Result<Vec<CaptchaEventRow>, DbError> {
+    with_reader(&state.0, |reader| reader.list_captcha_events(limit))
 }
 
 #[cfg(test)]

@@ -153,6 +153,17 @@ describe("createDbApi", () => {
     expect(calls[5].args).toEqual({ now: 5000, thresholdSecs: 15 });
   });
 
+  it("listCaptchaEvents уходит в свою команду с limit", async () => {
+    const { calls, invoke } = fakeInvoke([]);
+    const api = createDbApi(invoke);
+
+    await api.listCaptchaEvents(20);
+
+    expect(calls).toEqual([
+      { command: "list_captcha_events", args: { limit: 20 } },
+    ]);
+  });
+
   it("ошибка invoke не глотается — её разбирает dbErrorMessage", async () => {
     const payload = {
       kind: "DatabaseNotFound",

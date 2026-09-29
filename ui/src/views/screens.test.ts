@@ -147,6 +147,8 @@ describe("экраны на шаблоне", () => {
       "requests-claim",
       "captcha-value",
       "captcha-claim",
+      "captcha-feed",
+      "captcha-feed-empty",
       "chart-Клики/час",
     ]) {
       expect(html).toContain(`data-test="${hook}"`);
@@ -164,6 +166,13 @@ describe("экраны на шаблоне", () => {
     const workersAt = html.indexOf('data-test="workers-card"');
     expect(workersAt).toBeGreaterThan(html.indexOf('data-test="card-captcha"'));
     expect(workersAt).toBeLessThan(html.indexOf('data-test="chart-Клики/час"'));
+    // лента CAPTCHA — после воркеров и до графиков: подсветка и события рядом
+    const feedAt = html.indexOf('data-test="captcha-feed"');
+    expect(feedAt).toBeGreaterThan(workersAt);
+    expect(feedAt).toBeLessThan(html.indexOf('data-test="chart-Клики/час"'));
+    // ни уведомлений, ни строк событий — их порождает только новый тик
+    expect(html).not.toContain("captcha-notice");
+    expect(html).not.toContain("captcha-events");
     // до первого ответа демона экран честно ждёт, а не показывает пустой пул
     expect(html).toContain('data-test="workers-empty"');
     expect(html).toContain("Ожидание первого ответа демона");

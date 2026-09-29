@@ -21,9 +21,21 @@ const props = defineProps<{
   phase: PollPhase;
   /** Снимок GET /state; null — ответа ещё не было или он провалился. */
   snapshot: StateSnapshot | null;
+  /**
+   * Воркеры с нерешённой CAPTCHA за последние 30 минут — warning-чип в
+   * колонке статуса. Приходит из ленты событий Dashboard (производная от
+   * уже загруженных строк), компонент сам опроса не заведёт.
+   */
+  captchaAlertIds?: string[];
 }>();
 
 const workers = computed(() => props.snapshot?.workers ?? []);
+
+// Множество, а не линейный поиск: строк на тике немного, но проверка идёт
+// для каждой, а Set не зависит от порядка пришедших id.
+const captchaAlerts = computed(
+  () => new Set(props.captchaAlertIds ?? []),
+);
 
 // Аптайм меряется от updated_at снимка, а не от локальных часов: у демона
 // и UI могут расходиться часы. Снимка нет — тире, NaN в ячейку не попадает.
@@ -86,6 +98,17 @@ function uptime(worker: WorkerRow): string {
             <td>{{ worker.browser_id }}</td>
             <td :data-test="`worker-status-${worker.browser_id}`">
               <StatusChip :status="workerStatusKind(worker.status)" :label="worker.status" />
+              <v-chip
+                v-if="captchaAlerts.has(worker.browser_id)"
+                size="x-small"
+                color="warning"
+                variant="tonal"
+                class="ml-2"
+                title="Нерешённая CAPTCHA за последние 30 минут"
+                :data-test="`worker-captcha-${worker.browser_id}`"
+              >
+                CAPTCHA
+              </v-chip>
             </td>
             <td class="text-right" :data-test="`worker-pid-${worker.browser_id}`">
               {{ formatPid(worker.pid) }}
