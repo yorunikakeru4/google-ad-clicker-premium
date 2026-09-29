@@ -23,6 +23,14 @@
 несколько секунд и замирает — это намеренно, потому что «поднимать зомби» и
 выжигать CPU куда хуже, чем остановиться и показать в UI ``circuit_open``.
 
+**Heartbeat.** В БД ``heartbeat_at`` пишет сам воркер — фоновым потоком через
+``StoreWriter.heartbeat`` (upsert, см. ``engine/store.py``). Супервизор здесь
+только наблюдает: раз в тик читает свежие отметки одним запросом и двигает
+in-memory ``last_heartbeat`` строго по факту роста значения из БД. Это и есть
+условие, при котором «живой, но зависший» процесс находится полным ``tick()``:
+если бы писал супервизор, он обновлял бы отметку сам и обнулял бы возраст
+перед проверкой stale — детект зависания был бы мёртв.
+
 **Назначение прокси.** Супервизор — единственный, кто выдаёт
 ``ADCLICKER_PROXY``: пул читается на каждом спавне, выбор делается по живым
 (``is_alive=1``) и не занятым другим живым воркером строкам, внутри
@@ -68,8 +76,11 @@ from typing import Any, Protocol
 from engine.control_plane.state import StateStore, WorkerStatus
 from engine.proxy_pool import ProxyError, ProxyPool
 
-# Heartbeat в БД раз в 5 секунд: чаще — лишние записи в SQLite, реже — UI
-# начнёт считать живого воркера мёртвым.
+# Кадр наблюдения: так часто супервизор читает heartbeat'ы воркеров из БД
+# (и так же спит между тиками). Саму запись в БД делает воркер со своей
+# стороны своей константой (engine.worker.WORKER_HEARTBEAT_INTERVAL_SECONDS)
+# — она дублируется, а не импортируется, чтобы воркер не тянул настройки
+# демона. Часто — лишние чтения SQLite, реже — детект зависания опоздает.
 HEARTBEAT_INTERVAL_SECONDS = 5.0
 
 # Env-контракт воркера (engine.worker.PROXY_ENV): значение вида
@@ -108,7 +119,9 @@ DEFAULT_MAX_RESTARTS = 5
 DEFAULT_RESTART_COUNT_RESET_AFTER = 300.0
 
 # Воркер, который не прислал heartbeat дольше этого, считается зависшим.
-# Три интервала heartbeat с запасом: одна потерянная запись — не зависание.
+# Три интервала с запасом: воркер пишет раз в 5 с, супервизор читает раз в
+# 5 с — 15 с переживают две потерянные записи подряд и грейс после спавна
+# (первое наблюдение за новым воркером приходит не раньше интервала).
 STALE_MULTIPLIER = 3.0
 DEFAULT_STALE_AFTER_SECONDS = STALE_MULTIPLIER * HEARTBEAT_INTERVAL_SECONDS
 
@@ -148,6 +161,10 @@ class SupervisorSettings:
     тестов, и их всегда нужно передавать одним куском, а не поимённо.
     """
 
+    # Кадр фонового цикла: run_idle спит между тиками, поэтому столько же
+    # раз в секунду супервизор и читает heartbeat'ы воркеров. Саму запись в
+    # БД делает воркер, а порог stale считается от того же интервала
+    # (STALE_MULTIPLIER).
     heartbeat_interval: float = HEARTBEAT_INTERVAL_SECONDS
     shutdown_grace_seconds: float = SHUTDOWN_GRACE_SECONDS
     restart_backoff_base: float = RESTART_BACKOFF_BASE_SECONDS
@@ -303,6 +320,10 @@ class _Worker:
     process: ProcessLike
     started_at: float
     restart_count: int = 0
+    # Наблюдаемая отметка heartbeat, а не написанная супервизором: начальное
+    # значение ставится при register/restart (это и есть грейс на первое
+    # наблюдение), дальше растёт только по факту роста heartbeat_at в БД —
+    # его пишет сам воркер. Замершее значение = кандидат на stale.
     last_heartbeat: float = 0.0
     # Момент, не раньше которого воркер снова поднимается. Сбросается при
     # каждом падении, поэтому backoff растёт от фактических попыток, а не
@@ -862,35 +883,49 @@ class Supervisor:
     # --- тик -------------------------------------------------------------
 
     def tick(self) -> None:
-        """Один цикл надзора: heartbeat, сбор падений, рестарты по backoff.
+        """Один цикл надзора: наблюдение за heartbeat, сбор падений, рестарты.
 
         Синхронный и возвращающий управление: фоновый поток и HTTP-запрос
         вызывают одно и то же, и обе стороны получают одинаковое поведение.
+
+        Порядок внутри значим: сначала в память переносятся heartbeat'ы,
+        записанные воркерами, и только потом те, кто не стучил, помечаются
+        зависшими — иначе проверка stale работала бы по устаревшему значению.
         """
         with self._lock:
-            self._heartbeat_due()
+            self._observe_heartbeats()
             self._mark_stale_workers()
             for browser_id, worker in list(self._workers.items()):
                 self._reconcile(browser_id, worker)
 
-    def _heartbeat_due(self) -> None:
-        """Обновляет heartbeat тем воркерам, у кого истёк интервал."""
-        now = self._clock.wall()
+    def _observe_heartbeats(self) -> None:
+        """Переносит heartbeat'ы из БД в память. Наблюдение, а не запись.
+
+        ``heartbeat_at`` пишет сам воркер (``StoreWriter.heartbeat``); здесь
+        один запрос на тик читает все отметки сразу и двигает in-memory
+        ``last_heartbeat`` строго по факту роста значения из БД. «Строго по
+        росту» — не формальность: время в памяти не должно «омоложиться»
+        само, иначе возраст перестанет расти и детект зависания снова
+        перестанет срабатывать.
+        """
+        if not self._workers:
+            return
+        stored = self.store.heartbeats()
         for browser_id, worker in self._workers.items():
-            if worker.circuit_open:
-                continue
-            if worker.last_heartbeat + self.settings.heartbeat_interval > now:
-                continue
-            self.store.heartbeat(browser_id, now=now)
-            worker.last_heartbeat = now
+            seen = stored.get(browser_id)
+            if seen is not None and seen > worker.last_heartbeat:
+                worker.last_heartbeat = seen
 
     def _mark_stale_workers(self) -> None:
         """Помечает зависших воркеров, которые не прислали heartbeat вовремя.
 
         Процесс может быть жив, но бесполезен: браузер не отвечает, сокет
         заблокирован. По одному poll() такой воркер неотличим от здорового, и
-        демон ждал бы его вечно. Решение принимает _reconcile: он увидит, что
-        heartbeat устарел, и переведёт воркера в путь рестарта.
+        демон ждал бы его вечно. Heartbeat в БД в такой ситуации не растёт —
+        его пишет воркер, а супервизор только наблюдает (``_observe_heartbeats``),
+        поэтому ``last_heartbeat`` замирает и здесь наступает порог stale.
+        Решение принимает _reconcile: он увидит, что heartbeat устарел, и
+        переведёт воркера в путь рестарта.
         """
         now = self._clock.wall()
         for browser_id, worker in self._workers.items():
