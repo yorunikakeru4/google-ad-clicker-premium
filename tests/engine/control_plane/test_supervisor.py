@@ -175,6 +175,23 @@ def make_supervisor(store, registry, clock, settings):
     )
 
 
+def worker_beats(store, clock, *browser_ids):
+    """Пишет heartbeat ровно тем кодом, что и настоящий воркер.
+
+    ``StoreWriter.heartbeat`` — production-путь записи из ``engine.worker``;
+    ``now`` подставляется из часов теста, чтобы наблюдение супервизора и
+    stale-порог сравнивались с одним источником времени. Без этой записи
+    фейковый воркер в тестах выглядел бы зависшим: heartbeat пишет воркер,
+    а не супервизор.
+    """
+    writer = StoreWriter(store.db_path)
+    try:
+        for browser_id in browser_ids:
+            writer.heartbeat(browser_id, now=clock.wall())
+    finally:
+        writer.close()
+
+
 class TestStart:
     """Запуск воркеров и отказ при повторном старте."""
 
@@ -269,7 +286,15 @@ class TestStart:
 
 
 class TestHeartbeat:
-    """Heartbeat в БД каждые 5 секунд."""
+    """Heartbeat пишет воркер, супервизор наблюдает.
+
+    Раньше эти тесты проверяли, что супервизор сам обновляет ``heartbeat_at``
+    каждые 5 секунд: из-за этого детект зависания был мёртв — ``tick()``
+    обновлял отметку перед проверкой stale, и возраст в памяти не превышал
+    интервал. Теперь запись принадлежит воркеру (``StoreWriter.heartbeat``),
+    а тесты проверяют наблюдение: тик читает БД одним запросом и двигает
+    in-memory ``last_heartbeat`` только по факту роста значения.
+    """
 
     def test_start_writes_initial_heartbeat(self, store, registry, clock, settings):
         """Регистрация сама ставит heartbeat — UI не должен ждать первого тика,
@@ -280,48 +305,157 @@ class TestHeartbeat:
 
         assert store.get_worker("br-1")["heartbeat_at"] == clock.wall()
 
-    def test_heartbeat_uses_supervisor_clock_not_real_time(self, store, registry, clock, settings):
-        """Иначе тесты heartbeat'а зависели бы от системных часов."""
+    def test_tick_does_not_write_heartbeat_for_the_worker(
+        self, store, registry, clock, settings
+    ):
+        """Было «супервизор пишет heartbeat» — стало «супервизор не пишет».
+
+        Писал бы супервизор — обновлял бы отметку сам и обнулял возраст
+        перед проверкой stale, отбрасывая зависшего воркера как здорового.
+        """
         supervisor = make_supervisor(store, registry, clock, settings)
         supervisor.start(1)
+        first = store.get_worker("br-1")["heartbeat_at"]
+
+        clock.advance(sup.HEARTBEAT_INTERVAL_SECONDS * 3)
+        supervisor.tick()
+
+        assert store.get_worker("br-1")["heartbeat_at"] == first, (
+            "писать heartbeat от имени воркера супервизору нельзя"
+        )
+        assert supervisor._workers["br-1"].last_heartbeat == first, (
+            "наблюдение не должно двигаться само, без записи воркера"
+        )
+
+    def test_worker_write_is_observed_on_the_next_tick(
+        self, store, registry, clock, settings
+    ):
+        """Запись воркера попадает в память на тике, часы — супервизорские.
+
+        Иначе тесты heartbeat'а зависели бы от системных часов. Значение
+        читается из БД, а не берётся из ``time.time()``: воркер и демон
+        смотрят на одну и ту же колонку.
+        """
+        supervisor = make_supervisor(store, registry, clock, settings)
+        supervisor.start(1)
+        first = store.get_worker("br-1")["heartbeat_at"]
         clock.advance(sup.HEARTBEAT_INTERVAL_SECONDS)
+        worker_beats(store, clock, "br-1")
+
+        # Запись уже в БД, но без тика наблюдение не состоялось.
+        assert supervisor._workers["br-1"].last_heartbeat == first
 
         supervisor.tick()
 
         assert store.get_worker("br-1")["heartbeat_at"] == clock.wall() == 1_700_000_005.0
+        assert supervisor._workers["br-1"].last_heartbeat == clock.wall()
 
-
-    def test_no_heartbeat_before_interval_elapses(self, store, registry, clock, settings):
-        supervisor = make_supervisor(store, registry, clock, settings)
-        supervisor.start(1)
-        first = store.get_worker("br-1")["heartbeat_at"]
-
-        clock.advance(sup.HEARTBEAT_INTERVAL_SECONDS - 1)
-        supervisor.tick()
-
-        assert store.get_worker("br-1")["heartbeat_at"] == first, "писать heartbeat раньше срока нельзя"
-
-    def test_heartbeat_written_after_interval(self, store, registry, clock, settings):
-        supervisor = make_supervisor(store, registry, clock, settings)
-        supervisor.start(1)
-        first = store.get_worker("br-1")["heartbeat_at"]
-
-        clock.advance(sup.HEARTBEAT_INTERVAL_SECONDS)
-        supervisor.tick()
-
-        assert store.get_worker("br-1")["heartbeat_at"] == clock.wall() > first
-
-    def test_heartbeat_refreshed_for_every_worker(self, store, registry, clock, settings):
+    def test_observed_heartbeat_covers_every_worker(
+        self, store, registry, clock, settings
+    ):
         supervisor = make_supervisor(store, registry, clock, settings)
         supervisor.start(3)
         clock.advance(sup.HEARTBEAT_INTERVAL_SECONDS)
 
+        worker_beats(store, clock, "br-1", "br-2", "br-3")
         supervisor.tick()
 
-        assert {w["heartbeat_at"] for w in store.list_workers()} == {clock.wall()}
+        assert {w["browser_id"]: w["heartbeat_at"] for w in store.list_workers()} == {
+            "br-1": clock.wall(),
+            "br-2": clock.wall(),
+            "br-3": clock.wall(),
+        }
+        assert all(
+            worker.last_heartbeat == clock.wall()
+            for worker in supervisor._workers.values()
+        ), "наблюдение обязано увидеть запись каждого воркера одним тиком"
 
     def test_default_heartbeat_interval_is_five_seconds(self):
         assert sup.HEARTBEAT_INTERVAL_SECONDS == 5.0
+
+
+class TestStaleDetection:
+    """Зависший воркер: процесс жив по ``poll()``, heartbeat не приходит.
+
+    Heartbeat в БД пишет сам воркер (``StoreWriter.heartbeat``), супервизор
+    только наблюдает за ростом ``heartbeat_at`` и обязан по его отсутствию
+    признать воркера зависшим — несмотря на живой процесс. Раньше этого не
+    происходило: ``_heartbeat_due`` писал heartbeat от имени воркера прямо в
+    ``tick()`` перед проверкой stale, и возраст в памяти не превышал интервал.
+    """
+
+    def test_tick_terminates_worker_that_stopped_beating(
+        self, store, registry, clock, settings
+    ):
+        """Красный тест на дефект: зависание должно находиться полным ``tick()``."""
+        supervisor = make_supervisor(store, registry, clock, settings)
+        supervisor.start(1)
+        supervisor.tick()
+
+        clock.advance(settings.stale_after_seconds + 1)
+        supervisor.tick()
+
+        assert registry.terminated == ["br-1"], (
+            "зависший процесс обязан получить SIGTERM: docstring "
+            "_mark_stale_workers обещает это ровно, а порядок "
+            "heartbeat -> stale в tick() гасил детект"
+        )
+        assert store.get_worker("br-1")["status"] == WorkerStatus.BACKOFF.value
+        assert "worker heartbeat is stale" in all_log_text(store)
+
+    def test_worker_that_keeps_beating_is_not_marked_stale(
+        self, store, registry, clock, settings
+    ):
+        """Обратная сторона детекта: штатные 5 секунд не дают ложных срабатываний."""
+        supervisor = make_supervisor(store, registry, clock, settings)
+        supervisor.start(1)
+        supervisor.tick()
+
+        for _ in range(3):
+            clock.advance(sup.HEARTBEAT_INTERVAL_SECONDS)
+            worker_beats(store, clock, "br-1")
+            supervisor.tick()
+
+        assert registry.terminated == [], "стучащий воркер не может быть признан зависшим"
+        assert store.get_worker("br-1")["status"] == WorkerStatus.RUNNING.value
+
+    def test_grace_after_spawn_covers_the_first_heartbeat(
+        self, store, registry, clock, settings
+    ):
+        """Первое наблюдение за новым воркером приходит не сразу.
+
+        Регистрация ставит ``last_heartbeat=now``, а воркер пишет первый
+        heartbeat через свой интервал — до порога stale должно оставаться
+        запас, иначе каждый свежий спавн гиб бы от ложного срабатывания.
+        """
+        supervisor = make_supervisor(store, registry, clock, settings)
+        supervisor.start(1)
+
+        clock.advance(settings.stale_after_seconds - 1)
+        supervisor.tick()
+
+        assert registry.terminated == []
+        assert store.get_worker("br-1")["status"] == WorkerStatus.RUNNING.value
+
+    def test_restart_resets_the_stale_observation(
+        self, store, registry, clock, settings
+    ):
+        """Рестарт начинает отсчёт заново: новый процесс не наследует
+        возраст heartbeat'а старого, иначе первое наблюдение после
+        рестарта выглядело бы зависанием сразу после старта."""
+        supervisor = make_supervisor(store, registry, clock, settings)
+        supervisor.start(1)
+        worker_beats(store, clock, "br-1")
+        registry.created[0].exit(1)
+        supervisor.tick()
+        clock.advance(sup.RESTART_BACKOFF_BASE_SECONDS)
+        supervisor.tick()
+
+        clock.advance(settings.stale_after_seconds - 1)
+        supervisor.tick()
+
+        assert registry.terminated == [], "после рестарта возраст heartbeat'а начинается заново"
+        assert len(registry.created) == 2, "воркер должен быть перезапущен, а не убит снова"
 
 
 class TestCrashDetection:
@@ -466,6 +600,10 @@ class TestAutoRestart:
         assert store.get_worker("br-1")["restart_count"] == 1
 
         clock.advance(settings.restart_count_reset_after + 1)
+        # Воркер всё это время работал и стучил сам: к тику его последняя
+        # запись свежая, и детект зависания не должен вмешаться в сброс
+        # счётчика. Без записи фейковый воркер выглядел бы зависшим.
+        worker_beats(store, clock, "br-1")
         supervisor.tick()
 
         assert store.get_worker("br-1")["restart_count"] == 0
@@ -655,6 +793,10 @@ class TestCircuitBreaker:
                 process.exit(1)
             supervisor.tick()
             clock.advance(60.0)
+            # br-2 и br-3 всё это время работают и стучат heartbeat'ом сами:
+            # иначе супервизор признал бы их зависшими, а тест проверяет
+            # изоляцию воркеров, а не детект зависания.
+            worker_beats(store, clock, "br-2", "br-3")
             supervisor.tick()
 
         assert store.get_worker("br-1")["status"] == WorkerStatus.CIRCUIT_OPEN.value
