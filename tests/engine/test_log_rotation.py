@@ -19,7 +19,14 @@ import time
 import pytest
 
 from engine.db import migrations
-from engine.log_rotation import export_day, local_day
+from engine.log_rotation import (
+    db_size_bytes,
+    enforce_db_size_limit,
+    export_day,
+    local_day,
+    retention_cutoff,
+    run_retention,
+)
 
 
 @pytest.fixture
@@ -263,3 +270,234 @@ class TestLocalDay:
 
         assert local_day(before) == "2024-03-31"
         assert local_day(after) == "2024-04-01"
+
+
+class TestRetentionCutoff:
+    """Отсечка retention: ровно N полных дней назад ещё живут."""
+
+    def test_cutoff_is_n_days_before_today(self):
+        assert retention_cutoff("2024-04-30", 30) == "2024-03-31"
+
+    def test_cutoff_crosses_month_and_year_boundaries(self):
+        assert retention_cutoff("2024-01-01", 1) == "2023-12-31"
+        assert retention_cutoff("2024-03-01", 29) == "2024-02-01"
+
+    def test_single_day_retention_keeps_yesterday(self):
+        assert retention_cutoff("2024-04-30", 1) == "2024-04-29"
+
+    def test_non_positive_retention_is_rejected(self):
+        for days in (0, -1):
+            with pytest.raises(ValueError):
+                retention_cutoff("2024-04-30", days)
+
+
+class TestRunRetention:
+    """Граница удаления: строго старше N дней — в мусор, ровно N — остаётся."""
+
+    @pytest.fixture
+    def dated_db(self, db_path):
+        for day in ("2024-03-29", "2024-03-30", "2024-03-31", "2024-04-01"):
+            _insert(db_path, day=day, ts=1711954800.0, message=f"row-{day}")
+        return db_path
+
+    @pytest.fixture
+    def export_files(self, export_dir):
+        export_dir.mkdir(parents=True)
+        for name in ("2024-03-29.log", "2024-03-30.log", "2024-03-31.log", "2024-04-01.log"):
+            (export_dir / name).write_text("day\n", encoding="utf-8")
+        (export_dir / "adclicker.log").write_text("legacy\n", encoding="utf-8")
+        (export_dir / "adclicker.log.1").write_text("legacy rotated\n", encoding="utf-8")
+        (export_dir / "notes.txt").write_text("не лог\n", encoding="utf-8")
+        return export_dir
+
+    def _days_left(self, db_path):
+        with sqlite3.connect(db_path) as conn:
+            return [row[0] for row in conn.execute("SELECT DISTINCT day FROM logs ORDER BY day")]
+
+    def test_rows_exactly_n_days_old_survive(self, dated_db, export_dir):
+        """N=30 при сегодня 2024-04-30: 2024-03-31 — ровно 30 дней, остаётся."""
+        result = run_retention(dated_db, "2024-04-30", 30, export_dir)
+
+        assert result.cutoff == "2024-03-31"
+        assert "2024-03-31" in self._days_left(dated_db)
+
+    def test_rows_strictly_older_than_n_days_are_deleted(self, dated_db, export_dir):
+        result = run_retention(dated_db, "2024-04-30", 30, export_dir)
+
+        assert self._days_left(dated_db) == ["2024-03-31", "2024-04-01"]
+        assert result.deleted_rows == 2, "строки двух удалённых дней"
+
+    def test_export_files_follow_the_same_boundary(self, dated_db, export_files):
+        run_retention(dated_db, "2024-04-30", 30, export_files)
+
+        assert sorted(p.name for p in export_files.iterdir()) == [
+            "2024-03-31.log",
+            "2024-04-01.log",
+            "adclicker.log",
+            "adclicker.log.1",
+            "notes.txt",
+        ]
+
+    def test_files_and_rows_are_reported_together(self, dated_db, export_files):
+        result = run_retention(dated_db, "2024-04-30", 30, export_files)
+
+        assert sorted(p.name for p in result.deleted_files) == [
+            "2024-03-29.log",
+            "2024-03-30.log",
+        ]
+        assert result.deleted_rows == 2
+
+    def test_one_day_retention_deletes_only_the_day_before_yesterday(
+        self, dated_db, export_dir
+    ):
+        result = run_retention(dated_db, "2024-04-01", 1, export_dir)
+
+        assert result.cutoff == "2024-03-31"
+        assert self._days_left(dated_db) == ["2024-03-31", "2024-04-01"]
+
+    def test_nothing_to_delete_is_a_quiet_no_op(self, db_path, export_dir):
+        _insert(db_path, day="2024-04-01", ts=1711954800.0, message="fresh")
+
+        result = run_retention(db_path, "2024-04-01", 30, export_dir)
+
+        assert result.deleted_rows == 0
+        assert result.deleted_files == []
+        assert self._days_left(db_path) == ["2024-04-01"]
+
+    def test_missing_export_dir_is_not_an_error(self, db_path, tmp_path):
+        _insert(db_path, day="2024-04-01", ts=1711954800.0)
+
+        result = run_retention(db_path, "2024-04-01", 30, tmp_path / "nope")
+
+        assert result.deleted_files == []
+
+    def test_rows_without_day_are_not_silently_dropped(self, db_path):
+        """NULL в day — баг писателя, а не повод удалять запись молча."""
+        with sqlite3.connect(db_path) as conn:
+            conn.execute(
+                "INSERT INTO logs (ts, day, level, message) VALUES (?, NULL, 'INFO', 'x')",
+                (1711954800.0,),
+            )
+            conn.commit()
+
+        result = run_retention(db_path, "2024-04-01", 1, None)
+
+        assert result.deleted_rows == 0
+
+    def test_non_positive_retention_is_rejected(self, db_path):
+        with pytest.raises(ValueError):
+            run_retention(db_path, "2024-04-01", 0)
+
+
+class TestDbSizeLimit:
+    """Защита от роста: старые дни логов уходят, пока БД не влезет в лимит."""
+
+    def _payload_db(self, db_path, days):
+        """БД с указанными днями (~1 МБ строк на день); возвращает её размер."""
+        with sqlite3.connect(db_path) as conn:
+            for day in days:
+                ts = time.mktime((2024, 4, 1, 12, 0, 0, 0, 0, -1))
+                conn.executemany(
+                    "INSERT INTO logs (ts, day, level, browser_id, category, message) "
+                    "VALUES (?, ?, 'INFO', 'br-1', 'click', ?)",
+                    [(ts + i, day, "x" * 500) for i in range(2500)],
+                )
+            conn.commit()
+        return db_size_bytes(db_path)
+
+    def _reference_db(self, tmp_path, name, days):
+        """Отдельная БД с теми же днями — источник правдоподобного размера.
+
+        Лимит в тестах выбирается между измеренными размерами разных наборов
+        дней, а не вычисляется из «примерно мегабайт»: так тест не зависит от
+        того, сколько страниц займут строки на данной машине.
+        """
+        path = tmp_path / name
+        migrations.migrate(path)
+        return self._payload_db(path, days)
+
+    def test_size_counts_the_database_and_its_wal(self, tmp_path):
+        db_path = tmp_path / "sized.db"
+        migrations.migrate(db_path)
+        base = db_size_bytes(db_path)
+        (tmp_path / "sized.db-wal").write_bytes(b"0" * 4096)
+
+        assert db_size_bytes(db_path) == base + 4096
+
+    def test_limit_zero_is_rejected(self, db_path):
+        with pytest.raises(ValueError):
+            enforce_db_size_limit(db_path, 0)
+
+    def test_database_already_within_the_limit_is_untouched(self, db_path):
+        _insert(db_path, day="2024-04-01", ts=1711954800.0)
+
+        result = enforce_db_size_limit(db_path, 100)
+
+        assert result.fits is True
+        assert result.deleted_days == ()
+        assert result.error is None
+
+    def test_deletes_the_oldest_day_and_stops_when_it_fits(self, tmp_path, db_path, export_dir):
+        days = ("2024-04-01", "2024-04-02", "2024-04-03")
+        export_dir.mkdir(parents=True)
+        for day in days:
+            (export_dir / f"{day}.log").write_text("day\n", encoding="utf-8")
+        initial = self._payload_db(db_path, days)
+        without_oldest = self._reference_db(tmp_path, "two.db", days[1:])
+        # Лимит между размерами «три дня» и «два дня»: в БД не влезает, но
+        # выкинуть достаточно ровно один день.
+        limit_mb = (initial + without_oldest) / 2 / (1024 * 1024)
+        assert initial > without_oldest
+
+        result = enforce_db_size_limit(db_path, limit_mb, export_dir=export_dir)
+
+        assert result.fits is True, result
+        assert result.deleted_days == ("2024-04-01",), "удаляются только самые старые дни"
+        assert result.size_bytes <= result.limit_bytes
+        assert not (export_dir / "2024-04-01.log").exists()
+        assert (export_dir / "2024-04-02.log").exists()
+        with sqlite3.connect(db_path) as conn:
+            left = {row[0] for row in conn.execute("SELECT DISTINCT day FROM logs")}
+        assert left == {"2024-04-02", "2024-04-03"}
+
+    def test_keeps_deleting_until_the_database_fits(self, tmp_path, db_path):
+        days = ("2024-04-01", "2024-04-02", "2024-04-03")
+        initial = self._payload_db(db_path, days)
+        two_days = self._reference_db(tmp_path, "two.db", days[1:])
+        one_day = self._reference_db(tmp_path, "one.db", days[2:])
+        # Лимит между «двумя днями» и «одним»: одного удалённого дня мало.
+        limit_mb = (two_days + one_day) / 2 / (1024 * 1024)
+        assert initial > two_days > one_day
+
+        result = enforce_db_size_limit(db_path, limit_mb)
+
+        assert result.fits is True, result
+        assert result.deleted_days == ("2024-04-01", "2024-04-02")
+        with sqlite3.connect(db_path) as conn:
+            left = {row[0] for row in conn.execute("SELECT DISTINCT day FROM logs")}
+        assert left == {"2024-04-03"}
+
+    def test_reports_failure_when_even_an_empty_database_does_not_fit(self, db_path):
+        result = enforce_db_size_limit(db_path, 0.001)
+
+        assert result.fits is False, "лимит мельче пустой БД — защита обязана сказать об этом"
+        assert result.deleted_days == (), "удалять нечего: строк дня нет"
+        assert result.size_bytes > result.limit_bytes
+
+    def test_deletes_every_day_when_nothing_fits_and_reports_it(self, db_path, export_dir):
+        export_dir.mkdir(parents=True)
+        for day in ("2024-04-01", "2024-04-02"):
+            _insert(db_path, day=day, ts=1711954800.0, message="row")
+            (export_dir / f"{day}.log").write_text("day\n", encoding="utf-8")
+
+        result = enforce_db_size_limit(db_path, 0.001, export_dir=export_dir)
+
+        assert result.fits is False
+        assert result.deleted_days == ("2024-04-01", "2024-04-02")
+        assert sorted(p.name for p in export_dir.iterdir()) == []
+        with sqlite3.connect(db_path) as conn:
+            assert conn.execute("SELECT COUNT(*) FROM logs").fetchone()[0] == 0
+
+    def test_negative_limit_is_rejected(self, db_path):
+        with pytest.raises(ValueError):
+            enforce_db_size_limit(db_path, -1)
