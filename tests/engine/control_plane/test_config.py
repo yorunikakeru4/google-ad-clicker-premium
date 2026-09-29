@@ -282,6 +282,79 @@ class TestPatch:
 
         assert updated.get("behavior.2captcha_apikey") == "SECRET-KEY"
 
+    @pytest.mark.parametrize("dotted", sorted(config_module._SECRET_FIELDS))
+    def test_patch_with_mask_keeps_existing_secret(self, dotted):
+        """Маска из GET-ответа означает «не менять», а не новое значение.
+
+        UI отдаёт ``to_dict()`` и может вернуть его же: до фикса
+        ``_deep_merge`` клал бы маску как значение, и следующий ``save()``
+        закреплял бы потерю ключа.
+        """
+        section, _, key = dotted.partition(".")
+        cfg = Config.from_dict(_raw(**{f"{section}__{key}": "REAL-KEY"}))
+
+        updated = cfg.patch({section: {key: SECRET_MASK}})
+
+        assert updated.get(dotted) == "REAL-KEY"
+
+    @pytest.mark.parametrize("dotted", sorted(config_module._SECRET_FIELDS))
+    def test_patch_with_empty_string_clears_secret(self, dotted):
+        """Очистка пустой строкой — осознанное действие и работает как раньше."""
+        section, _, key = dotted.partition(".")
+        cfg = Config.from_dict(_raw(**{f"{section}__{key}": "REAL-KEY"}))
+
+        updated = cfg.patch({section: {key: ""}})
+
+        assert updated.get(dotted) == ""
+
+    @pytest.mark.parametrize("dotted", sorted(config_module._SECRET_FIELDS))
+    def test_patch_with_mask_on_unset_secret_stays_unset(self, dotted):
+        """Маска по незаданному секрету не создаёт literal-значение «********»."""
+        section, _, key = dotted.partition(".")
+        cfg = Config.from_dict(_raw())
+
+        updated = cfg.patch({section: {key: SECRET_MASK}})
+
+        assert updated.get(dotted) == ""
+
+    def test_patch_of_unrelated_field_does_not_touch_secrets(self):
+        cfg = Config.from_dict(
+            _raw(behavior__2captcha_apikey="REAL-KEY", webdriver__proxy="http://user:pw@1.2.3.4:8080")
+        )
+
+        updated = cfg.patch({"behavior": {"click_order": 3}})
+
+        assert updated.get("behavior.click_order") == 3
+        assert updated.get("behavior.2captcha_apikey") == "REAL-KEY"
+        assert updated.get("webdriver.proxy") == "http://user:pw@1.2.3.4:8080"
+
+    def test_mask_patch_alone_leaves_config_unchanged(self):
+        """Патч, целиком состоящий из маски, — конфиг без изменений."""
+        cfg = Config.from_dict(
+            _raw(behavior__2captcha_apikey="REAL-KEY", webdriver__proxy="http://user:pw@1.2.3.4:8080")
+        )
+        mask_patch: dict = {}
+        for dotted in config_module._SECRET_FIELDS:
+            section, _, key = dotted.partition(".")
+            mask_patch.setdefault(section, {})[key] = SECRET_MASK
+
+        assert cfg.patch(mask_patch).as_dict() == cfg.as_dict()
+
+    def test_mask_is_special_only_for_fields_in_secret_list(self):
+        """Правило «маска = не менять» действует ровно по ``_SECRET_FIELDS``.
+
+        Несекретное поле получает строку маски как обычное значение: правило
+        не разливается по всей схеме.
+        """
+        cfg = Config.from_dict(_raw(behavior__query="shoes"))
+
+        updated = cfg.patch({"behavior": {"query": SECRET_MASK}})
+
+        assert updated.get("behavior.query") == SECRET_MASK
+        assert config_module._SECRET_FIELDS == frozenset(
+            {"behavior.2captcha_apikey", "webdriver.proxy"}
+        )
+
 
 class TestSerialization:
     """Формат наружу: секреты не уезжают, JSON всегда читаем."""
@@ -359,16 +432,43 @@ class TestFileIO:
 
         assert cfg.to_dict() == config_module.default_config()
 
-    def test_save_writes_masked_secret_placeholder(self, tmp_path):
+    @pytest.mark.parametrize("dotted", sorted(config_module._SECRET_FIELDS))
+    def test_save_writes_real_secret_and_never_the_mask(self, tmp_path, dotted):
+        """Файл — source of truth (план §1): save пишет настоящий ключ.
+
+        Обратное поведение (маска в config.json) убивало ключ навсегда:
+        после сохранения из UI и рестарта демон и legacy ``config_reader``
+        читали строку ``********``. Маска остаётся средством для HTTP-ответов.
+        """
         path = tmp_path / "config.json"
-        cfg = Config.from_dict(_raw(behavior__2captcha_apikey="REAL-KEY"))
+        section, _, key = dotted.partition(".")
+        cfg = Config.from_dict(_raw(**{f"{section}__{key}": "REAL-KEY"}))
 
         cfg.save(path)
+        text = path.read_text(encoding="utf-8")
         reloaded = Config.load(path)
 
-        assert SECRET_MASK in path.read_text(encoding="utf-8")
-        assert "REAL-KEY" not in path.read_text(encoding="utf-8")
-        assert reloaded.get("behavior.2captcha_apikey") == SECRET_MASK
+        assert "REAL-KEY" in text
+        assert SECRET_MASK not in text
+        assert reloaded.get(dotted) == "REAL-KEY"
+
+    def test_save_keeps_sorted_json_and_trailing_newline(self, tmp_path):
+        path = tmp_path / "config.json"
+
+        Config.from_dict(_raw(behavior__browser_count=3)).save(path)
+        text = path.read_text(encoding="utf-8")
+
+        assert text.endswith("}\n")
+        parsed = json.loads(text)
+        assert list(parsed) == sorted(parsed)
+        assert list(parsed["behavior"]) == sorted(parsed["behavior"])
+
+    def test_save_leaves_owner_only_permissions(self, tmp_path):
+        path = tmp_path / "config.json"
+
+        Config.from_dict(_raw(behavior__2captcha_apikey="REAL-KEY")).save(path)
+
+        assert path.stat().st_mode & 0o777 == 0o600
 
     def test_save_is_atomic_and_leaves_no_temp_file(self, tmp_path):
         path = tmp_path / "config.json"
