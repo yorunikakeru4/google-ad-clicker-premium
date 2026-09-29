@@ -2084,6 +2084,14 @@ class TestProfileAssignment:
 
         registry.created[0].exit(1)
         supervisor.tick()
+
+        assert profile_status(db_path, ids[0]) == "free", (
+            "реапер освобождает профиль мёртвого воркера — иначе пул потерял бы строку"
+        )
+        assert store.get_worker("br-1")["profile_id"] == ids[0], (
+            "ссылка переживает реапер: именно она возвращает профиль респавну"
+        )
+
         clock.advance(sup.RESTART_BACKOFF_BASE_SECONDS)
         supervisor.tick()
 
