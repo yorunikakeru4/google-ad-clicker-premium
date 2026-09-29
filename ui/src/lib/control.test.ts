@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   apiErrorMessage,
+  configRequest,
   controlRequest,
   disabledReason,
   errorMessage,
@@ -90,6 +91,14 @@ describe("controlRequest", () => {
       method: "POST",
       path: "/control/restart",
     });
+  });
+});
+
+describe("configRequest", () => {
+  it("чтение конфига — GET на /control/config без тела", () => {
+    const request = configRequest();
+    expect(request).toEqual({ method: "GET", path: "/control/config" });
+    expect(request.body).toBeUndefined();
   });
 });
 
