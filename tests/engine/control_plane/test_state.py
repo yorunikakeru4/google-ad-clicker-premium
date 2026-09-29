@@ -175,10 +175,84 @@ class TestWorkerStatusTransitions:
             "starting",
             "running",
             "backoff",
+            "degraded",
             "stopped",
             "circuit_open",
         }
         assert WORKER_STATUSES == {s.value for s in WorkerStatus}
+
+    def test_degraded_status_keeps_pid_and_records_reason(self, store, db_path):
+        """Деградация — не терминальный статус: процесс жив, причина в last_error.
+
+        Иначе PID обнулился бы, и UI показал бы умершего воркера там, где
+        процесс работает, а супервизор потерял бы объект для ротации.
+        """
+        store.register_worker("br-1", pid=1234)
+
+        store.set_status("br-1", WorkerStatus.DEGRADED, error="cdp connection lost")
+
+        row = _read(db_path, "SELECT pid, status, last_error FROM workers")[0]
+        assert row["pid"] == 1234
+        assert row["status"] == "degraded"
+        assert row["last_error"] == "cdp connection lost"
+
+
+class TestWorkerAssignment:
+    """Назначение прокси и профиля в строке воркера.
+
+    Назначение живёт ровно столько, сколько живёт процесс: спавн пишет
+    ``proxy_id``, stop/kill и ротация снимают его вместе с ``profile_id``.
+    """
+
+    def test_assign_proxy_writes_proxy_id(self, store, db_path):
+        with sqlite3.connect(db_path) as conn:
+            conn.execute("INSERT INTO proxies (host, port) VALUES ('10.0.0.1', 8080)")
+            conn.commit()
+        store.register_worker("br-1", pid=1)
+
+        store.assign_proxy("br-1", 1)
+
+        assert _read(db_path, "SELECT proxy_id FROM workers")[0]["proxy_id"] == 1
+
+    def test_release_assignment_clears_proxy_and_profile(self, store, db_path):
+        with sqlite3.connect(db_path) as conn:
+            conn.execute("INSERT INTO profiles (name) VALUES ('default')")
+            conn.execute(
+                "INSERT INTO proxies (host, port) VALUES ('10.0.0.1', 8080)"
+            )
+            conn.commit()
+        store.register_worker("br-1", pid=1)
+        with sqlite3.connect(db_path) as conn:
+            conn.execute(
+                "UPDATE workers SET proxy_id = 1, profile_id = "
+                "(SELECT id FROM profiles WHERE name = 'default') WHERE browser_id = 'br-1'"
+            )
+            conn.commit()
+
+        store.release_assignment("br-1")
+
+        row = _read(db_path, "SELECT proxy_id, profile_id FROM workers")[0]
+        assert row["proxy_id"] is None, "прокси должен освободиться"
+        assert row["profile_id"] is None, "профиль должен освободиться"
+
+    def test_release_assignment_for_unknown_worker_is_not_an_error(self, store, db_path):
+        store.register_worker("br-1", pid=1)
+
+        store.release_assignment("ghost")
+
+        assert _read(db_path, "SELECT proxy_id FROM workers")[0]["proxy_id"] is None
+
+    def test_assigning_a_deleted_proxy_leaves_no_assignment(self, store, db_path):
+        """Прокси удалили между выбором и записью — назначения не появляется.
+
+        ``DELETE`` из ``/control/proxies`` не берёт блокировку супервизора,
+        а IntegrityError посреди спавна оставил бы полузапущенный пул.
+        """
+        store.register_worker("br-1", pid=1)
+
+        store.assign_proxy("br-1", 4242)
+
+        assert _read(db_path, "SELECT proxy_id FROM workers")[0]["proxy_id"] is None
 
 
 class TestPauseFlag:
@@ -370,6 +444,21 @@ class TestSnapshot:
 
         assert snapshot["worker_count"] == 2
         assert snapshot["alive_count"] == 1
+
+    def test_snapshot_reports_degraded_worker_with_its_pid(self, store):
+        """Деградировавший воркер виден в снимке: статус, причина и живой PID.
+
+        Это путь «воркер сигналит → /state отдаёт → UI красит»: потерять
+        статус на этом участке значило бы, что сигнал воркера никому не виден.
+        """
+        store.register_worker("br-1", pid=4242)
+        store.set_status("br-1", WorkerStatus.DEGRADED, error="proxy rejected credentials")
+
+        worker = store.snapshot()["workers"][0]
+
+        assert worker["status"] == "degraded"
+        assert worker["last_error"] == "proxy rejected credentials"
+        assert worker["pid"] == 4242
 
     def test_snapshot_reflects_pause_flag(self, store):
         store.set_run_state("running")

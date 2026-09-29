@@ -27,7 +27,7 @@ from engine.control_plane.api import (
     token_from_environ,
 )
 from engine.control_plane.config import Config
-from engine.control_plane.state import StateStore
+from engine.control_plane.state import StateStore, WorkerStatus
 from engine.control_plane.supervisor import Supervisor, SupervisorSettings
 from tests.engine.control_plane.test_supervisor import FakeClock, FakeProcessRegistry
 
@@ -426,6 +426,24 @@ class TestStateEndpoint:
         _, body, _ = request(server, "/state")
 
         assert body["updated_at"] > 0
+
+    def test_state_reports_degraded_worker(self, server, store):
+        """Сигнал воркера обязан дойти до /state — иначе UI его не видит.
+
+        ``mark_degraded`` пишет строку из процесса воркера, а HTTP-ответ
+        собирает супервизорский снимок: здесь проверяется именно этот путь,
+        включая сохранение PID (деградация не убивает процесс).
+        """
+        request(server, "/control/start", method="POST", body={"workers": 1})
+        store.set_status("br-1", WorkerStatus.DEGRADED, error="cdp connection lost")
+
+        status, body, _ = request(server, "/state")
+
+        assert status == 200
+        worker = body["workers"][0]
+        assert worker["status"] == "degraded"
+        assert worker["last_error"] == "cdp connection lost"
+        assert isinstance(worker["pid"], int)
 
     def test_state_rejects_post(self, server):
         status, _, _ = request(server, "/state", method="POST")
