@@ -1,0 +1,348 @@
+"""Тесты батчевого writer'а SQLite (engine/store.py).
+
+Контракт, который здесь зафиксирован:
+
+- логи и клики буферизуются и уходят в БД батчами: по размеру или по таймеру;
+- конкурентная запись из потоков ничего не теряет, порядок внутри воркера kept;
+- close() сбрасывает остаток и безопасен повторно;
+- ошибка записи не роняет вызывающего: счётчик потерь + последняя ошибка,
+  запись продолжается.
+"""
+
+from __future__ import annotations
+
+import sqlite3
+import threading
+import time
+
+import pytest
+
+from engine.db import migrations
+from engine.store import StoreWriter
+
+
+@pytest.fixture
+def db_path(tmp_path):
+    path = tmp_path / "adclicker.db"
+    migrations.migrate(path)
+    return path
+
+
+def _read(db_path, sql, params=()):
+    with sqlite3.connect(db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        return conn.execute(sql, params).fetchall()
+
+
+def _wait_for(predicate, timeout_s=5.0):
+    """Ожидание условия без фиксированного долгого сна."""
+    deadline = time.time() + timeout_s
+    while time.time() < deadline:
+        if predicate():
+            return True
+        time.sleep(0.01)
+    return predicate()
+
+
+class TestLogBatching:
+    def test_log_visible_only_after_flush_while_batch_not_full(self, db_path):
+        writer = StoreWriter(db_path, batch_size=100, flush_interval=60.0)
+        try:
+            writer.log(level="INFO", category="click", message="hello", browser_id="br-1")
+
+            assert _read(db_path, "SELECT * FROM logs") == []
+
+            writer.flush()
+
+            rows = _read(db_path, "SELECT level, browser_id, category, message FROM logs")
+            assert [(r["level"], r["browser_id"], r["category"], r["message"]) for r in rows] == [
+                ("INFO", "br-1", "click", "hello")
+            ]
+        finally:
+            writer.close()
+
+    def test_log_fields_and_ts_round_trip(self, db_path):
+        writer = StoreWriter(db_path, batch_size=100, flush_interval=60.0)
+        try:
+            writer.log(
+                level="WARNING",
+                category="proxy",
+                message="slow",
+                browser_id="br-2",
+                fields='{"latency_ms": 900}',
+                ts=1700000000.5,
+            )
+            writer.flush()
+
+            rows = _read(db_path, "SELECT ts, level, browser_id, category, message, fields FROM logs")
+            assert len(rows) == 1
+            assert rows[0]["ts"] == 1700000000.5
+            assert rows[0]["level"] == "WARNING"
+            assert rows[0]["browser_id"] == "br-2"
+            assert rows[0]["category"] == "proxy"
+            assert rows[0]["message"] == "slow"
+            assert rows[0]["fields"] == '{"latency_ms": 900}'
+        finally:
+            writer.close()
+
+    def test_batch_size_triggers_automatic_flush(self, db_path):
+        writer = StoreWriter(db_path, batch_size=3, flush_interval=60.0)
+        try:
+            writer.log(level="INFO", category="click", message="m1", browser_id="br-1")
+            writer.log(level="INFO", category="click", message="m2", browser_id="br-1")
+            assert _read(db_path, "SELECT COUNT(*) AS n FROM logs")[0]["n"] == 0
+
+            writer.log(level="INFO", category="click", message="m3", browser_id="br-1")
+
+            rows = _read(db_path, "SELECT message FROM logs ORDER BY id")
+            assert [r["message"] for r in rows] == ["m1", "m2", "m3"]
+        finally:
+            writer.close()
+
+    def test_flush_interval_triggers_timed_flush(self, db_path):
+        writer = StoreWriter(db_path, batch_size=1000, flush_interval=0.05)
+        try:
+            writer.log(level="INFO", category="scheduler", message="tick", browser_id="br-1")
+
+            assert _wait_for(
+                lambda: len(_read(db_path, "SELECT * FROM logs")) == 1
+            ), "таймер не сбросил батч"
+        finally:
+            writer.close()
+
+    def test_click_values_round_trip(self, db_path):
+        writer = StoreWriter(db_path, batch_size=100, flush_interval=60.0)
+        try:
+            writer.record_click(
+                url="https://example.com/a",
+                query="shoes",
+                category="search",
+                browser_id="br-1",
+                http_status=200,
+                ts=1700000001.0,
+            )
+            writer.flush()
+
+            rows = _read(
+                db_path,
+                "SELECT ts, url, query, category, browser_id, http_status FROM clicks",
+            )
+            assert len(rows) == 1
+            assert rows[0]["ts"] == 1700000001.0
+            assert rows[0]["url"] == "https://example.com/a"
+            assert rows[0]["query"] == "shoes"
+            assert rows[0]["category"] == "search"
+            assert rows[0]["browser_id"] == "br-1"
+            assert rows[0]["http_status"] == 200
+        finally:
+            writer.close()
+
+
+class TestConcurrency:
+    def test_concurrent_writers_lose_nothing_and_keep_per_worker_order(self, db_path):
+        writer = StoreWriter(db_path, batch_size=7, flush_interval=0.02)
+        worker_ids = ["br-1", "br-2", "br-3", "br-4"]
+        per_worker = 25
+
+        def work(browser_id):
+            for i in range(per_worker):
+                writer.log(
+                    level="INFO",
+                    category="click",
+                    message=f"{browser_id}-{i:03d}",
+                    browser_id=browser_id,
+                )
+            writer.heartbeat(browser_id)
+
+        threads = [threading.Thread(target=work, args=(bid,)) for bid in worker_ids]
+        try:
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join()
+            writer.flush()
+        finally:
+            writer.close()
+
+        rows = _read(db_path, "SELECT COUNT(*) AS n FROM logs")[0]["n"]
+        assert rows == len(worker_ids) * per_worker
+
+        for browser_id in worker_ids:
+            messages = [
+                r["message"]
+                for r in _read(
+                    db_path,
+                    "SELECT message FROM logs WHERE browser_id = ? ORDER BY id",
+                    (browser_id,),
+                )
+            ]
+            assert messages == [f"{browser_id}-{i:03d}" for i in range(per_worker)]
+
+        heartbeats = {
+            r["browser_id"]: r["heartbeat_at"]
+            for r in _read(db_path, "SELECT browser_id, heartbeat_at FROM workers")
+        }
+        assert set(heartbeats) == set(worker_ids)
+        assert all(value is not None for value in heartbeats.values())
+
+
+class TestClose:
+    def test_close_flushes_remainder_and_second_close_is_safe(self, db_path):
+        writer = StoreWriter(db_path, batch_size=100, flush_interval=60.0)
+        writer.log(level="INFO", category="cleanup", message="last", browser_id="br-1")
+        writer.record_click(url="https://example.com/last", browser_id="br-1")
+
+        writer.close()
+        writer.close()
+
+        assert _read(db_path, "SELECT COUNT(*) AS n FROM logs")[0]["n"] == 1
+        assert _read(db_path, "SELECT COUNT(*) AS n FROM clicks")[0]["n"] == 1
+
+    def test_write_after_close_does_not_raise_and_counts_dropped(self, db_path):
+        writer = StoreWriter(db_path, batch_size=100, flush_interval=60.0)
+        writer.close()
+
+        writer.log(level="INFO", category="click", message="late", browser_id="br-1")
+
+        assert writer.dropped == 1
+        assert writer.last_error is not None
+        assert _read(db_path, "SELECT COUNT(*) AS n FROM logs")[0]["n"] == 0
+
+
+class TestWriteErrors:
+    def test_closed_db_does_not_raise_and_counts_losses(self, db_path):
+        writer = StoreWriter(db_path, batch_size=100, flush_interval=60.0)
+        try:
+            writer.log(level="INFO", category="click", message="m1", browser_id="br-1")
+            writer.flush()
+            assert writer.dropped == 0
+            assert _read(db_path, "SELECT COUNT(*) AS n FROM logs")[0]["n"] == 1
+
+            # Ломаем соединение из-под writer'а: имитация закрытой/битой БД.
+            writer._conn.close()
+
+            writer.log(level="INFO", category="click", message="m2", browser_id="br-1")
+            writer.flush()
+
+            assert writer.dropped == 1
+            assert writer.last_error is not None
+        finally:
+            writer.close()
+
+    def test_writer_keeps_accepting_records_after_error(self, db_path):
+        writer = StoreWriter(db_path, batch_size=100, flush_interval=60.0)
+        try:
+            writer._conn.close()
+
+            writer.log(level="INFO", category="click", message="m1", browser_id="br-1")
+            writer.flush()
+            dropped_after_first = writer.dropped
+
+            # Воркер продолжает работать: второй вызов тоже не роняет.
+            writer.log(level="INFO", category="click", message="m2", browser_id="br-1")
+            writer.flush()
+
+            assert writer.dropped == dropped_after_first + 1
+            assert writer.last_error is not None
+        finally:
+            writer.close()
+
+    def test_heartbeat_error_does_not_raise(self, db_path):
+        writer = StoreWriter(db_path, batch_size=100, flush_interval=60.0)
+        try:
+            writer._conn.close()
+
+            writer.heartbeat("br-1")
+
+            assert writer.dropped >= 1
+            assert writer.last_error is not None
+        finally:
+            writer.close()
+
+
+class TestRunsAndHeartbeat:
+    def test_start_add_finish_run_round_trip(self, db_path):
+        from engine.control_plane.state import StateStore
+
+        state = StateStore(db_path)
+        worker_id = state.register_worker("br-1", pid=100)
+
+        writer = StoreWriter(db_path, batch_size=100, flush_interval=60.0)
+        try:
+            run_id = writer.start_run(worker_id)
+            assert isinstance(run_id, int) and run_id > 0
+
+            writer.add_run_counts(run_id, clicks=2, captcha_seen=1, captcha_solved=1)
+            writer.finish_run(run_id, status="ok")
+
+            rows = _read(
+                db_path,
+                "SELECT status, total_clicks, captcha_seen, captcha_solved, ended_at "
+                "FROM runs WHERE id = ?",
+                (run_id,),
+            )
+            assert len(rows) == 1
+            assert rows[0]["status"] == "ok"
+            assert rows[0]["total_clicks"] == 2
+            assert rows[0]["captcha_seen"] == 1
+            assert rows[0]["captcha_solved"] == 1
+            assert rows[0]["ended_at"] is not None
+        finally:
+            writer.close()
+
+    def test_heartbeat_updates_workers_row(self, db_path):
+        from engine.control_plane.state import StateStore
+
+        state = StateStore(db_path)
+        state.register_worker("br-1", pid=100)
+
+        writer = StoreWriter(db_path, batch_size=100, flush_interval=60.0)
+        try:
+            before = time.time()
+            writer.heartbeat("br-1")
+
+            rows = _read(db_path, "SELECT heartbeat_at FROM workers WHERE browser_id = 'br-1'")
+            assert len(rows) == 1
+            assert rows[0]["heartbeat_at"] >= before
+        finally:
+            writer.close()
+
+    def test_heartbeat_visible_without_prior_register(self, db_path):
+        """Воркер может стукнуть раньше, чем супервизор зарегистрировал строку."""
+        writer = StoreWriter(db_path, batch_size=100, flush_interval=60.0)
+        try:
+            writer.heartbeat("br-new")
+
+            rows = _read(db_path, "SELECT browser_id, heartbeat_at FROM workers")
+            assert [(r["browser_id"], r["heartbeat_at"] is not None) for r in rows] == [
+                ("br-new", True)
+            ]
+        finally:
+            writer.close()
+
+    def test_start_run_failure_returns_none_and_counts(self, db_path):
+        from engine.control_plane.state import StateStore
+
+        state = StateStore(db_path)
+        worker_id = state.register_worker("br-1", pid=100)
+
+        writer = StoreWriter(db_path, batch_size=100, flush_interval=60.0)
+        try:
+            writer._state = None  # ломаем путь runs: имитация недоступности БД
+
+            assert writer.start_run(worker_id) is None
+            assert writer.dropped >= 1
+            assert writer.last_error is not None
+        finally:
+            writer._state = StateStore(db_path)
+            writer.close()
+
+
+class TestConstructor:
+    def test_rejects_non_positive_batch_size(self, db_path):
+        with pytest.raises(ValueError):
+            StoreWriter(db_path, batch_size=0, flush_interval=1.0)
+
+    def test_rejects_non_positive_flush_interval(self, db_path):
+        with pytest.raises(ValueError):
+            StoreWriter(db_path, batch_size=10, flush_interval=0)
