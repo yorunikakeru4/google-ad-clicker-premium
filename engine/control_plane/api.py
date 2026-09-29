@@ -41,6 +41,14 @@ from engine.control_plane.supervisor import (
     SupervisorError,
     WorkerSpawnError,
 )
+from engine.proxy_health import CheckInProgressError, ProxyHealthChecker
+from engine.proxy_pool import (
+    ProxyError,
+    ProxyImportError,
+    ProxyInUseError,
+    ProxyNotFoundError,
+    ProxyPool,
+)
 
 # Имя переменной окружения с токеном.
 TOKEN_ENV_VAR = "ADCLICKER_CONTROL_TOKEN"
@@ -75,6 +83,12 @@ _ERROR_STATUS = {
     InvalidWorkerCountError: ("invalid_worker_count", 400),
     WorkerSpawnError: ("worker_spawn_failed", 503),
     ConfigError: ("invalid_config", 400),
+    # Подсистема прокси: конфликт состояния, отсутствующая строка и ошибка
+    # импорта. Каждый код — из контракта /control/proxies*, а не выдуман.
+    ProxyInUseError: ("proxy_in_use", 409),
+    ProxyNotFoundError: ("proxy_not_found", 404),
+    ProxyImportError: ("proxy_import_failed", 400),
+    CheckInProgressError: ("check_in_progress", 409),
 }
 
 
@@ -157,6 +171,10 @@ class ControlPlaneHandler(BaseHTTPRequestHandler):
     config: Config
     config_path: Path
     token: str
+    proxy_pool: ProxyPool
+    # Any, а не ProxyHealthChecker: тесты подменяют проверяющий объект
+    # фейком, а супервизорской нотации для duck-typing здесь не требуется.
+    proxy_checker: Any
 
     def do_GET(self) -> None:  # noqa: N802 - имя задано BaseHTTPRequestHandler
         self._dispatch("GET")
@@ -198,6 +216,11 @@ class ControlPlaneHandler(BaseHTTPRequestHandler):
             # это ValueError, и без неё невалидный конфиг уехал бы в 500.
             # 400 с перечнем полей — единственный полезный ответ здесь.
             self._send_json(400, _error("invalid_config", str(exc), problems=exc.problems))
+        except ProxyError as exc:
+            # Ошибки пула прокси: сообщения уже безопасны (без кредов),
+            # здесь только перевод типа в код и статус.
+            code, status = _error_status(exc)
+            self._send_json(status, _error(code, str(exc)))
         except SupervisorError as exc:
             code, status = _error_status(exc)
             self._send_json(status, _error(code, str(exc)))
@@ -285,6 +308,34 @@ class ControlPlaneHandler(BaseHTTPRequestHandler):
         type(self).config = updated
         self._send_json(200, {"config": updated.to_dict()})
 
+    def _handle_proxies_list(self) -> None:
+        # Креды маскируются внутри list_proxies: ответ уходит в UI наружу.
+        self._send_json(200, {"proxies": self.proxy_pool.list_proxies()})
+
+    def _handle_proxies_add(self) -> None:
+        self._send_json(200, self.proxy_pool.add_lines(self._requested_lines()))
+
+    def _handle_proxies_import(self) -> None:
+        # Тело читается, чтобы битый JSON дал привычный 400, но его
+        # содержимое игнорируется: путь берётся только из конфига.
+        self._read_optional_object()
+        path = str(self.config.get("paths.proxy_file") or "")
+        if not path:
+            raise ProxyImportError(
+                "paths.proxy_file не задан в конфиге — импорт из файла невозможен"
+            )
+        self._send_json(200, self.proxy_pool.import_file(path))
+
+    def _handle_proxies_delete(self) -> None:
+        self.proxy_pool.delete(self._requested_proxy_id())
+        self._send_json(200, {"deleted": True})
+
+    def _handle_proxies_check(self) -> None:
+        self._read_optional_object()
+        # CheckInProgressError отсюда уходит в 409 check_in_progress.
+        self.proxy_checker.start()
+        self._send_json(200, {"started": True})
+
     # --- вспомогательное -------------------------------------------------
 
     def _requested_worker_count(self) -> int:
@@ -302,6 +353,41 @@ class ControlPlaneHandler(BaseHTTPRequestHandler):
         if isinstance(workers, bool) or not isinstance(workers, int):
             raise InvalidRequestError("поле workers должно быть целым числом")
         return workers
+
+    def _requested_lines(self) -> list[str]:
+        """Список строк из тела запроса.
+
+        Пустое тело — ошибка, а не пустой импорт: молчаливый ``added: 0``
+        на нажатую кнопку выглядел бы как «всё добавлено, ничего не найдено».
+        """
+        raw = self._read_json_body()
+        if not isinstance(raw, dict):
+            raise InvalidRequestError("ожидается объект с полем lines")
+        lines = raw.get("lines")
+        if not isinstance(lines, list):
+            raise InvalidRequestError("поле lines должно быть списком строк")
+        if not all(isinstance(item, str) for item in lines):
+            raise InvalidRequestError("поле lines должно быть списком строк")
+        return lines
+
+    def _requested_proxy_id(self) -> int:
+        raw = self._read_json_body()
+        if not isinstance(raw, dict):
+            raise InvalidRequestError("ожидается объект с полем id")
+        proxy_id = raw.get("id")
+        # bool — подкласс int: JSON true не должно пройти как id=1.
+        if isinstance(proxy_id, bool) or not isinstance(proxy_id, int):
+            raise InvalidRequestError("поле id должно быть целым числом")
+        return proxy_id
+
+    def _read_optional_object(self) -> dict[str, Any]:
+        """Тело-объект для endpoint'ов с пустым или необязательным телом."""
+        raw = self._read_json_body()
+        if raw is None:
+            return {}
+        if not isinstance(raw, dict):
+            raise InvalidRequestError("ожидается JSON-объект")
+        return raw
 
     def _read_json_object(self) -> dict[str, Any]:
         raw = self._read_json_body()
@@ -397,6 +483,11 @@ _ROUTES: dict[tuple[str, str], str] = {
     ("POST", "/control/restart"): "_handle_restart",
     ("GET", "/control/config"): "_handle_config_get",
     ("POST", "/control/config"): "_handle_config_post",
+    ("GET", "/control/proxies"): "_handle_proxies_list",
+    ("POST", "/control/proxies"): "_handle_proxies_add",
+    ("POST", "/control/proxies/import"): "_handle_proxies_import",
+    ("POST", "/control/proxies/delete"): "_handle_proxies_delete",
+    ("POST", "/control/proxies/check"): "_handle_proxies_check",
 }
 
 
@@ -427,6 +518,8 @@ class ControlPlaneServer:
         config_path: str | Path,
         host: str = LOOPBACK_HOST,
         port: int = 0,
+        proxy_pool: ProxyPool | None = None,
+        proxy_checker: Any = None,
     ):
         if not _is_loopback(host):
             raise ValueError(
@@ -441,6 +534,16 @@ class ControlPlaneServer:
         self.config = config
         self.token = token
         self.config_path = Path(config_path)
+        # Пул прокси по умолчанию строится на той же БД, что и супервизор:
+        # сервер не знает про путь к базе иначе, чем через его store.
+        self.proxy_pool = (
+            proxy_pool if proxy_pool is not None else ProxyPool(supervisor.store.db_path)
+        )
+        self.proxy_checker = (
+            proxy_checker
+            if proxy_checker is not None
+            else ProxyHealthChecker(self.proxy_pool)
+        )
         self.host = host
         self.requested_port = port
         self.port = port
@@ -485,6 +588,8 @@ class ControlPlaneServer:
                 "config": self.config,
                 "config_path": self.config_path,
                 "token": self.token,
+                "proxy_pool": self.proxy_pool,
+                "proxy_checker": self.proxy_checker,
             },
         )
         return bound
