@@ -197,11 +197,24 @@ class TestWorkerStatusTransitions:
         assert row["last_error"] == "cdp connection lost"
 
 
+def _assign_both(store, db_path):
+    """Строка воркера с прокси и профилем — состояние после спавна."""
+    with sqlite3.connect(db_path) as conn:
+        conn.execute("INSERT INTO profiles (name) VALUES ('default')")
+        conn.execute("INSERT INTO proxies (host, port) VALUES ('10.0.0.1', 8080)")
+        conn.commit()
+    store.register_worker("br-1", pid=1)
+    store.assign_proxy("br-1", 1)
+    store.assign_profile("br-1", 1)
+
+
 class TestWorkerAssignment:
     """Назначение прокси и профиля в строке воркера.
 
-    Назначение живёт ровно столько, сколько живёт процесс: спавн пишет
-    ``proxy_id``, stop/kill и ротация снимают его вместе с ``profile_id``.
+    Два разных события, поэтому и два метода: ротация и спавн без прокси
+    снимают только ``proxy_id`` (``release_proxy``), а stop/kill/circuit-open
+    снимают оба поля (``release_assignment``) — в паре с
+    ``ProfilePool.release``, который освобождает статус профиля.
     """
 
     def test_assign_proxy_writes_proxy_id(self, store, db_path):
@@ -214,20 +227,44 @@ class TestWorkerAssignment:
 
         assert _read(db_path, "SELECT proxy_id FROM workers")[0]["proxy_id"] == 1
 
-    def test_release_assignment_clears_proxy_and_profile(self, store, db_path):
+    def test_assign_profile_writes_profile_id(self, store, db_path):
         with sqlite3.connect(db_path) as conn:
             conn.execute("INSERT INTO profiles (name) VALUES ('default')")
-            conn.execute(
-                "INSERT INTO proxies (host, port) VALUES ('10.0.0.1', 8080)"
-            )
             conn.commit()
         store.register_worker("br-1", pid=1)
-        with sqlite3.connect(db_path) as conn:
-            conn.execute(
-                "UPDATE workers SET proxy_id = 1, profile_id = "
-                "(SELECT id FROM profiles WHERE name = 'default') WHERE browser_id = 'br-1'"
-            )
-            conn.commit()
+
+        store.assign_profile("br-1", 1)
+
+        assert _read(db_path, "SELECT profile_id FROM workers")[0]["profile_id"] == 1
+
+    def test_assigning_a_deleted_profile_leaves_no_assignment(self, store, db_path):
+        """Профиль удалили между выдачей и записью — IntegrityError посреди
+        спавна оставил бы полузапущенный пул, как и в assign_proxy."""
+        store.register_worker("br-1", pid=1)
+
+        store.assign_profile("br-1", 4242)
+
+        assert _read(db_path, "SELECT profile_id FROM workers")[0]["profile_id"] is None
+
+    def test_release_proxy_clears_only_the_proxy(self, store, db_path):
+        """Ротация прокси не должна трогать профиль воркера."""
+        _assign_both(store, db_path)
+
+        store.release_proxy("br-1")
+
+        row = _read(db_path, "SELECT proxy_id, profile_id FROM workers")[0]
+        assert row["proxy_id"] is None, "прокси должен освободиться"
+        assert row["profile_id"] == 1, "профиль остаётся за воркером"
+
+    def test_release_proxy_for_unknown_worker_is_not_an_error(self, store, db_path):
+        store.register_worker("br-1", pid=1)
+
+        store.release_proxy("ghost")
+
+        assert _read(db_path, "SELECT proxy_id FROM workers")[0]["proxy_id"] is None
+
+    def test_release_assignment_clears_proxy_and_profile(self, store, db_path):
+        _assign_both(store, db_path)
 
         store.release_assignment("br-1")
 

@@ -356,6 +356,20 @@ class ProfilePool:
             rows = conn.execute(sql).fetchall()
         return [_row_to_dict(row) for row in rows]
 
+    def assigned_profile_ids(self) -> set[int]:
+        """Id профилей, которые должны держать воркеры (``assigned``/``active``).
+
+        Точка входа для реапера: один запрос на тик вместо выборки всех
+        строк, дальше супервизор сравнивает множество с реально живыми
+        держателями. Пустое множество означает «освобождать нечего», и тик не
+        тратит ни одной записи.
+        """
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT id FROM profiles WHERE status IN ('assigned', 'active') ORDER BY id"
+            ).fetchall()
+        return {int(row["id"]) for row in rows}
+
     # --- удаление --------------------------------------------------------
 
     def delete(self, profile_id: Any) -> None:

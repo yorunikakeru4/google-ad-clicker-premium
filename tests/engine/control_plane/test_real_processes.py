@@ -570,9 +570,10 @@ class TestRealProxyRotation:
     """Ротация на настоящих процессах.
 
     Решение принимает супервизор, но проверяется оно по тому, что получает
-    НОВЫЙ процесс: ``ADCLICKER_PROXY`` читается напрямую из окружения живого
-    PID (``psutil``), а не из логов и не из записей супервизора — иначе тест
-    подтвердил бы только то, что демон себе записал.
+    НОВЫЙ процесс: ``ADCLICKER_PROXY`` и ``ADCLICKER_PROFILE_ID`` читаются
+    напрямую из окружения живого PID (``psutil``), а не из логов и не из
+    записей супервизора — иначе тест подтвердил бы только то, что демон себе
+    записал.
     """
 
     def test_degraded_real_worker_respawns_with_a_different_proxy_env(
@@ -616,10 +617,10 @@ class TestRealProxyRotation:
             "alice:s3cr3t@10.0.0.1:8080"
         )
         with store._connect() as conn:
-            conn.execute("INSERT INTO profiles (name) VALUES ('default')")
+            cursor = conn.execute("INSERT INTO profiles (name) VALUES ('default')")
+            profile_id = int(cursor.lastrowid)
             conn.execute(
-                "UPDATE workers SET profile_id = (SELECT id FROM profiles WHERE name = 'default') "
-                "WHERE browser_id = 'br-1'"
+                "UPDATE workers SET profile_id = ? WHERE browser_id = 'br-1'", (profile_id,)
             )
             conn.commit()
 
@@ -636,7 +637,18 @@ class TestRealProxyRotation:
         )
         worker = store.get_worker("br-1")
         assert worker["proxy_id"] == second_id
-        assert worker["profile_id"] is None, "профиль освобождается при ротации"
+        # Мотивация правки фазы 5: раньше ротация звала release_assignment и
+        # сбрасывала профиль вместе с прокси — новый процесс уезжал в чужую
+        # страну уже без аккаунта. Теперь меняется только прокси.
+        assert worker["profile_id"] == profile_id, "профиль переживает ротацию"
+        assert psutil.Process(second_pid).environ()["ADCLICKER_PROFILE_ID"] == str(
+            profile_id
+        ), "новый процесс обязан получить тот же профиль"
+        with store._connect() as conn:
+            status = conn.execute(
+                "SELECT status FROM profiles WHERE id = ?", (profile_id,)
+            ).fetchone()["status"]
+        assert status == "assigned"
 
         with store._connect() as conn:
             rows = conn.execute(
