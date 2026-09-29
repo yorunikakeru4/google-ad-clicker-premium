@@ -4,8 +4,11 @@ import sys
 from time import sleep
 from datetime import datetime
 
-from logger import logger
 from config_reader import config
+from engine.log import get_logger
+
+
+log = get_logger()
 
 
 def _inside_running_interval() -> bool:
@@ -51,13 +54,21 @@ def main() -> None:
 
         if not _inside_running_interval():
             start_time = config.behavior.running_interval_start
-            logger.info(f"Outside of the running interval. Waiting {start_time} to start...")
+            log.info(
+                "scheduler",
+                "Outside of the running interval. Waiting to start...",
+                fields={"start_time": start_time},
+            )
             sleep(60)
             continue
 
         subprocess.run(command)
 
-        logger.info(f"Sleeping {config.behavior.loop_wait_time} seconds...")
+        log.info(
+            "scheduler",
+            "Sleeping...",
+            fields={"seconds": config.behavior.loop_wait_time},
+        )
         sleep(config.behavior.loop_wait_time)
 
 
@@ -66,9 +77,13 @@ if __name__ == "__main__":
     try:
         main()
     except Exception as exp:
-        logger.error("Exception occurred. See the details in the log file.")
+        log.error("scheduler", "Exception occurred. See the details in the log file.")
 
         message = str(exp).split("\n")[0]
-        logger.debug(f"Exception: {message}")
+        log.debug("scheduler", "Exception", fields={"error": message})
         details = traceback.format_tb(exp.__traceback__)
-        logger.debug(f"Exception details: \n{''.join(details)}")
+        log.debug(
+            "scheduler",
+            "Exception details:",
+            fields={"traceback": "".join(details)},
+        )

@@ -1,6 +1,9 @@
 import subprocess
 
-from logger import logger
+from engine.log import get_logger
+
+
+log = get_logger()
 
 
 class ADBController:
@@ -29,7 +32,7 @@ class ADBController:
                 raise SystemExit("No device was found! Please connect at least 1 device.")
 
             for device in self.devices:
-                logger.debug(f"Android device: {device}")
+                log.debug("browser", "Android device", fields={"device": device})
 
         except Exception as exp:
             raise Exception(f"An error occurred while running: '{' '.join(command)}'") from exp
@@ -62,9 +65,13 @@ class ADBController:
             result = subprocess.run(command, capture_output=True, text=True)
 
             if result.returncode == 0:
-                logger.info(f"URL[{url}] was successfully opened on device[{device_id}]")
+                log.info(
+                    "browser",
+                    "URL was successfully opened on device",
+                    fields={"url": url, "device_id": device_id},
+                )
             else:
-                logger.error(f"Error opening URL: {result.stderr}")
+                log.error("browser", "Error opening URL", fields={"stderr": result.stderr})
 
         except Exception as exp:
             raise Exception(f"An error occurred while running: '{' '.join(command)}'") from exp
@@ -82,9 +89,17 @@ class ADBController:
             result = subprocess.run(command, capture_output=True, text=True)
 
             if result.returncode == 0:
-                logger.debug(f"Key event[{keycode}] was successfully sent.")
+                log.debug(
+                    "browser",
+                    "Key event was successfully sent.",
+                    fields={"keycode": keycode},
+                )
             else:
-                logger.error(f"Couldn't send key event: {result.stderr}")
+                log.error(
+                    "browser",
+                    "Couldn't send key event",
+                    fields={"stderr": result.stderr},
+                )
 
         except Exception as exp:
             raise Exception(f"An error occurred while running: '{' '.join(command)}'") from exp
@@ -120,7 +135,7 @@ class ADBController:
             result = subprocess.run(command, capture_output=True, text=True)
 
             if result.returncode != 0:
-                logger.error(f"Error during swipe: {result.stderr}")
+                log.error("browser", "Error during swipe", fields={"stderr": result.stderr})
 
         except Exception as exp:
             raise Exception(f"An error occurred while running: '{' '.join(command)}'") from exp
@@ -135,9 +150,13 @@ class ADBController:
             result = subprocess.run(command, capture_output=True, text=True)
 
             if result.returncode == 0:
-                logger.debug("Back key event was successfully sent.")
+                log.debug("browser", "Back key event was successfully sent.")
             else:
-                logger.error(f"Couldn't send key event: {result.stderr}")
+                log.error(
+                    "browser",
+                    "Couldn't send key event",
+                    fields={"stderr": result.stderr},
+                )
 
         except Exception as exp:
             raise Exception(f"An error occurred while running: '{' '.join(command)}'") from exp

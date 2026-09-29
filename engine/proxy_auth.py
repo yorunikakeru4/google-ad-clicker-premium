@@ -24,12 +24,12 @@ max_failures`` прокси считается мёртвым и один раз
 
 from __future__ import annotations
 
-import logging
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable
 
 from engine.cdp import CdpClient, resolve_browser_ws_url
+from engine.log import get_logger
 
 __all__ = [
     "DEFAULT_PROXY_TRANSPORT",
@@ -46,7 +46,7 @@ __all__ = [
     "start_proxy_auth",
 ]
 
-logger = logging.getLogger(__name__)
+log = get_logger()
 
 PROXY_TRANSPORT_CDP_AUTH = "cdp_auth"
 PROXY_TRANSPORT_EXTENSION = "extension"
@@ -160,7 +160,7 @@ class ProxyAuthManager:
         # Без patterns: иначе CDP перехватит весь трафик и вкладки встанут.
         self._client.send("Fetch.enable", {"handleAuthRequests": True})
         self._started = True
-        logger.info("proxy CDP auth enabled (user %s)", mask_secret(self._username))
+        log.info("proxy", "proxy CDP auth enabled", fields={"user": mask_secret(self._username)})
         return self
 
     def stop(self) -> None:
@@ -185,18 +185,22 @@ class ProxyAuthManager:
         request_id = params.get("requestId")
         challenge = params.get("authChallenge")
         if not isinstance(request_id, str) or not request_id:
-            logger.debug("Fetch.authRequired without requestId, ignoring")
+            log.debug("proxy", "Fetch.authRequired without requestId, ignoring")
             return
         if not isinstance(challenge, dict):
             challenge = {}
         source = challenge.get("source")
         scheme = challenge.get("scheme")
         if source != "Proxy" or scheme not in _SUPPORTED_SCHEMES:
-            logger.debug("non-proxy auth challenge (source=%r scheme=%r), cancelling", source, scheme)
+            log.debug(
+                "proxy",
+                "non-proxy auth challenge, cancelling",
+                fields={"source": source, "scheme": scheme},
+            )
             self._cancel(request_id)
             return
         if request_id in self._answered:
-            logger.info("proxy auth rejected for request, cancelling")
+            log.info("proxy", "proxy auth rejected for request, cancelling")
             self._cancel(request_id)
             self._register_failure()
             return
@@ -212,7 +216,7 @@ class ProxyAuthManager:
                 },
             },
         )
-        logger.debug("answered proxy auth challenge")
+        log.debug("proxy", "answered proxy auth challenge")
 
     def _cancel(self, request_id: str) -> None:
         self._client.send(
@@ -226,7 +230,11 @@ class ProxyAuthManager:
             self._dead = True
         if self._dead and not self._dead_notified:
             self._dead_notified = True
-            logger.warning("proxy marked dead after %d auth failures", self._fail_count)
+            log.warning(
+                "proxy",
+                "proxy marked dead after auth failures",
+                fields={"fail_count": self._fail_count},
+            )
             if self._on_proxy_dead is not None:
                 self._on_proxy_dead()
 

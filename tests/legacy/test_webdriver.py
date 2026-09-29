@@ -97,7 +97,7 @@ def test_quit_does_not_raise_when_browser_kill_fails_unexpectedly(monkeypatch):
         raise ValueError("unexpected kill failure")
 
     monkeypatch.setattr(webdriver.os, "kill", boom)
-    monkeypatch.setattr(webdriver.logger, "debug", lambda *args, **kwargs: None)
+    monkeypatch.setattr(webdriver.log, "debug", lambda *args, **kwargs: None)
 
     driver.quit()
 
@@ -112,7 +112,7 @@ def test_quit_logs_swallowed_kill_error_instead_of_silencing_it(monkeypatch):
         raise ValueError("unexpected kill failure")
 
     monkeypatch.setattr(webdriver.os, "kill", boom)
-    monkeypatch.setattr(webdriver.logger, "debug", lambda *args, **kwargs: records.append((args, kwargs)))
+    monkeypatch.setattr(webdriver.log, "debug", lambda *args, **kwargs: records.append((args, kwargs)))
 
     driver.quit()
 
