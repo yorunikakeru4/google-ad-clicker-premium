@@ -184,6 +184,28 @@ pub struct DiagnosticRow {
     pub suspicion_flags: Option<String>,
 }
 
+/// Строка `captcha_events` для ленты CAPTCHA на Dashboard: когда случилось,
+/// кто и на какой странице, решилась капча или нет и где лежит скриншот.
+///
+/// Колонки — контракт таблицы `captcha_events` из `engine/db/schema.sql`.
+/// `solved` хранится в БД как INTEGER (0/1) и выходит в JSON булевым:
+/// фронт читает его как правду об исходе решения, а не как число.
+/// `sitekey` и `solver` приходят как есть — UI показывает их в строке
+/// события, не интерпретируя.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct CaptchaEventRow {
+    pub id: i64,
+    pub ts: f64,
+    pub browser_id: Option<String>,
+    pub proxy_id: Option<i64>,
+    pub page_url: Option<String>,
+    pub sitekey: Option<String>,
+    pub screenshot_path: Option<String>,
+    pub solved: bool,
+    pub solver: Option<String>,
+    pub elapsed_ms: Option<i64>,
+}
+
 /// Читатель боевой БД: одно соединение, строго на чтение.
 ///
 /// Соединение не разделяется между потоками (`SQLITE_OPEN_NO_MUTEX`):
@@ -454,6 +476,51 @@ impl DbReader {
                     browser_version: row.get(13)?,
                     headers: row.get(14)?,
                     suspicion_flags: row.get(15)?,
+                })
+            })
+            .map_err(read_failed)?;
+
+        rows.map(|row| row.map_err(read_failed)).collect()
+    }
+
+    /// Последние события CAPTCHA — лента на Dashboard.
+    ///
+    /// Порядок `ts DESC, id DESC` — как у логов: свежее событие первым, а
+    /// равный `ts` разрывается id (свежевставленная строка впереди).
+    /// `limit = 0` возвращает пустой список; значения выше
+    /// [`MAX_LOGS_LIMIT`] усекаются до того же потолка, что и у логов, —
+    /// экран не должен выгружать в память всю историю событий.
+    pub fn list_captcha_events(&self, limit: u32) -> Result<Vec<CaptchaEventRow>, DbError> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let limit = limit.min(MAX_LOGS_LIMIT);
+
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT id, ts, browser_id, proxy_id, page_url, sitekey, \
+                        screenshot_path, solved, solver, elapsed_ms \
+                   FROM captcha_events \
+                  ORDER BY ts DESC, id DESC \
+                  LIMIT ?1",
+            )
+            .map_err(read_failed)?;
+
+        let rows = stmt
+            .query_map([limit], |row| {
+                let solved: i64 = row.get(7)?;
+                Ok(CaptchaEventRow {
+                    id: row.get(0)?,
+                    ts: row.get(1)?,
+                    browser_id: row.get(2)?,
+                    proxy_id: row.get(3)?,
+                    page_url: row.get(4)?,
+                    sitekey: row.get(5)?,
+                    screenshot_path: row.get(6)?,
+                    solved: solved != 0,
+                    solver: row.get(8)?,
+                    elapsed_ms: row.get(9)?,
                 })
             })
             .map_err(read_failed)?;
