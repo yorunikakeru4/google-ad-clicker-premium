@@ -399,6 +399,20 @@ class TestLogging:
         rows = _read(db_path, "SELECT level FROM logs")
         assert rows[0]["level"] == "INFO"
 
+    def test_log_row_gets_the_local_day_of_its_timestamp(self, store, db_path):
+        """Записи демона обязаны жить в day: иначе экспорт и retention их не видят.
+
+        Второй писатель в `logs` (помимо StoreWriter) со своим INSERT —
+        классический способ получить NULL-день и вечнорастущую таблицу.
+        """
+        before = time.strftime("%Y-%m-%d", time.localtime())
+
+        store.log("INFO", "api", "tick")
+
+        after = time.strftime("%Y-%m-%d", time.localtime())
+        rows = _read(db_path, "SELECT day FROM logs")
+        assert rows[0]["day"] in {before, after}
+
 
 class TestRunRecords:
     """Записи о запусках сценария: по одной строке на запуск воркера."""
