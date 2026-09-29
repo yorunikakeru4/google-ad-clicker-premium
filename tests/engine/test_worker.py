@@ -13,6 +13,7 @@ engine.worker``). Он заменяет собой и ``run_in_loop.py`` (окн
 from __future__ import annotations
 
 import threading
+import time
 from collections.abc import Callable
 from datetime import time as clock_time
 
@@ -25,6 +26,8 @@ from engine.store import StoreWriter
 from engine.worker import (
     EXIT_CONFIG_ERROR,
     EXIT_OK,
+    WORKER_HEARTBEAT_INTERVAL_SECONDS,
+    HeartbeatSender,
     ScenarioRequest,
     ScheduleSettings,
     SourceError,
@@ -697,3 +700,133 @@ def test_startup_failure_reason_is_written_to_the_db(monkeypatch, tmp_path):
     ]
     assert rows, "причина неудачного старта должна попасть в logs"
     assert rows[0]["browser_id"] == "br-4"
+
+
+# --- heartbeat воркера ------------------------------------------------------
+
+
+def worker_heartbeat(db_path, browser_id: str) -> float | None:
+    import sqlite3
+
+    with sqlite3.connect(db_path) as conn:
+        row = conn.execute(
+            "SELECT heartbeat_at FROM workers WHERE browser_id = ?", (browser_id,)
+        ).fetchone()
+    return None if row is None else float(row[0])
+
+
+def test_main_writes_growing_heartbeat_while_running(tmp_path, monkeypatch):
+    """Воркер стучит в БД сам, пока крутит сценарии.
+
+    Только живой процесс может подтвердить, что его цикл работает:
+    супервизор heartbeat не пишет, он наблюдает за ростом ``heartbeat_at`` и
+    по его отсутствию помечает воркера зависшим. Интервал укорочен, чтобы
+    тест не ждал боевые 5 секунд.
+    """
+    import engine.worker as worker_module
+
+    monkeypatch.setattr(worker_module, "WORKER_HEARTBEAT_INTERVAL_SECONDS", 0.01)
+    db_path = tmp_path / "heartbeat.db"
+    stop = threading.Event()
+    source = FakeSource()
+    samples: list[float | None] = []
+
+    def sample(_request: ScenarioRequest) -> None:
+        samples.append(worker_heartbeat(db_path, "br-7"))
+        written = [value for value in samples if value is not None]
+        if (len(written) >= 2 and max(written) > min(written)) or len(samples) >= 200:
+            stop.set()
+
+    source.on_scenario = sample
+    code = main(
+        ["--browser-id", "br-7", "--db", str(db_path)],
+        source_factory=lambda: source,
+        stop_event=stop,
+    )
+
+    written = [value for value in samples if value is not None]
+    assert code == EXIT_OK
+    assert written, "воркер обязан завести строку heartbeat'ом — писать её больше некому"
+    assert max(written) > min(written), "heartbeat_at должен расти во время работы цикла"
+
+
+def test_main_stops_heartbeat_before_closing_the_writer(tmp_path):
+    """Поток heartbeat обязан погаснуть до close(): иначе он мог бы дописать
+    запись в закрытый writer, а сам — остаться жить в процессе."""
+
+    def heartbeat_threads() -> set[int | None]:
+        return {
+            thread.ident
+            for thread in threading.enumerate()
+            if thread.name == "worker-heartbeat" and thread.is_alive()
+        }
+
+    before = heartbeat_threads()
+    stop = threading.Event()
+    source = FakeSource()
+    source.on_scenario = lambda request: stop.set()
+
+    main(
+        ["--browser-id", "br-1", "--db", str(tmp_path / "hb-close.db")],
+        source_factory=lambda: source,
+        stop_event=stop,
+    )
+
+    assert heartbeat_threads() == before, (
+        "после main() не должно прибавиться живых worker-heartbeat: "
+        f"было {len(before)}, стало {len(heartbeat_threads())}"
+    )
+
+
+def test_worker_heartbeat_stays_below_the_supervisor_stale_threshold():
+    """Контракт между двумя константами: воркер пишет чаще, чем супервизор
+    объявляет зависание, иначе живой воркер погиб бы от ложного срабатывания.
+
+    Константы при этом намеренно свои в каждом модуле, а не импортированные:
+    воркер не должен тянуть настройки супервизора (тот тянет пул прокси и
+    базу демона).
+    """
+    from engine.control_plane import supervisor as sup
+
+    assert WORKER_HEARTBEAT_INTERVAL_SECONDS == 5.0
+    assert WORKER_HEARTBEAT_INTERVAL_SECONDS < sup.DEFAULT_STALE_AFTER_SECONDS
+
+
+def test_heartbeat_thread_survives_a_failing_writer(db_path):
+    """Ошибка записи не убивает поток: молчаливая смерть heartbeat выглядела
+    бы как зависание воркера, и супервизор убил бы работающий процесс."""
+
+    class FailingWriter(StoreWriter):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.attempts = 0
+
+        def heartbeat(self, browser_id: str, now: float | None = None) -> None:
+            self.attempts += 1
+            raise RuntimeError("sqlite exploded")
+
+    writer = FailingWriter(db_path, flush_interval=10.0)
+    try:
+        sender = HeartbeatSender(writer, "br-1", interval=0.01)
+        sender.start()
+        deadline = time.monotonic() + 5.0
+        while writer.attempts < 3 and time.monotonic() < deadline:
+            time.sleep(0.01)
+
+        assert writer.attempts >= 3, "поток обязан пережить ошибку и продолжить стучать"
+        assert sender.is_running, "поток не должен умирать после исключения"
+
+        writer.flush()
+        rows = [
+            row
+            for row in read_logs(db_path)
+            if row["message"] == "worker heartbeat write failed"
+        ]
+        assert rows, "причина сбоя записи heartbeat должна попасть в logs"
+        assert rows[0]["level"] == "ERROR"
+        assert rows[0]["browser_id"] == "br-1"
+
+        sender.stop()
+        assert sender.is_running is False
+    finally:
+        writer.close()

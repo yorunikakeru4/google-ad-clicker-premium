@@ -62,6 +62,22 @@ time.sleep(300)
 # Падает сразу с кодом 1, ничего не записав: сценарий "воркер сломан".
 IMMEDIATE_FAILURE = "raise SystemExit(1)\n"
 
+# Стучит heartbeat'ом через настоящий StoreWriter — ровно то, что делает
+# engine.worker фоновым потоком. DB и репозиторий приходят аргументами:
+# заглушка живёт в отдельном процессе и не может импортировать тестовые
+# константы. Пишется каждые 50 мс, чтобы тест не ждал боевой интервал.
+HEARTBEATING_SLEEPER = """
+import os, sys, time
+with open(sys.argv[1], "a", encoding="utf-8") as handle:
+    handle.write(f"{sys.argv[2]}:{os.getpid()}\\n")
+sys.path.insert(0, sys.argv[4])
+from engine.store import StoreWriter
+writer = StoreWriter(sys.argv[3])
+while True:
+    writer.heartbeat(sys.argv[2])
+    time.sleep(0.05)
+"""
+
 BROWSER_IDS = ["br-1", "br-2", "br-3"]
 
 
@@ -256,22 +272,78 @@ class TestRealWorkersRunTogether:
 
 
 class TestRealHeartbeat:
-    """Heartbeat доходит до БД по настоящим PID."""
+    """Heartbeat доходит до БД по настоящим PID.
 
-    def test_heartbeat_is_written_for_every_real_worker(self, store, pid_file, cleanup_pids):
+    Пишет его воркер (``StoreWriter.heartbeat``), супервизор только наблюдает.
+    Обе стороны контракта проверяются на настоящих процессах: рост
+    ``heartbeat_at`` от самого процесса и отсутствие записей от супервизора.
+    """
+
+    def test_worker_writes_growing_heartbeat_for_every_real_worker(
+        self, store, db_path, pid_file, cleanup_pids
+    ):
+        repo_root = str(Path(__file__).resolve().parents[3])
         supervisor = make_real_supervisor(
-            store, pid_file, lambda bid: _recorder_command(pid_file, bid)
+            store,
+            pid_file,
+            lambda bid: [
+                sys.executable,
+                "-c",
+                HEARTBEATING_SLEEPER,
+                str(pid_file),
+                bid,
+                str(db_path),
+                repo_root,
+            ],
         )
 
         supervisor.start(3)
         assert _wait_until(lambda: len(started_records(pid_file)) == 3)
         supervisor.tick()
+        before = {w["browser_id"]: w["heartbeat_at"] for w in store.list_workers()}
+        assert len(before) == 3
+        assert all(value is not None for value in before.values())
+        assert all(w["status"] == WorkerStatus.RUNNING.value for w in store.list_workers())
 
-        workers = store.list_workers()
-        assert len(workers) == 3
-        assert all(w["heartbeat_at"] is not None for w in workers)
-        assert all(w["status"] == WorkerStatus.RUNNING.value for w in workers)
+        assert _wait_until(
+            lambda: all(
+                worker["heartbeat_at"] > before[worker["browser_id"]]
+                for worker in store.list_workers()
+            )
+        ), f"воркеры обязаны писать heartbeat в рабочем цикле: {store.list_workers()}"
 
+        supervisor.tick()
+
+        assert all(
+            supervisor._workers[browser_id].last_heartbeat
+            == store.get_worker(browser_id)["heartbeat_at"]
+            for browser_id in before
+        ), "наблюдение супервизора обязано увидеть запись воркера"
+
+        supervisor.stop()
+
+    def test_supervisor_does_not_write_heartbeat_for_a_silent_worker(
+        self, store, pid_file, cleanup_pids
+    ):
+        """Воркер молчит — супервизор не пишет за него.
+
+        Писал бы — обновлял бы отметку сам и обнулял возраст перед проверкой
+        stale, и зависший процесс остался бы незамеченным.
+        """
+        supervisor = make_real_supervisor(
+            store, pid_file, lambda bid: _recorder_command(pid_file, bid)
+        )
+        supervisor.start(1)
+        assert _wait_until(lambda: len(started_records(pid_file)) == 1)
+        first = store.get_worker("br-1")["heartbeat_at"]
+
+        time.sleep(supervisor.settings.heartbeat_interval * 3)
+        supervisor.tick()
+        supervisor.tick()
+
+        assert store.get_worker("br-1")["heartbeat_at"] == first, (
+            "супервизор наблюдает за heartbeat, а не пишет его от имени воркера"
+        )
         supervisor.stop()
 
     def test_stale_real_worker_is_marked_backoff_and_restarted(self, store, pid_file, cleanup_pids):

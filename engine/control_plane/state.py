@@ -251,6 +251,11 @@ class StateStore:
 
         Только heartbeat_at: остальные поля воркера в этот момент меняться не
         должны, иначе UI видел бы скачущий started_at.
+
+        В бою heartbeat воркера пишет ``StoreWriter.heartbeat`` (upsert со
+        стороны самого процесса), а супервизор только читает эти значения
+        через :meth:`heartbeats`. Метод остаётся записью уровня хранилища
+        для строк, которые уже поставил супервизор.
         """
         stamp = time.time() if now is None else now
         with self._connect() as conn:
@@ -260,6 +265,24 @@ class StateStore:
                     (stamp, browser_id),
                 )
                 conn.commit()
+
+    def heartbeats(self) -> dict[str, float]:
+        """Читает ``heartbeat_at`` всех воркеров одним запросом.
+
+        Нужно супервизору на каждом тике: воркер пишет heartbeat сам, а
+        демон наблюдает за ростом значения, чтобы отличить работающий
+        процесс от зависшего. Один SELECT вместо запроса на воркера — тик и
+        так держит лок супервизора, а пул ограничен потолком воркеров.
+
+        Строки без отметки (теоретически: register_worker всегда ставит
+        ``heartbeat_at``) не попадают в результат — для наблюдения это
+        «ещё не стучал», а не «нулевое время».
+        """
+        with self._connect() as conn:
+            rows = conn.execute(
+                "SELECT browser_id, heartbeat_at FROM workers WHERE heartbeat_at IS NOT NULL"
+            ).fetchall()
+        return {row["browser_id"]: float(row["heartbeat_at"]) for row in rows}
 
     def delete_worker(self, browser_id: str) -> None:
         with self._connect() as conn:

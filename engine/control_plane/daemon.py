@@ -198,8 +198,9 @@ class Daemon:
                 stop_event = getattr(thread, "stop_event", None)
                 if stop_event is not None:
                     stop_event.set()
-                # Ждём поток: иначе он может дописать heartbeat в БД уже после
-                # того, как демон объявил себя остановленным.
+                # Ждём поток: иначе он может дописать в БД статусы, логи и
+                # рестарты уже после того, как демон объявил себя
+                # остановленным. Heartbeat он не пишет — его пишут воркеры.
                 thread.join(timeout=SHUTDOWN_GRACE_SECONDS)
             self._supervisor_thread = None
 
