@@ -54,6 +54,18 @@ in-memory ``last_heartbeat`` строго по факту роста значе�
 рестартов: повторная деградация сразу после подмены не превращается в
 плотный цикл.
 
+**Назначение профиля.** Каждый спавн (первый, респавн после падения, ротация
+прокси) начинается с ``ProfilePool.take_for_worker``: выданный профиль уходит
+воркеру в ``ADCLICKER_PROFILE_ID`` (десятичный id), а его собственный
+``proxy_id`` становится ``ADCLICKER_PROXY`` — приоритетнее выбора из пула,
+потому что аккаунт не должен уезжать в чужую геолокацию. Профиль переживает
+и падение, и ротацию: полный релиз (``ProfilePool.release`` +
+``release_assignment``) делается только на stop/kill и при раскрытии circuit
+breaker. Страховка от потери назначения — реапер в ``tick()``: профиль, чей
+воркер умер, удалён из реестра или не стучал heartbeat'ом, возвращается в
+пул, но ``workers.profile_id`` остаётся — это память, благодаря которой
+респавн получает тот же профиль.
+
 **Лексика ``proxy_usage.result``** (пишется только здесь, значений больше нет):
 
 * ``assigned`` — выдача при спавне/респавне;
@@ -74,6 +86,7 @@ from dataclasses import dataclass
 from typing import Any, Protocol
 
 from engine.control_plane.state import StateStore, WorkerStatus
+from engine.profile_pool import ProfilePool
 from engine.proxy_pool import ProxyError, ProxyPool
 
 # Кадр наблюдения: так часто супервизор читает heartbeat'ы воркеров из БД
@@ -87,6 +100,12 @@ HEARTBEAT_INTERVAL_SECONDS = 5.0
 # user:pass@host:port. Дублируется, а не импортируется из engine.worker:
 # тот тянет selenium, а супервизор обязан оставаться бесплатным от браузера.
 PROXY_ENV = "ADCLICKER_PROXY"
+
+# Env-контракт профиля: десятичный id строки profiles, без ведущих нулей и
+# без форматирования — ровно то, что печатает INTEGER PRIMARY KEY. Читает
+# воркер/legacy (следующая волна), поэтому значение не кодируется ни во что
+# ещё. Дублируется, а не импортируется, по той же причине, что и PROXY_ENV.
+PROFILE_ENV = "ADCLICKER_PROFILE_ID"
 
 # Лексика proxy_usage.result, которую пишет супервизор (см. докстринг модуля).
 PROXY_USAGE_ASSIGNED = "assigned"
@@ -367,6 +386,7 @@ class Supervisor:
         command_for: Callable[[str], list[str]] = default_command,
         env_for: Callable[[str], dict[str, str]] | None = None,
         proxy_pool: ProxyPool | None = None,
+        profile_pool: ProfilePool | None = None,
     ):
         self.store = store
         self.settings = settings or SupervisorSettings()
@@ -380,6 +400,12 @@ class Supervisor:
         # до этой фичи. Демон передаёт свой (общий с /control/proxies).
         self.proxy_pool = (
             proxy_pool if proxy_pool is not None else ProxyPool(store.db_path)
+        )
+        # Профили — та же схема, что и у прокси: экземпляр по умолчанию
+        # строится на той же БД, а демон передаёт свой (общий с
+        # /control/profiles), чтобы выдача и HTTP не расходились.
+        self.profile_pool = (
+            profile_pool if profile_pool is not None else ProfilePool(store.db_path)
         )
         self._workers: dict[str, _Worker] = {}
         self._pool_size = 0
@@ -444,9 +470,19 @@ class Supervisor:
             )
 
     def _start_worker(self, browser_id: str, restart_count: int) -> None:
-        picked = self._pick_proxy(browser_id, allow_shared=True)
-        proxy = None if picked is None else picked[0]
-        process = self._spawn_checked(browser_id, proxy)
+        # Профиль берётся ДО спавна: он и его прокси уходят в env процесса,
+        # а выбор прокси профилю проигрывает (см. _pick_spawn_proxy).
+        profile = self._take_profile(browser_id)
+        try:
+            picked = self._pick_spawn_proxy(browser_id, profile)
+            proxy = None if picked is None else picked[0]
+            process = self._spawn_checked(browser_id, proxy, profile)
+        except BaseException:
+            # Спавн не состоялся: профиль нельзя оставить назначенным на
+            # воркера, которого не будет, — иначе пул потеряет строку навсегда.
+            if profile is not None:
+                self.profile_pool.release(profile["id"])
+            raise
         now = self._clock.wall()
         worker_id = self.store.register_worker(browser_id, process.pid, now=now)
         self._workers[browser_id] = _Worker(
@@ -458,9 +494,11 @@ class Supervisor:
             next_start_at=now,
             run_id=self.store.start_run(worker_id),
         )
-        # Назначение — строго после register_worker: assign_proxy делает
-        # UPDATE существующей строки, а для нового воркера её ещё нет.
+        # Назначение — строго после register_worker: assign_proxy и
+        # assign_profile делают UPDATE существующей строки, а для нового
+        # воркера её ещё нет.
         self._bind_proxy(browser_id, picked)
+        self._bind_profile(browser_id, profile)
         self.store.log(
             "INFO",
             "supervisor",
@@ -468,6 +506,94 @@ class Supervisor:
             {"pid": process.pid, "restart_count": restart_count},
             browser_id=browser_id,
         )
+
+    # --- профили: выдача, env, релиз --------------------------------------
+
+    def _take_profile(self, browser_id: str) -> dict[str, Any] | None:
+        """Берёт профиль под спавн. ``None`` — брать нечего.
+
+        Если у воркера осталась ссылка на профиль, который выдать нельзя
+        (заблокирован оператором или отобран живым соседом), ссылка гасится:
+        воркер без профиля не должен выглядеть в БД как владеющий им.
+        """
+        profile = self.profile_pool.take_for_worker(browser_id)
+        if profile is None:
+            self.profile_pool.release_for_worker(browser_id)
+        return profile
+
+    def _bind_profile(self, browser_id: str, profile: dict[str, Any] | None) -> None:
+        """Крепит выданный профиль к строке воркера и пишет лог.
+
+        Вызывается после ``register_worker`` — иначе UPDATE не найдёт строки.
+        В лог уходят только id: ``key_ref`` (ссылка на ключ) и креды прокси
+        в ``logs`` не пишутся.
+        """
+        if profile is None:
+            return
+        self.store.assign_profile(browser_id, profile["id"])
+        self.store.log(
+            "INFO",
+            "browser",
+            "profile assigned",
+            {"profile_id": profile["id"], "proxy_id": profile.get("proxy_id")},
+            browser_id=browser_id,
+        )
+
+    def _release_profile(self, browser_id: str) -> None:
+        """Полный релиз профиля воркера: статус в пул, ссылка — в NULL.
+
+        Вызывается там, где процесс кончается насовсем (stop, kill,
+        circuit-open). Ротация сюда не ходит.
+        """
+        stored = self.store.get_worker(browser_id)
+        profile_id = None if stored is None else stored["profile_id"]
+        if profile_id is None:
+            return
+        if self.profile_pool.release_for_worker(browser_id):
+            self.store.log(
+                "INFO",
+                "browser",
+                "profile released",
+                {"profile_id": profile_id},
+                browser_id=browser_id,
+            )
+
+    def _pick_spawn_proxy(
+        self, browser_id: str, profile: dict[str, Any] | None
+    ) -> tuple[dict[str, Any], str] | None:
+        """Прокси спавна: профильный приоритетнее пула.
+
+        У аккаунта свой прокси — геолокация, часовой пояс и язык привязаны к
+        нему, и подмена на «свободный живой» из пула означала бы выход
+        аккаунта из своей страны. Пул используется, только когда у профиля
+        нет прокси либо его строка исчезла/помечена мёртвой.
+        """
+        from_profile = self._profile_proxy(browser_id, profile)
+        if from_profile is not None:
+            return from_profile
+        return self._pick_proxy(browser_id, allow_shared=True)
+
+    def _profile_proxy(
+        self, browser_id: str, profile: dict[str, Any] | None
+    ) -> tuple[dict[str, Any], str] | None:
+        if profile is None or not profile.get("proxy_id"):
+            return None
+        proxy_id = profile["proxy_id"]
+        proxy = self.proxy_pool.get(proxy_id)
+        # get() с настоящими кредами (список их маскирует), и между чтениями
+        # строку могли удалить. Жизнеспособность проверяется той же
+        # колонкой, что и в _pick_proxy: мёртвый прокси не выдаётся никому.
+        unavailable = proxy is None or proxy["is_alive"] != 1
+        if unavailable:
+            self.store.log(
+                "WARNING",
+                "proxy",
+                "profile proxy unavailable, worker falls back to the pool",
+                {"profile_id": profile["id"], "proxy_id": proxy_id},
+                browser_id=browser_id,
+            )
+            return None
+        return proxy, PROXY_USAGE_ASSIGNED
 
     # --- прокси: выбор, выдача, ротация -----------------------------------
 
@@ -529,7 +655,9 @@ class Supervisor:
         Вызывается после ``register_worker`` — иначе UPDATE не найдёт строки.
         """
         if picked is None:
-            self.store.release_assignment(browser_id)
+            # Только прокси: спавн без прокси — не событие смерти процесса,
+            # и профиль, выданный перед спавном, обязан уцелеть.
+            self.store.release_proxy(browser_id)
             if self.proxy_pool.list_proxies():
                 # Пул непустой, но живых строк нет: воркер работает без
                 # прокси не по своему выбору, и это должно быть видно.
@@ -676,7 +804,20 @@ class Supervisor:
             return
 
         self._finish_run(worker, "stopped", "proxy rotated")
-        process = self._spawn_checked(browser_id, proxy)
+        # Профиль переживает ротацию: новый процесс получает тот же профиль
+        # и тот же env. release_assignment здесь НЕ вызывается — именно он в
+        # фазе 5 сбрасывал профиль вместе с прокси, и воркер продолжал работу
+        # уже без аккаунта (план.md, фаза 6 «Привязка профиля»).
+        profile = self._take_profile(browser_id)
+        try:
+            process = self._spawn_checked(browser_id, proxy, profile)
+        except BaseException:
+            # Старый процесс уже погаш, новый не поднялся: без отката профиль
+            # остался бы назначенным на воркера, у которого нет ни процесса,
+            # ни следующего тика (исключение убивает цикл run_idle).
+            if profile is not None:
+                self.profile_pool.release(profile["id"])
+            raise
         worker.process = process
         worker.started_at = now
         worker.last_heartbeat = now
@@ -689,13 +830,12 @@ class Supervisor:
             base=self.settings.restart_backoff_base,
             maximum=self.settings.restart_backoff_max,
         )
-        # register_worker ставит status=starting и не трогает proxy_id,
-        # поэтому назначение пишется явно — тем же кодом, что и на спавне.
-        # release_assignment идёт первым: профиль прошлой сессии должен
-        # освободиться, а не переехать на нового воркера (план, фаза 5).
+        # register_worker ставит status=starting и не трогает proxy_id и
+        # profile_id, поэтому назначения пишутся явно — тем же кодом, что и
+        # на спавне.
         self.store.register_worker(browser_id, process.pid, now=now)
-        self.store.release_assignment(browser_id)
         self.store.assign_proxy(browser_id, proxy["id"])
+        self._bind_profile(browser_id, profile)
         self._record_proxy_use(
             proxy["id"],
             browser_id,
@@ -737,7 +877,12 @@ class Supervisor:
             )
         return not worker.is_alive()
 
-    def _spawn_checked(self, browser_id: str, proxy: dict[str, Any] | None) -> ProcessLike:
+    def _spawn_checked(
+        self,
+        browser_id: str,
+        proxy: dict[str, Any] | None,
+        profile: dict[str, Any] | None = None,
+    ) -> ProcessLike:
         """Запуск с приведением любой ошибки ОС к WorkerSpawnError.
 
         Подменяемая фабрика (в тестах и в будущем пути запуска) может бросить
@@ -745,15 +890,18 @@ class Supervisor:
         HTTP отдаст 500 там, где положен 503 с понятным текстом.
 
         Окружение воркера достраивается здесь, а не в ``env_for``: выбор
-        прокси принимается до спавна (иначе нечем снабдить процесс), а
-        ``env_for`` остаётся точкой подмены для тестов. ``ADCLICKER_PROXY``
-        сначала снимается — наследие из окружения демона не должно обходить
-        пул — и только потом выставляется назначенное значение.
+        прокси и профиля принимаются до спавна (иначе нечем снабдить процесс),
+        а ``env_for`` остаётся точкой подмены для тестов. Обе переменные
+        сначала снимаются — наследие из окружения демона не должно обходить
+        пулы, — и только потом выставляются назначенные значения.
         """
         env = dict(self._env_for(browser_id))
         env.pop(PROXY_ENV, None)
+        env.pop(PROFILE_ENV, None)
         if proxy is not None:
             env[PROXY_ENV] = proxy_env_value(proxy)
+        if profile is not None:
+            env[PROFILE_ENV] = str(profile["id"])
         try:
             return self._spawn(browser_id, self._command_for(browser_id), env)
         except SupervisorError:
@@ -824,9 +972,11 @@ class Supervisor:
             worker = self._workers.pop(browser_id)
             if not worker.circuit_open:
                 self.store.set_status(browser_id, WorkerStatus.STOPPED)
-            # Назначение снимается вместе со смертью процесса: прокси
-            # освобождается для других, а профиль — для respawn, который
-            # поднимет нового воркера уже с чистым profile_id.
+            # Полный релиз: процесс кончается насовсем, прокси возвращается в
+            # пул, а профиль — в очередь на выдачу. Порядок важен:
+            # release_assignment обнуляет profile_id, поэтому пул читает
+            # ссылку раньше.
+            self._release_profile(browser_id)
             self.store.release_assignment(browser_id)
 
     def restart(self, count: int) -> list[str]:
@@ -895,8 +1045,55 @@ class Supervisor:
         with self._lock:
             self._observe_heartbeats()
             self._mark_stale_workers()
+            # Реапер идёт ПОСЛЕ stale-логики и ДО разбора падений: к этому
+            # моменту зависший процесс уже погашен, а падение ещё не
+            # оформлено — страховка видит ровно то, что видит и stale.
+            self._reap_profiles()
             for browser_id, worker in list(self._workers.items()):
                 self._reconcile(browser_id, worker)
+
+    def _reap_profiles(self) -> None:
+        """Возвращает в пул профили, чьи воркеры мертвы, удалены или протухли.
+
+        Страховка от потери назначения: пул статусов не знает ни о процессах,
+        ни о реестре — только супервизор решает, кто жив. Условия живости
+        совпадают со stale-логикой: процесс должен быть жив, воркер не должен
+        стоять в раскрытой цепи, а heartbeat — не протухнуть.
+
+        ``workers.profile_id`` при этом не трогается (см.
+        ``ProfilePool.reap``): это память о прошлом назначении, без которой
+        респавн получил бы чужой профиль. Ссылку гасит выдача профиля
+        другому воркеру и полный релиз.
+        """
+        assigned = self.profile_pool.assigned_profile_ids()
+        if not assigned:
+            return
+        live = self._live_profile_ids()
+        reaped = self.profile_pool.reap(live)
+        if reaped:
+            self.store.log(
+                "WARNING",
+                "browser",
+                "profile released: worker is gone",
+                {"profile_ids": sorted(assigned - live), "count": reaped},
+            )
+
+    def _live_profile_ids(self) -> set[int]:
+        """Профили, которые держат живые воркеры, — по реестру и heartbeat."""
+        profile_by_browser = {
+            row["browser_id"]: row["profile_id"] for row in self.store.list_workers()
+        }
+        now = self._clock.wall()
+        live: set[int] = set()
+        for browser_id, worker in self._workers.items():
+            if worker.circuit_open or not worker.is_alive():
+                continue
+            if now - worker.last_heartbeat > self.settings.stale_after_seconds:
+                continue
+            profile_id = profile_by_browser.get(browser_id)
+            if profile_id is not None:
+                live.add(profile_id)
+        return live
 
     def _observe_heartbeats(self) -> None:
         """Переносит heartbeat'ы из БД в память. Наблюдение, а не запись.
@@ -1093,16 +1290,28 @@ class Supervisor:
         self._finish_run(worker, "crashed", reason)
         # Воркер убит и без явного рестарта не поднимется — значит, прокси и
         # профиль принадлежат уже никому: освобождаем, как и на stop.
+        self._release_profile(browser_id)
         self.store.release_assignment(browser_id)
         del self._workers[browser_id]
 
     def _restart_worker(self, browser_id: str, worker: _Worker) -> None:
-        # Прокси выбирается заново, а не берётся из строки: назначение могло
-        # освободиться или стать мёртвым, пока воркер сидел в backoff.
-        # Своё же (если оно живо) возвращается — чужое не берётся никогда.
-        picked = self._pick_proxy(browser_id, allow_shared=True)
-        proxy = None if picked is None else picked[0]
-        process = self._spawn_checked(browser_id, proxy)
+        # Профиль: приоритет прошлому назначению — упавший и поднятый заново
+        # продолжает работать с тем же аккаунтом. Прокси для пула выбирается
+        # заново, а не берётся из строки: назначение могло освободиться или
+        # стать мёртвым, пока воркер сидел в backoff; своё же (если оно живо)
+        # возвращается — чужое не берётся никогда.
+        profile = self._take_profile(browser_id)
+        try:
+            picked = self._pick_spawn_proxy(browser_id, profile)
+            proxy = None if picked is None else picked[0]
+            process = self._spawn_checked(browser_id, proxy, profile)
+        except BaseException:
+            # Исключение из респавна уходит через tick() наружу и останавливает
+            # цикл run_idle — реапер-страховки после него не будет, поэтому
+            # профиль освобождается здесь же.
+            if profile is not None:
+                self.profile_pool.release(profile["id"])
+            raise
         now = self._clock.wall()
         worker.process = process
         worker.started_at = now
@@ -1118,6 +1327,7 @@ class Supervisor:
         self.store.register_worker(browser_id, process.pid, now=now)
         self.store.set_status(browser_id, WorkerStatus.STARTING)
         self._bind_proxy(browser_id, picked)
+        self._bind_profile(browser_id, profile)
         self.store.log(
             "INFO",
             "supervisor",

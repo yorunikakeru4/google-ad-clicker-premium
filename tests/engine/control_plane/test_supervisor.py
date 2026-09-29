@@ -10,12 +10,15 @@ terminate, kill, код возврата.
 подставленные часы, поэтому тесты не спят и не мигают.
 """
 
+import json
 import threading
 
 import pytest
 
 from engine.control_plane import supervisor as sup
 from engine.control_plane.state import StateStore, WorkerStatus
+from engine.db import migrations
+from engine.profile_pool import ProfilePool
 from engine.proxy_pool import ProxyPool
 from engine.store import StoreWriter
 
@@ -1417,8 +1420,10 @@ def all_log_text(store) -> str:
 
 
 def assign_profile(store, browser_id, name="default"):
+    """Назначает профиль воркера ровно в том виде, в каком это делает пул:
+    строка ``profiles`` в статусе ``assigned`` и ссылка ``workers.profile_id``."""
     with store._connect() as conn:
-        conn.execute("INSERT INTO profiles (name) VALUES (?)", (name,))
+        conn.execute("INSERT INTO profiles (name, status) VALUES (?, 'assigned')", (name,))
         profile_id = conn.execute(
             "SELECT id FROM profiles WHERE name = ?", (name,)
         ).fetchone()["id"]
@@ -1428,6 +1433,36 @@ def assign_profile(store, browser_id, name="default"):
         )
         conn.commit()
     return profile_id
+
+
+def profile_status(db_path, profile_id) -> str | None:
+    conn = migrations.connect(db_path)
+    try:
+        row = conn.execute("SELECT status FROM profiles WHERE id = ?", (profile_id,)).fetchone()
+        return None if row is None else row["status"]
+    finally:
+        conn.close()
+
+
+def profile_rows(db_path) -> list[dict]:
+    conn = migrations.connect(db_path)
+    try:
+        return [dict(row) for row in conn.execute("SELECT * FROM profiles ORDER BY id").fetchall()]
+    finally:
+        conn.close()
+
+
+def browser_logs(store, level=None):
+    """Логи профилей (категория browser) — зеркало proxy_logs."""
+    with store._connect() as conn:
+        rows = conn.execute(
+            "SELECT level, category, browser_id, message, fields FROM logs "
+            "WHERE category = 'browser' ORDER BY id"
+        ).fetchall()
+    logs = [dict(row) for row in rows]
+    if level is None:
+        return logs
+    return [row for row in logs if row["level"] == level]
 
 
 class TestProxyAssignment:
@@ -1555,13 +1590,16 @@ class TestProxyAssignment:
         pool.add_lines(["alice:s3cr3t@10.0.0.1:8080"])
         supervisor = make_supervisor(store, registry, clock, settings)
         supervisor.start(1)
-        assign_profile(store, "br-1")
+        profile_id = assign_profile(store, "br-1")
 
         supervisor.stop()
 
         worker = store.get_worker("br-1")
         assert worker["proxy_id"] is None, "после stop прокси должен быть свободен"
         assert worker["profile_id"] is None, "профиль должен освободиться при остановке"
+        assert profile_status(db_path, profile_id) == "free", (
+            "полный релиз на stop обязан вернуть профиль в пул"
+        )
 
     def test_open_circuit_releases_proxy(self, store, clock, db_path):
         pool = make_pool(db_path)
@@ -1765,9 +1803,16 @@ class TestProxyRotation:
         assert worker["proxy_id"] == ids[0], "чужой занятый прокси не годится в резерв"
         assert len(registry.created) == 1
 
-    def test_rotation_frees_the_profile_and_leaves_other_workers_alone(
+    def test_rotation_keeps_the_profile_and_leaves_other_workers_alone(
         self, store, registry, clock, settings, db_path
     ):
+        """Ротация меняет только прокси.
+
+        Мотивация правки фазы 5: ``release_assignment`` чистил оба поля, и
+        подмена прокси сбрасывала профиль воркера — воркер продолжал работу
+        уже без аккаунта, а профиль уходил в пул к чужому браузеру. Профиль
+        переживает ротацию; полный релиз остаётся на stop/circuit-open.
+        """
         pool = make_pool(db_path)
         pool.add_lines(
             [
@@ -1779,7 +1824,7 @@ class TestProxyRotation:
         ids = [row["id"] for row in pool.list_proxies()]
         supervisor = make_supervisor(store, registry, clock, settings)
         supervisor.start(2)
-        assign_profile(store, "br-1")
+        profile_id = assign_profile(store, "br-1")
         second_pid = store.get_worker("br-2")["pid"]
 
         degrade(db_path, "br-1")
@@ -1787,7 +1832,10 @@ class TestProxyRotation:
 
         rotated = store.get_worker("br-1")
         assert rotated["proxy_id"] == ids[2], "резерв — свободный живой прокси"
-        assert rotated["profile_id"] is None, "при ротации профиль освобождается"
+        assert rotated["profile_id"] == profile_id, (
+            "ротация прокси не должна сбрасывать профиль воркера"
+        )
+        assert profile_status(db_path, profile_id) == "assigned"
         untouched = store.get_worker("br-2")
         assert untouched["proxy_id"] == ids[1]
         assert untouched["status"] == WorkerStatus.RUNNING.value
@@ -1861,3 +1909,351 @@ class TestProxyRotation:
             (ids[0], "assigned"),
             (ids[0], "assigned"),
         ]
+
+
+# --- профили ----------------------------------------------------------------
+
+
+def add_profiles(db_path, *names):
+    """Свободные профили через пул, возвращает их id по порядку."""
+    pool = ProfilePool(db_path)
+    result = pool.add_profiles([{"name": name} for name in names])
+    assert result["added"] == len(names), result
+    return [row["id"] for row in profile_rows(db_path)]
+
+
+def env_of(registry, call=-1):
+    return registry.start_calls[call]["env"]
+
+
+class TestProfileAssignment:
+    """Выдача профиля при спавне: env, профильный прокси, лог, откат.
+
+    Контракт: супервизор передаёт ``ADCLICKER_PROFILE_ID`` (десятичный id) и,
+    если у профиля есть свой прокси, делает его ``ADCLICKER_PROXY`` —
+    приоритетнее выбора из пула. Нет профиля — переменной нет вовсе, даже
+    если она досталась демону из окружения.
+    """
+
+    def test_spawn_takes_a_profile_and_passes_its_id_via_env(
+        self, store, registry, clock, settings, db_path
+    ):
+        (profile_id,) = add_profiles(db_path, "alice")
+        supervisor = make_supervisor(store, registry, clock, settings)
+
+        supervisor.start(1)
+
+        worker = store.get_worker("br-1")
+        assert worker["profile_id"] == profile_id
+        assert env_of(registry)["ADCLICKER_PROFILE_ID"] == str(profile_id)
+        assert profile_status(db_path, profile_id) == "assigned"
+
+    def test_spawn_without_profiles_leaves_the_worker_profileless(
+        self, store, registry, clock, settings, db_path
+    ):
+        supervisor = make_supervisor(store, registry, clock, settings)
+
+        supervisor.start(1)
+
+        assert "ADCLICKER_PROFILE_ID" not in env_of(registry)
+        assert store.get_worker("br-1")["profile_id"] is None
+        assert profile_rows(db_path) == []
+
+    def test_profile_env_inherited_from_the_daemon_is_dropped(
+        self, store, registry, clock, settings, db_path, monkeypatch
+    ):
+        """Наследие окружения демона не должно обходить пул, как ADCLICKER_PROXY."""
+        monkeypatch.setenv("ADCLICKER_PROFILE_ID", "999")
+        supervisor = make_supervisor(store, registry, clock, settings)
+
+        supervisor.start(1)
+
+        assert "ADCLICKER_PROFILE_ID" not in env_of(registry)
+
+    def test_each_worker_gets_its_own_profile(
+        self, store, registry, clock, settings, db_path
+    ):
+        ids = add_profiles(db_path, "a", "b")
+        supervisor = make_supervisor(store, registry, clock, settings)
+
+        supervisor.start(2)
+
+        assert [store.get_worker(b)["profile_id"] for b in ("br-1", "br-2")] == ids
+        assert [env_of(registry, call)["ADCLICKER_PROFILE_ID"] for call in (0, 1)] == [
+            str(ids[0]),
+            str(ids[1]),
+        ]
+
+    def test_profile_proxy_wins_over_the_pool(
+        self, store, registry, clock, settings, db_path
+    ):
+        """Свой прокси профиля приоритетнее пула: аккаунт не уезжает в чужую страну."""
+        pool = make_pool(db_path)
+        pool.add_lines(["alice:s3cr3t@10.0.0.1:8080", "bob:hunter2@10.0.0.2:9090"])
+        proxy_ids = [row["id"] for row in pool.list_proxies()]
+        profiles = ProfilePool(db_path)
+        profiles.add_profiles([{"name": "alice", "proxy_id": proxy_ids[1]}])
+        supervisor = make_supervisor(store, registry, clock, settings)
+
+        supervisor.start(1)
+
+        assert store.get_worker("br-1")["proxy_id"] == proxy_ids[1]
+        assert env_of(registry)["ADCLICKER_PROXY"] == "bob:hunter2@10.0.0.2:9090"
+        assert [(row["proxy_id"], row["result"]) for row in usage_rows(store)] == [
+            (proxy_ids[1], "assigned")
+        ], "прокси пула не должен расходоваться, когда у профиля есть свой"
+
+    def test_profile_without_proxy_falls_back_to_the_pool(
+        self, store, registry, clock, settings, db_path
+    ):
+        pool = make_pool(db_path)
+        pool.add_lines(["alice:s3cr3t@10.0.0.1:8080"])
+        proxy_id = pool.list_proxies()[0]["id"]
+        add_profiles(db_path, "alice")
+        supervisor = make_supervisor(store, registry, clock, settings)
+
+        supervisor.start(1)
+
+        assert store.get_worker("br-1")["proxy_id"] == proxy_id
+        assert env_of(registry)["ADCLICKER_PROXY"] == "alice:s3cr3t@10.0.0.1:8080"
+
+    def test_dead_profile_proxy_falls_back_to_the_pool_with_a_warning(
+        self, store, registry, clock, settings, db_path
+    ):
+        pool = make_pool(db_path)
+        pool.add_lines(["alice:s3cr3t@10.0.0.1:8080", "bob:hunter2@10.0.0.2:9090"])
+        proxy_ids = [row["id"] for row in pool.list_proxies()]
+        pool.record_check_result(proxy_ids[0], alive=False, error="timeout")
+        profiles = ProfilePool(db_path)
+        profiles.add_profiles([{"name": "alice", "proxy_id": proxy_ids[0]}])
+        supervisor = make_supervisor(store, registry, clock, settings)
+
+        supervisor.start(1)
+
+        assert store.get_worker("br-1")["proxy_id"] == proxy_ids[1], (
+            "мёртвый прокси профиля не должен попадать в env — пул даёт живой"
+        )
+        assert env_of(registry)["ADCLICKER_PROXY"] == "bob:hunter2@10.0.0.2:9090"
+        assert proxy_logs(store, level="WARNING"), "подмена должна быть видна в логе"
+
+    def test_spawn_logs_the_profile_without_secrets(
+        self, store, registry, clock, settings, db_path
+    ):
+        pool = make_pool(db_path)
+        pool.add_lines(["alice:s3cr3t@10.0.0.1:8080"])
+        proxy_id = pool.list_proxies()[0]["id"]
+        ProfilePool(db_path).add_profiles(
+            [{"name": "alice", "key_ref": "hooks:SECRET-KEY", "proxy_id": proxy_id}]
+        )
+        supervisor = make_supervisor(store, registry, clock, settings)
+
+        supervisor.start(1)
+
+        logs = browser_logs(store)
+        assert logs, "выдача профиля обязана попасть в лог"
+        assert logs[0]["category"] == "browser"
+        assert logs[0]["browser_id"] == "br-1"
+        fields = json.loads(logs[0]["fields"])
+        assert fields["profile_id"] == 1
+        assert fields["proxy_id"] == proxy_id
+        assert "SECRET-KEY" not in all_log_text(store), "key_ref не пишется в логи"
+        assert "s3cr3t" not in all_log_text(store), "креды прокси не пишутся в логи"
+
+    def test_failed_spawn_does_not_leave_the_profile_assigned(
+        self, store, clock, settings, db_path
+    ):
+        (profile_id,) = add_profiles(db_path, "alice")
+        registry = FakeProcessRegistry(spawn_error=OSError("no such binary"))
+        supervisor = make_supervisor(store, registry, clock, settings)
+
+        with pytest.raises(sup.WorkerSpawnError):
+            supervisor.start(1)
+
+        assert profile_status(db_path, profile_id) == "free", (
+            "профиль нельзя оставить назначенным на воркер, которого нет"
+        )
+
+    def test_respawn_after_a_crash_keeps_the_same_profile(
+        self, store, registry, clock, settings, db_path
+    ):
+        """Падение — не повод менять профиль: реапер освобождает, респавн забирает."""
+        ids = add_profiles(db_path, "a", "b")
+        supervisor = make_supervisor(store, registry, clock, settings)
+        supervisor.start(1)
+        assert store.get_worker("br-1")["profile_id"] == ids[0]
+
+        registry.created[0].exit(1)
+        supervisor.tick()
+
+        assert profile_status(db_path, ids[0]) == "free", (
+            "реапер освобождает профиль мёртвого воркера — иначе пул потерял бы строку"
+        )
+        assert store.get_worker("br-1")["profile_id"] == ids[0], (
+            "ссылка переживает реапер: именно она возвращает профиль респавну"
+        )
+
+        clock.advance(sup.RESTART_BACKOFF_BASE_SECONDS)
+        supervisor.tick()
+
+        worker = store.get_worker("br-1")
+        assert worker["profile_id"] == ids[0]
+        assert profile_status(db_path, ids[0]) == "assigned"
+        assert env_of(registry, -1)["ADCLICKER_PROFILE_ID"] == str(ids[0])
+
+    def test_rotation_passes_the_profile_to_the_new_process(
+        self, store, registry, clock, settings, db_path
+    ):
+        pool = make_pool(db_path)
+        pool.add_lines(
+            ["alice:s3cr3t@10.0.0.1:8080", "bob:hunter2@10.0.0.2:9090"]
+        )
+        (profile_id,) = add_profiles(db_path, "alice")
+        supervisor = make_supervisor(store, registry, clock, settings)
+        supervisor.start(1)
+        assert env_of(registry, 0)["ADCLICKER_PROFILE_ID"] == str(profile_id)
+
+        degrade(db_path, "br-1")
+        supervisor.tick()
+
+        assert env_of(registry, 1)["ADCLICKER_PROFILE_ID"] == str(profile_id), (
+            "новый процесс ротации обязан получить тот же профиль"
+        )
+        assert store.get_worker("br-1")["profile_id"] == profile_id
+        assert profile_status(db_path, profile_id) == "assigned"
+
+    def test_open_circuit_releases_the_profile(self, store, clock, db_path):
+        (profile_id,) = add_profiles(db_path, "alice")
+        registry = FakeProcessRegistry()
+        settings = sup.SupervisorSettings(
+            heartbeat_interval=5.0,
+            shutdown_grace_seconds=0.2,
+            restart_backoff_base=0.1,
+            restart_backoff_max=0.2,
+            max_restarts=1,
+            restart_count_reset_after=3600.0,
+            max_workers=4,
+        )
+        supervisor = make_supervisor(store, registry, clock, settings)
+        supervisor.start(1)
+        assert store.get_worker("br-1")["profile_id"] == profile_id
+
+        for _ in range(2):
+            registry.created[-1].exit(1)
+            supervisor.tick()
+            clock.advance(60.0)
+            supervisor.tick()
+
+        worker = store.get_worker("br-1")
+        assert worker["status"] == WorkerStatus.CIRCUIT_OPEN.value
+        assert worker["profile_id"] is None, "раскрытая цепь — полный релиз"
+        assert profile_status(db_path, profile_id) == "free"
+
+    def test_stop_releases_the_profile_taken_from_the_pool(
+        self, store, registry, clock, settings, db_path
+    ):
+        (profile_id,) = add_profiles(db_path, "alice")
+        supervisor = make_supervisor(store, registry, clock, settings)
+        supervisor.start(1)
+        assert store.get_worker("br-1")["profile_id"] == profile_id
+
+        supervisor.stop()
+
+        assert store.get_worker("br-1")["profile_id"] is None
+        assert profile_status(db_path, profile_id) == "free"
+
+
+class TestProfileReaper:
+    """Реапер в tick(): назначение без живого воркера не висит вечно.
+
+    Страховка от потери назначения: если воркер умер, удалён из реестра или
+    не стучал heartbeat'ом, профиль возвращается в пул. Ссылка
+    ``workers.profile_id`` при этом сохраняется — это память, благодаря
+    которой респавн получает тот же профиль.
+    """
+
+    def test_profile_of_a_live_worker_survives_ticks(
+        self, store, registry, clock, settings, db_path
+    ):
+        (profile_id,) = add_profiles(db_path, "alice")
+        supervisor = make_supervisor(store, registry, clock, settings)
+        supervisor.start(1)
+        worker_beats(store, clock, "br-1")
+
+        supervisor.tick()
+        supervisor.tick()
+
+        assert profile_status(db_path, profile_id) == "assigned"
+        assert store.get_worker("br-1")["profile_id"] == profile_id
+
+    def test_profile_is_freed_when_the_process_dies(
+        self, store, registry, clock, settings, db_path
+    ):
+        (profile_id,) = add_profiles(db_path, "alice")
+        supervisor = make_supervisor(store, registry, clock, settings)
+        supervisor.start(1)
+
+        registry.created[0].exit(1)
+        supervisor.tick()
+
+        assert profile_status(db_path, profile_id) == "free"
+        assert store.get_worker("br-1")["profile_id"] == profile_id, (
+            "ссылка остаётся памятью о прошлом назначении"
+        )
+
+    def test_profile_is_freed_when_the_worker_row_is_gone(
+        self, store, registry, clock, settings, db_path
+    ):
+        (profile_id,) = add_profiles(db_path, "alice")
+        supervisor = make_supervisor(store, registry, clock, settings)
+        supervisor.start(1)
+        store.delete_worker("br-1")
+
+        supervisor.tick()
+
+        assert profile_status(db_path, profile_id) == "free"
+
+    def test_profile_is_freed_when_the_heartbeat_goes_stale(
+        self, store, registry, clock, settings, db_path
+    ):
+        (profile_id,) = add_profiles(db_path, "alice")
+        supervisor = make_supervisor(store, registry, clock, settings)
+        supervisor.start(1)
+        worker_beats(store, clock, "br-1")
+
+        # Heartbeat замер: воркер перестал стучить, дальше — stale-логика
+        # (процесс гасится) и реапер (профиль освобождается).
+        clock.advance(sup.STALE_MULTIPLIER * sup.HEARTBEAT_INTERVAL_SECONDS + 1.0)
+        supervisor.tick()
+
+        assert store.get_worker("br-1")["status"] == WorkerStatus.BACKOFF.value
+        assert profile_status(db_path, profile_id) == "free"
+
+    def test_reaping_is_logged_with_the_profile_id(
+        self, store, registry, clock, settings, db_path
+    ):
+        (profile_id,) = add_profiles(db_path, "alice")
+        supervisor = make_supervisor(store, registry, clock, settings)
+        supervisor.start(1)
+        worker_beats(store, clock, "br-1")
+        clock.advance(sup.STALE_MULTIPLIER * sup.HEARTBEAT_INTERVAL_SECONDS + 1.0)
+
+        supervisor.tick()
+
+        logs = browser_logs(store, level="WARNING")
+        assert logs, "реапер обязан оставить след в логе"
+        assert profile_id in [json.loads(row["fields"])["profile_ids"][0] for row in logs]
+        assert all(row["category"] == "browser" for row in logs)
+
+    def test_profiles_of_other_live_workers_are_untouched(
+        self, store, registry, clock, settings, db_path
+    ):
+        ids = add_profiles(db_path, "a", "b")
+        supervisor = make_supervisor(store, registry, clock, settings)
+        supervisor.start(2)
+        worker_beats(store, clock, "br-1", "br-2")
+
+        registry.created[0].exit(1)
+        supervisor.tick()
+
+        assert profile_status(db_path, ids[0]) == "free"
+        assert profile_status(db_path, ids[1]) == "assigned"

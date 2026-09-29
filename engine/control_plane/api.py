@@ -41,6 +41,13 @@ from engine.control_plane.supervisor import (
     SupervisorError,
     WorkerSpawnError,
 )
+from engine.profile_pool import (
+    ProfileError,
+    ProfileInUseError,
+    ProfileInvalidError,
+    ProfileNotFoundError,
+    ProfilePool,
+)
 from engine.proxy_health import CheckInProgressError, ProxyHealthChecker
 from engine.proxy_pool import (
     ProxyError,
@@ -89,6 +96,13 @@ _ERROR_STATUS = {
     ProxyNotFoundError: ("proxy_not_found", 404),
     ProxyImportError: ("proxy_import_failed", 400),
     CheckInProgressError: ("check_in_progress", 409),
+    # Подсистема профилей: те же три статуса, что у прокси, плюс ошибка
+    # машины статусов. ProfileInvalidError — это «тело корректно, но
+    # запрошенное в нём бессмысленно» (системный статус, кривой диапазон),
+    # поэтому код ответа общий с остальными проверками тела — invalid_request.
+    ProfileInUseError: ("profile_in_use", 409),
+    ProfileNotFoundError: ("profile_not_found", 404),
+    ProfileInvalidError: ("invalid_request", 400),
 }
 
 
@@ -172,6 +186,7 @@ class ControlPlaneHandler(BaseHTTPRequestHandler):
     config_path: Path
     token: str
     proxy_pool: ProxyPool
+    profile_pool: ProfilePool
     # Any, а не ProxyHealthChecker: тесты подменяют проверяющий объект
     # фейком, а супервизорской нотации для duck-typing здесь не требуется.
     proxy_checker: Any
@@ -219,6 +234,11 @@ class ControlPlaneHandler(BaseHTTPRequestHandler):
         except ProxyError as exc:
             # Ошибки пула прокси: сообщения уже безопасны (без кредов),
             # здесь только перевод типа в код и статус.
+            code, status = _error_status(exc)
+            self._send_json(status, _error(code, str(exc)))
+        except ProfileError as exc:
+            # Ошибки пула профилей: текст построен без key_ref, здесь только
+            # перевод типа в код и статус — как у прокси.
             code, status = _error_status(exc)
             self._send_json(status, _error(code, str(exc)))
         except SupervisorError as exc:
@@ -327,7 +347,7 @@ class ControlPlaneHandler(BaseHTTPRequestHandler):
         self._send_json(200, self.proxy_pool.import_file(path))
 
     def _handle_proxies_delete(self) -> None:
-        self.proxy_pool.delete(self._requested_proxy_id())
+        self.proxy_pool.delete(self._requested_id())
         self._send_json(200, {"deleted": True})
 
     def _handle_proxies_check(self) -> None:
@@ -335,6 +355,56 @@ class ControlPlaneHandler(BaseHTTPRequestHandler):
         # CheckInProgressError отсюда уходит в 409 check_in_progress.
         self.proxy_checker.start()
         self._send_json(200, {"started": True})
+
+    # --- профили ---------------------------------------------------------
+
+    def _handle_profiles_list(self) -> None:
+        # key_ref в ответе — ссылка, а не секрет, поэтому уходит как есть;
+        # в logs его не пишет никто (и это проверяется тестами пула).
+        self._send_json(200, {"profiles": self.profile_pool.list_profiles()})
+
+    def _handle_profiles_add(self) -> None:
+        self._send_json(200, self.profile_pool.add_profiles(self._requested_profiles()))
+
+    def _handle_profiles_import(self) -> None:
+        # Формат строки (key_ref либо "key_ref | name") и генерация имени
+        # живут в ProfilePool.import_lines — здесь только проверка тела.
+        self._send_json(200, self.profile_pool.import_lines(self._requested_lines()))
+
+    def _handle_profiles_delete(self) -> None:
+        # ProfileNotFoundError → 404, ProfileInUseError → 409 profile_in_use.
+        self.profile_pool.delete(self._requested_id())
+        self._send_json(200, {"deleted": True})
+
+    def _handle_profiles_assign(self) -> None:
+        # Границы диапазона валидирует пул: единый источник правил, а ошибка
+        # идёт сюда как ProfileInvalidError (400) через _ERROR_STATUS.
+        raw = self._read_optional_object()
+        self._send_json(
+            200, self.profile_pool.assign_range(raw.get("start_id"), raw.get("end_id"))
+        )
+
+    def _handle_profiles_unassign(self) -> None:
+        # Тело читается, чтобы битый JSON дал привычный 400; его содержимое
+        # не используется — команда массовая и без параметров.
+        self._read_optional_object()
+        self._send_json(200, {"released": self.profile_pool.unassign_all()})
+
+    def _handle_profiles_status(self) -> None:
+        raw = self._read_json_body()
+        if not isinstance(raw, dict):
+            raise InvalidRequestError("ожидается объект с полями id и status")
+        profile_id = raw.get("id")
+        # bool — подкласс int: JSON true не должно пройти как id=1.
+        if isinstance(profile_id, bool) or not isinstance(profile_id, int):
+            raise InvalidRequestError("поле id должно быть целым числом")
+        status = raw.get("status")
+        if not isinstance(status, str):
+            raise InvalidRequestError("поле status должно быть текстом")
+        # assigned|active системные и неизвестные значения пул отклоняет сам
+        # (ProfileInvalidError → 400), здесь только форма тела.
+        row = self.profile_pool.set_status(profile_id, status)
+        self._send_json(200, {"id": row["id"], "status": row["status"]})
 
     # --- вспомогательное -------------------------------------------------
 
@@ -370,15 +440,34 @@ class ControlPlaneHandler(BaseHTTPRequestHandler):
             raise InvalidRequestError("поле lines должно быть списком строк")
         return lines
 
-    def _requested_proxy_id(self) -> int:
+    def _requested_profiles(self) -> list[dict[str, Any]]:
+        """Список записей из тела ``POST /control/profiles``.
+
+        Пустое тело — ошибка, а не пустой импорт: молчаливый ``added: 0``
+        на нажатую кнопку выглядел бы как «всё добавлено, ничего не
+        найдено». Семантика каждой записи (имя, поля, дубликаты) — забота
+        пула, здесь проверяется только форма.
+        """
+        raw = self._read_json_body()
+        if not isinstance(raw, dict):
+            raise InvalidRequestError("ожидается объект с полем profiles")
+        records = raw.get("profiles")
+        if not isinstance(records, list) or not all(
+            isinstance(item, dict) for item in records
+        ):
+            raise InvalidRequestError("поле profiles должно быть списком объектов")
+        return records
+
+    def _requested_id(self) -> int:
+        """Поле ``id`` из тела: удаление прокси, удаление профиля, статус."""
         raw = self._read_json_body()
         if not isinstance(raw, dict):
             raise InvalidRequestError("ожидается объект с полем id")
-        proxy_id = raw.get("id")
+        profile_id = raw.get("id")
         # bool — подкласс int: JSON true не должно пройти как id=1.
-        if isinstance(proxy_id, bool) or not isinstance(proxy_id, int):
+        if isinstance(profile_id, bool) or not isinstance(profile_id, int):
             raise InvalidRequestError("поле id должно быть целым числом")
-        return proxy_id
+        return profile_id
 
     def _read_optional_object(self) -> dict[str, Any]:
         """Тело-объект для endpoint'ов с пустым или необязательным телом."""
@@ -488,6 +577,13 @@ _ROUTES: dict[tuple[str, str], str] = {
     ("POST", "/control/proxies/import"): "_handle_proxies_import",
     ("POST", "/control/proxies/delete"): "_handle_proxies_delete",
     ("POST", "/control/proxies/check"): "_handle_proxies_check",
+    ("GET", "/control/profiles"): "_handle_profiles_list",
+    ("POST", "/control/profiles"): "_handle_profiles_add",
+    ("POST", "/control/profiles/import"): "_handle_profiles_import",
+    ("POST", "/control/profiles/delete"): "_handle_profiles_delete",
+    ("POST", "/control/profiles/assign"): "_handle_profiles_assign",
+    ("POST", "/control/profiles/unassign"): "_handle_profiles_unassign",
+    ("POST", "/control/profiles/status"): "_handle_profiles_status",
 }
 
 
@@ -519,6 +615,7 @@ class ControlPlaneServer:
         host: str = LOOPBACK_HOST,
         port: int = 0,
         proxy_pool: ProxyPool | None = None,
+        profile_pool: ProfilePool | None = None,
         proxy_checker: Any = None,
     ):
         if not _is_loopback(host):
@@ -536,8 +633,14 @@ class ControlPlaneServer:
         self.config_path = Path(config_path)
         # Пул прокси по умолчанию строится на той же БД, что и супервизор:
         # сервер не знает про путь к базе иначе, чем через его store.
+        # Профили — та же схема: пул в демоне один на три потребителя
+        # (HTTP, спавн супервизора, реапер), иначе выдача и список в UI
+        # разъезжались бы.
         self.proxy_pool = (
             proxy_pool if proxy_pool is not None else ProxyPool(supervisor.store.db_path)
+        )
+        self.profile_pool = (
+            profile_pool if profile_pool is not None else ProfilePool(supervisor.store.db_path)
         )
         self.proxy_checker = (
             proxy_checker
@@ -589,6 +692,7 @@ class ControlPlaneServer:
                 "config_path": self.config_path,
                 "token": self.token,
                 "proxy_pool": self.proxy_pool,
+                "profile_pool": self.profile_pool,
                 "proxy_checker": self.proxy_checker,
             },
         )

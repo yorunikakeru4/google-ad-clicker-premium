@@ -177,8 +177,9 @@ class StateStore:
         Назначением владеет супервизор, и делает он это ПОСЛЕ
         ``register_worker``: здесь только UPDATE существующей строки, а для
         нового воркера её ещё нет. ``profile_id`` не трогается — профиль
-        выдаётся отдельной фазой и снимается только через
-        :meth:`release_assignment`.
+        выдаётся отдельной фазой (``ProfilePool.take_for_worker``) и снимается
+        только полным релизом (:meth:`release_assignment` парно с
+        ``ProfilePool.release``), но не ротацией прокси.
 
         Значение берётся подзапросом, а не напрямую: ``DELETE`` из
         ``/control/proxies`` не берёт блокировку супервизора и может упасть
@@ -197,13 +198,59 @@ class StateStore:
                 )
                 conn.commit()
 
-    def release_assignment(self, browser_id: str) -> None:
-        """Снимает назначение: ``proxy_id`` и ``profile_id`` → NULL.
+    def assign_profile(self, browser_id: str, profile_id: int) -> None:
+        """Крепит профиль к строке воркера (``workers.profile_id``).
 
-        Назначение живёт ровно столько, сколько живёт процесс: на stop/kill
-        и перед ротацией прокси и профиль освобождаются, а respawn (новый
-        start или ротация) поднимает воркера с чистым ``profile_id`` и новым
-        ``ADCLICKER_PROXY`` — план.md, фаза 5 «Отказоустойчивость».
+        Симметрия :meth:`assign_proxy` и та же дисциплина: назначением владеет
+        супервизор, и делает он это ПОСЛЕ ``register_worker`` — метод умеет
+        только UPDATE существующей строки. Значение берётся подзапросом:
+        профиль могли удалить между выдачей (``take_for_worker``) и этой
+        записью, и прямое значение дало бы IntegrityError посреди спавна.
+        Статус профиля при этом уже ``assigned`` — его ставит пул, в одной
+        транзакции с выдачей.
+        """
+        with self._connect() as conn:
+            with self._lock:
+                conn.execute(
+                    "UPDATE workers SET profile_id = (SELECT id FROM profiles WHERE id = ?) "
+                    "WHERE browser_id = ?",
+                    (profile_id, browser_id),
+                )
+                conn.commit()
+
+    def release_proxy(self, browser_id: str) -> None:
+        """Снимает только прокси: ``workers.proxy_id`` → NULL.
+
+        Отдельный метод от :meth:`release_assignment` потому, что это разные
+        события. Ротация и спавн без прокси меняют ровно прокси — профиль
+        при этом остаётся за воркером (план.md, фаза 6: «ротация прокси не
+        должна сбрасывать профиль»). Полный релиз обоих полей — это
+        :meth:`release_assignment`, и вызывается он на stop/kill/circuit-open.
+
+        Вызов для несуществующего browser_id — не ошибка, как и в
+        :meth:`release_assignment`.
+        """
+        with self._connect() as conn:
+            with self._lock:
+                conn.execute(
+                    "UPDATE workers SET proxy_id = NULL WHERE browser_id = ?",
+                    (browser_id,),
+                )
+                conn.commit()
+
+    def release_assignment(self, browser_id: str) -> None:
+        """Полный релиз: ``proxy_id`` и ``profile_id`` → NULL.
+
+        Назначение живёт ровно столько, сколько живёт процесс, поэтому полный
+        релиз делается там, где процесс кончается насовсем: stop/kill всего
+        пула и раскрытие circuit breaker (план.md, фаза 5 и 6). Ротация прокси
+        сюда не входит — там нужен :meth:`release_proxy`, иначе подмена прокси
+        отнимала бы у воркера профиль.
+
+        Снимает только ссылку: статус профиля переводит в ``free`` пул
+        (``ProfilePool.release``), потому что заблокированный или ушедший в
+        ``error`` профиль возвращать в пул нельзя — там ждёт решение
+        оператора.
 
         Вызов для несуществующего browser_id — не ошибка: снятие назначения
         идёт в обоих направлениях (stop уже убранного воркера), и исключение
