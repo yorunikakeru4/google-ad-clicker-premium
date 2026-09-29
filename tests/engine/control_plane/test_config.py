@@ -6,6 +6,11 @@
 """
 
 import json
+import os
+import shutil
+import subprocess
+import sys
+from pathlib import Path
 
 import pytest
 
@@ -436,3 +441,39 @@ class TestProxyTransport:
 
         assert patched.get("webdriver.proxy_transport") == "direct"
         assert cfg.get("webdriver.proxy_transport") == "cdp_auth"
+
+
+class TestImportHasNoSideEffects:
+    """Импорт конфигурации не должен открывать БД логов.
+
+    Супервизор читает конфиг раньше, чем узнаёт, какую БД обслуживать
+    (``--db``): если сам импорт создаёт ``StoreWriter``, демон оставляет
+    ``adclicker.db`` в чужом каталоге и независимо от указанного пути. То же
+    касается ``config_reader`` — его читает legacy-код.
+    """
+
+    def test_importing_config_modules_does_not_create_the_log_db(self, tmp_path):
+        repo_root = Path(__file__).resolve().parents[3]
+        shutil.copy(repo_root / "config.json", tmp_path / "config.json")
+        env = dict(os.environ)
+        # Путь к БД указываем явно: conftest прописывает его в окружении
+        # pytest, и без переопределения файл создался бы вне tmp_path.
+        env["ADCLICKER_DB"] = str(tmp_path / "unexpected-logger-db.db")
+        env["PYTHONPATH"] = str(repo_root)
+
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                "import config_reader; import engine.control_plane.config",
+            ],
+            cwd=tmp_path,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+
+        assert result.returncode == 0, result.stderr
+        assert not (tmp_path / "unexpected-logger-db.db").exists()
+        assert not (tmp_path / "adclicker.db").exists()
