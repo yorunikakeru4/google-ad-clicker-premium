@@ -4,6 +4,274 @@
 //! здесь они не зашиты. Пустая база — нули, а не ошибка; нулевой знаменатель
 //! доли капчи — `None`, а не ложные 0%.
 
+use rusqlite::OptionalExtension;
+use serde::Serialize;
+
+use crate::db::{read_failed, DbError, DbReader};
+
+/// Сводка по запускам сценария в окне `since`.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct RunsSummary {
+    /// Статусы успеха (`ok`, `completed` — регистр не важен).
+    pub succeeded: i64,
+    /// Статусы ошибки (`failed`, `crashed`).
+    pub failed: i64,
+    /// Всё остальное: `running`, `stopped`, `baseline` и неизвестные статусы.
+    pub other: i64,
+    /// Текст самой свежей непустой `runs.error` в окне.
+    pub last_error: Option<String>,
+}
+
+/// Часовой бакет кликов: `bucket` — unix-секунды начала часа.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct HourlyClicks {
+    pub bucket: i64,
+    pub count: i64,
+}
+
+/// Скользящее окно «запросы/час» плюс разбивка по воркерам.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct RequestsLastHour {
+    pub total: i64,
+    pub per_browser: Vec<BrowserRequests>,
+}
+
+/// Доля запросов одного `browser_id` в окне последнего часа.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct BrowserRequests {
+    /// `None`, если у запроса неизвестен браузер: такие строки тоже должны
+    /// попадать в сумму, а не исчезать из нагрузки.
+    pub browser_id: Option<String>,
+    pub count: i64,
+}
+
+/// Воркер со свежим heartbeat — кандидат «жив» на дашборде.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ActiveWorker {
+    pub browser_id: String,
+    pub pid: Option<i64>,
+    pub status: String,
+    pub started_at: Option<f64>,
+    pub heartbeat_at: f64,
+    pub restart_count: i64,
+    pub last_error: Option<String>,
+}
+
+/// Куда попадает статус запуска.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RunOutcome {
+    Success,
+    Failure,
+    Other,
+}
+
+/// Классификация `runs.status` — единственное место, где известны словари
+/// статусов. Регистр не важен: статусы пишут разные места кода, а дашборд
+/// обязан их различать. Всё, что не в двух известных наборах, — «другое»:
+/// так битые и устаревшие статусы не превращаются ни в успех, ни в ошибку.
+fn classify_run_status(status: &str) -> RunOutcome {
+    match status.trim().to_ascii_lowercase().as_str() {
+        "ok" | "completed" => RunOutcome::Success,
+        "failed" | "crashed" => RunOutcome::Failure,
+        _ => RunOutcome::Other,
+    }
+}
+
+impl DbReader {
+    /// Сводка по `runs` в окне `since`: завершённые успешно / с ошибкой /
+    /// другое плюс текст последней ошибки.
+    ///
+    /// Окно режется по `COALESCE(started_at, created_at)`: строка без
+    /// `started_at` (старые и битые записи) не выпадает из дашборда. Класс —
+    /// только по `status`: незавершённые (`running`), штатно остановленные
+    /// (`stopped`) и неизвестные статусы идут в `other`. Последняя ошибка —
+    /// самая свежая непустая `error` в окне независимо от статуса: текст
+    /// полезен даже тогда, когда статус записан криво.
+    pub fn runs_summary(&self, since: f64) -> Result<RunsSummary, DbError> {
+        let mut summary = RunsSummary {
+            succeeded: 0,
+            failed: 0,
+            other: 0,
+            last_error: None,
+        };
+
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT status, COUNT(*) AS n \
+                 FROM runs \
+                 WHERE COALESCE(started_at, created_at) >= ?1 \
+                 GROUP BY status",
+            )
+            .map_err(read_failed)?;
+        let rows = stmt
+            .query_map(rusqlite::params![since], |row| {
+                let status: String = row.get(0)?;
+                let count: i64 = row.get(1)?;
+                Ok((status, count))
+            })
+            .map_err(read_failed)?;
+        for row in rows {
+            let (status, count) = row.map_err(read_failed)?;
+            match classify_run_status(&status) {
+                RunOutcome::Success => summary.succeeded += count,
+                RunOutcome::Failure => summary.failed += count,
+                RunOutcome::Other => summary.other += count,
+            }
+        }
+
+        summary.last_error = self
+            .conn
+            .query_row(
+                "SELECT error FROM runs \
+                 WHERE COALESCE(started_at, created_at) >= ?1 \
+                   AND error IS NOT NULL AND TRIM(error) != '' \
+                 ORDER BY id DESC LIMIT 1",
+                rusqlite::params![since],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(read_failed)?;
+
+        Ok(summary)
+    }
+
+    /// Клики по часовым бакетам: только заполненные часы, по возрастанию.
+    ///
+    /// Час — полуинтервал `[t0, t0 + 3600)`: строка с `ts`, кратным часу,
+    /// начинает новый час. Текущий неполный час включается — дашборд живой,
+    /// нормализовать по доле часа решает UI; пропуски не нуляются. `buckets` —
+    /// потолок самых свежих часов в окне `ts >= since`. `ts` — unix-секунды,
+    /// поэтому деление на 3600 неотрицательное и `CAST` работает как floor.
+    pub fn clicks_per_hour(&self, since: f64, buckets: u32) -> Result<Vec<HourlyClicks>, DbError> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT CAST(ts / 3600 AS INTEGER) AS bucket, COUNT(*) AS n \
+                 FROM clicks \
+                 WHERE ts >= ?1 \
+                 GROUP BY bucket \
+                 ORDER BY bucket DESC \
+                 LIMIT ?2",
+            )
+            .map_err(read_failed)?;
+        let rows = stmt
+            .query_map(rusqlite::params![since, buckets], |row| {
+                let index: i64 = row.get(0)?;
+                Ok(HourlyClicks {
+                    bucket: index * 3600,
+                    count: row.get(1)?,
+                })
+            })
+            .map_err(read_failed)?;
+
+        let mut points = rows
+            .map(|row| row.map_err(read_failed))
+            .collect::<Result<Vec<_>, _>>()?;
+        // SQL отдаёт самые свежие часы первыми — дашборду нужен хронология.
+        points.reverse();
+        Ok(points)
+    }
+
+    /// Скользящее окно `[now - 3600, now]` по `network_requests`: сумма и
+    /// разбивка по `browser_id` для нагрузки на воркер. Обе границы окна
+    /// включаются.
+    pub fn requests_last_hour(&self, now: f64) -> Result<RequestsLastHour, DbError> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT browser_id, COUNT(*) AS n \
+                 FROM network_requests \
+                 WHERE ts >= ?1 AND ts <= ?2 \
+                 GROUP BY browser_id",
+            )
+            .map_err(read_failed)?;
+        let rows = stmt
+            .query_map(rusqlite::params![now - 3600.0, now], |row| {
+                Ok(BrowserRequests {
+                    browser_id: row.get(0)?,
+                    count: row.get(1)?,
+                })
+            })
+            .map_err(read_failed)?;
+
+        let mut per_browser = rows
+            .map(|row| row.map_err(read_failed))
+            .collect::<Result<Vec<_>, _>>()?;
+        // Нагрузка вперёд: больше запросов — выше; ничья — browser_id по
+        // возрастанию, NULL первый, как в ORDER BY SQLite.
+        per_browser.sort_by(|left, right| {
+            right
+                .count
+                .cmp(&left.count)
+                .then_with(|| left.browser_id.cmp(&right.browser_id))
+        });
+        let total: i64 = per_browser.iter().map(|group| group.count).sum();
+
+        Ok(RequestsLastHour { total, per_browser })
+    }
+
+    /// Доля капчи в окне `since`: `captcha_events / network_requests`.
+    ///
+    /// Знаменатель 0 даёт `None`, а не деление на ноль и не ложные 0% — UI
+    /// покажет «н/д». Обе таблицы режутся одним `since`, поэтому доля не
+    /// смешивает разные окна.
+    pub fn captcha_share(&self, since: f64) -> Result<Option<f64>, DbError> {
+        let (captchas, requests): (i64, i64) = self
+            .conn
+            .query_row(
+                "SELECT \
+                   (SELECT COUNT(*) FROM captcha_events WHERE ts >= ?1), \
+                   (SELECT COUNT(*) FROM network_requests WHERE ts >= ?1)",
+                rusqlite::params![since],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .map_err(read_failed)?;
+
+        if requests == 0 {
+            Ok(None)
+        } else {
+            Ok(Some(captchas as f64 / requests as f64))
+        }
+    }
+
+    /// Воркеры с heartbeat не старше `threshold_secs` от `now` — живость для
+    /// дашборда. Граница включается: heartbeat ровно на пороге считается
+    /// живым, как и границы окна запросов; `heartbeat_at IS NULL` — не жив.
+    /// Порог приходит из UI и здесь не зашит.
+    pub fn active_workers(
+        &self,
+        now: f64,
+        threshold_secs: u32,
+    ) -> Result<Vec<ActiveWorker>, DbError> {
+        let cutoff = now - f64::from(threshold_secs);
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT browser_id, pid, status, started_at, heartbeat_at, restart_count, last_error \
+                 FROM workers \
+                 WHERE heartbeat_at IS NOT NULL AND heartbeat_at >= ?1 \
+                 ORDER BY browser_id",
+            )
+            .map_err(read_failed)?;
+        let rows = stmt
+            .query_map(rusqlite::params![cutoff], |row| {
+                Ok(ActiveWorker {
+                    browser_id: row.get(0)?,
+                    pid: row.get(1)?,
+                    status: row.get(2)?,
+                    started_at: row.get(3)?,
+                    heartbeat_at: row.get(4)?,
+                    restart_count: row.get(5)?,
+                    last_error: row.get(6)?,
+                })
+            })
+            .map_err(read_failed)?;
+
+        rows.map(|row| row.map_err(read_failed)).collect()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -93,7 +93,9 @@ pub struct LogPageEntry {
 /// каждый поток держит своего читателя.
 #[derive(Debug)]
 pub struct DbReader {
-    conn: Connection,
+    /// Соединение отдаётся модулю `metrics` для агрегатов дашборда: поле
+    /// видно только внутри крейта, наружу читалка остаётся закрытой.
+    pub(crate) conn: Connection,
 }
 
 impl DbReader {
@@ -308,7 +310,7 @@ fn open_failed(path: &Path, err: impl fmt::Display) -> DbError {
     }
 }
 
-fn read_failed(err: rusqlite::Error) -> DbError {
+pub(crate) fn read_failed(err: rusqlite::Error) -> DbError {
     DbError::ReadFailed {
         reason: err.to_string(),
     }
