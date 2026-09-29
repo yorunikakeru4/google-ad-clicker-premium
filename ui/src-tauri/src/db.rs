@@ -67,6 +67,26 @@ pub struct LogEntry {
     pub fields: Option<String>,
 }
 
+/// Фильтры экрана логов: точное равенство по уровню, категории и `browser_id`.
+/// Пустое поле означает «фильтр не применять» — ровно то, что делают `None`
+/// в [`DbReader::list_logs`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct LogFilters {
+    pub level: Option<String>,
+    pub category: Option<String>,
+    pub browser_id: Option<String>,
+}
+
+/// Строка страницы логов: та же запись, что и в [`LogEntry`], плюс `id` —
+/// вторая половина курсора. Без `id` группу строк с равным `ts` на границе
+/// страниц нельзя ни продолжить, ни исключить без потерь и дублей.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct LogPageEntry {
+    pub id: i64,
+    #[serde(flatten)]
+    pub log: LogEntry,
+}
+
 /// Читатель боевой БД: одно соединение, строго на чтение.
 ///
 /// Соединение не разделяется между потоками (`SQLITE_OPEN_NO_MUTEX`):
@@ -125,55 +145,141 @@ impl DbReader {
         category: Option<&str>,
         browser_id: Option<&str>,
     ) -> Result<Vec<LogEntry>, DbError> {
+        let filters = LogFilters {
+            level: level.map(str::to_string),
+            category: category.map(str::to_string),
+            browser_id: browser_id.map(str::to_string),
+        };
+        let page = self.fetch_log_page(&filters, None, None, limit)?;
+        Ok(page.into_iter().map(|row| row.log).collect())
+    }
+
+    /// Курсорная страница для экрана Logs: те же фильтры, что и у
+    /// [`Self::list_logs`], порядок `ts DESC, id DESC`.
+    ///
+    /// Курсор «строже позиции» задаётся парой `before_ts`/`before_id` — так
+    /// страницы не теряют и не дублируют строки с равным `ts`. Голый
+    /// `before_ts` без `before_id` работает как строгое «старше `before_ts`»;
+    /// `before_id` без `before_ts` игнорируется. `limit = 0` возвращает
+    /// пустую страницу, значения выше [`MAX_LOGS_LIMIT`] усекаются до него.
+    pub fn list_logs_page(
+        &self,
+        filters: &LogFilters,
+        before_ts: Option<f64>,
+        before_id: Option<i64>,
+        limit: u32,
+    ) -> Result<Vec<LogPageEntry>, DbError> {
+        self.fetch_log_page(filters, before_ts, before_id, limit)
+    }
+
+    /// Число строк `logs` под теми же фильтрами, что и у
+    /// [`Self::list_logs_page`]: общая величина для пагинации экрана Logs.
+    pub fn count_logs(&self, filters: &LogFilters) -> Result<i64, DbError> {
+        let (clause, binds) = log_where(filters, None, None);
+        let mut sql = String::from("SELECT COUNT(*) FROM logs");
+        sql.push_str(&clause);
+        let mut stmt = self.conn.prepare(&sql).map_err(read_failed)?;
+        let count: i64 = stmt
+            .query_row(binds.as_slice(), |row| row.get(0))
+            .map_err(read_failed)?;
+        Ok(count)
+    }
+
+    /// Общий путь запросов логов: одна страница в порядке `ts DESC, id DESC`.
+    fn fetch_log_page(
+        &self,
+        filters: &LogFilters,
+        before_ts: Option<f64>,
+        before_id: Option<i64>,
+        limit: u32,
+    ) -> Result<Vec<LogPageEntry>, DbError> {
         if limit == 0 {
             return Ok(Vec::new());
         }
         let limit = limit.min(MAX_LOGS_LIMIT);
 
-        // Фильтры собираются динамически: равенство столбца индексируется
-        // (`idx_logs_browser_id` и др.), а вариант «? IS NULL OR col = ?»
-        // заставлял бы SQLite сканировать индекс по ts целиком.
+        let (clause, mut binds) = log_where(filters, before_ts.as_ref(), before_id.as_ref());
         let mut sql =
-            String::from("SELECT ts, level, browser_id, category, message, fields FROM logs");
-        let mut conditions: Vec<&str> = Vec::new();
-        let mut binds: Vec<&dyn ToSql> = Vec::new();
-
-        if level.is_some() {
-            conditions.push("level = ?");
-            binds.push(&level);
-        }
-        if category.is_some() {
-            conditions.push("category = ?");
-            binds.push(&category);
-        }
-        if browser_id.is_some() {
-            conditions.push("browser_id = ?");
-            binds.push(&browser_id);
-        }
-        if !conditions.is_empty() {
-            sql.push_str(" WHERE ");
-            sql.push_str(&conditions.join(" AND "));
-        }
+            String::from("SELECT id, ts, level, browser_id, category, message, fields FROM logs");
+        sql.push_str(&clause);
         // id — детерминированный разрыв равных ts: свежевставленная строка
-        // идёт первой, и пагинация фазы 4 не будет терять и дублировать строки.
+        // идёт первой, и курсор (ts, id) продолжает страницу с того места,
+        // где остановилась предыдущая.
         sql.push_str(" ORDER BY ts DESC, id DESC LIMIT ?");
         binds.push(&limit);
 
         let mut stmt = self.conn.prepare(&sql).map_err(read_failed)?;
         let rows = stmt
             .query_map(binds.as_slice(), |row| {
-                Ok(LogEntry {
-                    ts: row.get(0)?,
-                    level: row.get(1)?,
-                    browser_id: row.get(2)?,
-                    category: row.get(3)?,
-                    message: row.get(4)?,
-                    fields: row.get(5)?,
+                Ok(LogPageEntry {
+                    id: row.get(0)?,
+                    log: LogEntry {
+                        ts: row.get(1)?,
+                        level: row.get(2)?,
+                        browser_id: row.get(3)?,
+                        category: row.get(4)?,
+                        message: row.get(5)?,
+                        fields: row.get(6)?,
+                    },
                 })
             })
             .map_err(read_failed)?;
 
         rows.map(|row| row.map_err(read_failed)).collect()
+    }
+}
+
+/// WHERE и бинды для запросов логов: фильтры плюс, опционально, курсор.
+///
+/// * `before_ts` + `before_id` — «строже позиции курсора» в порядке
+///   `ts DESC, id DESC`: `ts < ? OR (ts = ? AND id < ?)`. Равные `ts`
+///   достаются странице целиком, поэтому потерь и дублей нет;
+/// * только `before_ts` — строгое `ts < ?`: строка с `ts` на границе уже
+///   отдана и повторно не приходит;
+/// * `before_id` без `before_ts` игнорируется — это первая страница.
+///
+/// Фильтры собираются динамически: равенство столбца индексируется
+/// (`idx_logs_browser_id` и др.), а вариант «? IS NULL OR col = ?»
+/// заставлял бы SQLite сканировать индекс по ts целиком.
+fn log_where<'a>(
+    filters: &'a LogFilters,
+    before_ts: Option<&'a f64>,
+    before_id: Option<&'a i64>,
+) -> (String, Vec<&'a dyn ToSql>) {
+    let mut conditions: Vec<&str> = Vec::new();
+    let mut binds: Vec<&'a dyn ToSql> = Vec::new();
+
+    if filters.level.is_some() {
+        conditions.push("level = ?");
+        binds.push(&filters.level);
+    }
+    if filters.category.is_some() {
+        conditions.push("category = ?");
+        binds.push(&filters.category);
+    }
+    if filters.browser_id.is_some() {
+        conditions.push("browser_id = ?");
+        binds.push(&filters.browser_id);
+    }
+    if let Some(ts) = before_ts {
+        match before_id {
+            Some(id) => {
+                conditions.push("(ts < ? OR (ts = ? AND id < ?))");
+                binds.push(ts);
+                binds.push(ts);
+                binds.push(id);
+            }
+            None => {
+                conditions.push("ts < ?");
+                binds.push(ts);
+            }
+        }
+    }
+
+    if conditions.is_empty() {
+        (String::new(), binds)
+    } else {
+        (format!(" WHERE {}", conditions.join(" AND ")), binds)
     }
 }
 
@@ -777,7 +883,10 @@ mod tests {
             }
             before = page.last().map(|row| (row.log.ts, row.id));
             pages.push(page);
-            assert!(pages.len() <= 4, "пагинация должна завершиться пустой страницей");
+            assert!(
+                pages.len() <= 4,
+                "пагинация должна завершиться пустой страницей"
+            );
         }
 
         assert_eq!(
@@ -904,7 +1013,10 @@ mod tests {
         let page1 = reader
             .list_logs_page(&filters, None, None, 2)
             .expect("первая страница");
-        assert_eq!(page1.iter().map(|row| row.id).collect::<Vec<_>>(), vec![5, 3]);
+        assert_eq!(
+            page1.iter().map(|row| row.id).collect::<Vec<_>>(),
+            vec![5, 3]
+        );
 
         let page2 = reader
             .list_logs_page(&filters, Some(page1[1].log.ts), Some(page1[1].id), 2)
@@ -916,7 +1028,9 @@ mod tests {
             .expect("третья страница");
         assert!(page3.is_empty(), "фильтр не пропускает строки на границе");
         assert_eq!(
-            reader.count_logs(&filters).expect("count_logs под фильтром"),
+            reader
+                .count_logs(&filters)
+                .expect("count_logs под фильтром"),
             3,
             "count_logs считает ровно то, что читает list_logs_page"
         );
@@ -1018,11 +1132,9 @@ mod tests {
                 .expect("пустая БД — это ноль, а не ошибка"),
             0
         );
-        assert!(
-            reader
-                .list_logs_page(&LogFilters::default(), None, None, 10)
-                .expect("пустая БД отдаёт пустую страницу")
-                .is_empty()
-        );
+        assert!(reader
+            .list_logs_page(&LogFilters::default(), None, None, 10)
+            .expect("пустая БД отдаёт пустую страницу")
+            .is_empty());
     }
 }
