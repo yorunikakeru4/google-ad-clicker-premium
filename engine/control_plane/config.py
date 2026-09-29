@@ -25,7 +25,7 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
-from engine.proxy_auth import DEFAULT_PROXY_TRANSPORT, PROXY_TRANSPORTS
+from engine.proxy_transport import DEFAULT_PROXY_TRANSPORT, PROXY_TRANSPORTS
 
 # Значение, которым секрет заменяется в любом JSON наружу.
 SECRET_MASK = "********"
@@ -52,7 +52,7 @@ _SCHEMA: dict[str, dict[str, tuple[type | tuple[type, ...], Any]]] = {
         "shift_windows": (bool, False),
         "use_seleniumbase": (bool, False),
         # Как креды доходят до Chrome: cdp_auth (дефолт) | extension | direct.
-        # Дефолт и словарь значений — из engine.proxy_auth, а не отсюда.
+        # Дефолт и словарь значений — из engine.proxy_transport, а не отсюда.
         "proxy_transport": (str, DEFAULT_PROXY_TRANSPORT),
     },
     "behavior": {
@@ -85,9 +85,10 @@ _SCHEMA: dict[str, dict[str, tuple[type | tuple[type, ...], Any]]] = {
 _SECRET_FIELDS = frozenset({"behavior.2captcha_apikey", "webdriver.proxy"})
 
 # Поля-перечисления: путь поля -> допустимые значения. Словаря значений здесь
-# нет намеренно: он живёт в engine.proxy_auth рядом с resolve_proxy_transport,
-# и второе место правды для него недопустимо. Проверка выполняется только
-# после проверки типа, поэтому к этому месту доходит строка.
+# нет намеренно: он живёт в engine.proxy_transport, а нормализует его
+# resolve_proxy_transport из engine.proxy_auth, и второе место правды для него
+# недопустимо. Проверка выполняется только после проверки типа, поэтому к
+# этому месту доходит строка.
 _ENUM_FIELDS: dict[str, frozenset[str]] = {"webdriver.proxy_transport": PROXY_TRANSPORTS}
 
 # browser_count: legacy трактует 0 как "столько, сколько ядер". Демон держит

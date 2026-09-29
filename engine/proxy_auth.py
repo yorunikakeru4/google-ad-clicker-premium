@@ -21,6 +21,9 @@ Chrome ходит на настоящий прокси по ``--proxy-server=hos
 
 Три транспорта прокси (``resolve_proxy_transport``):
 ``cdp_auth`` (по умолчанию) | ``extension`` | ``direct``.
+Сами значения объявлены в :mod:`engine.proxy_transport` — лёгком модуле,
+который читают ``config_reader`` и control plane, не тянув websocket и
+логгер этого модуля.
 
 Подсчёт неудач: повторный ``Fetch.authRequired`` с тем же ``requestId``
 означает, что прокси креды не принял (приём как в Playwright). Такой повтор
@@ -39,6 +42,16 @@ from typing import Any, Callable
 from engine.cdp import CdpClient, resolve_browser_ws_url
 from engine.log import get_logger
 from engine.network_recorder import NetworkRecorder
+# Значения транспортов живут в лёгком модуле: их же читают config_reader и
+# control plane, которым websocket и логгер не нужны. Переэкспорт здесь —
+# публичный API модуля, поэтому имена остаются в ``__all__``.
+from engine.proxy_transport import (
+    DEFAULT_PROXY_TRANSPORT,
+    PROXY_TRANSPORTS,
+    PROXY_TRANSPORT_CDP_AUTH,
+    PROXY_TRANSPORT_DIRECT,
+    PROXY_TRANSPORT_EXTENSION,
+)
 
 __all__ = [
     "DEFAULT_PROXY_TRANSPORT",
@@ -56,12 +69,6 @@ __all__ = [
 ]
 
 log = get_logger()
-
-PROXY_TRANSPORT_CDP_AUTH = "cdp_auth"
-PROXY_TRANSPORT_EXTENSION = "extension"
-PROXY_TRANSPORT_DIRECT = "direct"
-DEFAULT_PROXY_TRANSPORT = PROXY_TRANSPORT_CDP_AUTH
-PROXY_TRANSPORTS = frozenset({PROXY_TRANSPORT_CDP_AUTH, PROXY_TRANSPORT_EXTENSION, PROXY_TRANSPORT_DIRECT})
 
 # Схемы, для которых CDP умеет отдать логин/пароль.
 _SUPPORTED_SCHEMES = frozenset({"Basic", "Digest"})

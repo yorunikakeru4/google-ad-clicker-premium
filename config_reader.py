@@ -3,7 +3,7 @@ import multiprocessing
 from dataclasses import dataclass
 from typing import Optional
 
-from engine.proxy_auth import DEFAULT_PROXY_TRANSPORT
+from engine.proxy_transport import DEFAULT_PROXY_TRANSPORT
 from logger import logger
 
 
@@ -27,8 +27,9 @@ class WebdriverParams:
     shift_windows: Optional[bool] = False
     use_seleniumbase: Optional[bool] = False
     # Транспорт прокси (cdp_auth | extension | direct). Дефолт берётся из
-    # engine.proxy_auth, а не дублируется строкой: словарь значений и
-    # "что считается нормой" живут там же, где resolve_proxy_transport.
+    # лёгкого engine.proxy_transport, а не дублируется строкой: словарь
+    # значений и "что считается нормой" живут там же, где их проверяет
+    # resolve_proxy_transport.
     proxy_transport: Optional[str] = DEFAULT_PROXY_TRANSPORT
 
 
@@ -133,7 +134,7 @@ class ConfigReader:
             shift_windows=config["webdriver"]["shift_windows"],
             use_seleniumbase=config["webdriver"]["use_seleniumbase"],
             # .get, а не []: config.json прошлой версии без ключа обязан
-            # читаться, дефолт приходит из engine.proxy_auth.
+            # читаться, дефолт приходит из engine.proxy_transport.
             proxy_transport=config["webdriver"].get(
                 "proxy_transport", DEFAULT_PROXY_TRANSPORT
             ),
