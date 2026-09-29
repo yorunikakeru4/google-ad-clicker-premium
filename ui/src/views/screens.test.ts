@@ -109,6 +109,14 @@ describe("экраны на шаблоне", () => {
     // управление демоном — только в AppShell
     expect(html).not.toContain("control-panel");
     expect(html).not.toContain("kill-dialog");
+
+    // таблица воркеров из /state — секция под метриками и до графиков
+    const workersAt = html.indexOf('data-test="workers-card"');
+    expect(workersAt).toBeGreaterThan(html.indexOf('data-test="card-captcha"'));
+    expect(workersAt).toBeLessThan(html.indexOf('data-test="chart-Клики/час"'));
+    // до первого ответа демона экран честно ждёт, а не показывает пустой пул
+    expect(html).toContain('data-test="workers-empty"');
+    expect(html).toContain("Ожидание первого ответа демона");
   });
 
   it("Logs: PageLayout, FilterBar с пятью контролами и тулбар действий", async () => {

@@ -2,6 +2,8 @@
 // Dashboard (план §5, фаза 4): успешные/неуспешные сценарии, аптайм демона,
 // запросы/час как проверяемое утверждение ≥50, доля CAPTCHA с порогом 5%
 // и три графика (клики/час, CAPTCHA по часам, нагрузка на воркеры).
+// Под метриками — таблица воркеров из /state (WorkersTable): опрос и AppShell,
+// экран только читает снимок.
 //
 // Вёрстка — шаблон экрана: PageLayout + MetricCard + StatusChip. Пороговые
 // правила остаются в lib/thresholds, данные — в useDashboard: карточка только
@@ -11,8 +13,10 @@ import BarChartCard from "../components/charts/BarChartCard.vue";
 import DbUnavailableAlert from "../components/DbUnavailableAlert.vue";
 import MetricCard from "../components/data/MetricCard.vue";
 import PageLayout from "../components/layout/PageLayout.vue";
+import WorkersTable from "../components/WorkersTable.vue";
 import type { StatusKind } from "../constants/statusMap";
 import { useDashboard } from "../composables/useDashboard";
+import { useDaemonStatus } from "../composables/useDaemonStatus";
 import { useDb } from "../composables/useDb";
 import { formatLastError, formatUptime } from "../lib/format";
 import { toneToStatus } from "../lib/thresholdStatus";
@@ -25,6 +29,9 @@ import {
 
 const db = useDb();
 const dash = useDashboard();
+// Опрос /state уже идёт в AppShell: здесь читается тот же снимок, без
+// собственного интервала (план §5, фаза 4).
+const daemon = useDaemonStatus();
 
 onMounted(() => {
   void db.ensureOpen();
@@ -190,6 +197,16 @@ const demoWindowHint = "окно 24 часа";
           :status="captchaStatusKind"
           :status-label="shareClaim"
           status-test="captcha-claim"
+        />
+      </v-col>
+    </v-row>
+
+    <!-- Воркеры из /state: под метриками, до графиков (план §5, фаза 4) -->
+    <v-row dense class="mt-1">
+      <v-col cols="12">
+        <WorkersTable
+          :phase="daemon.state.value.phase"
+          :snapshot="daemon.state.value.snapshot"
         />
       </v-col>
     </v-row>
