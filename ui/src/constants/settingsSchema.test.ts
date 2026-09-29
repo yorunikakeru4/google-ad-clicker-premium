@@ -67,6 +67,9 @@ const ENGINE_SCHEMA: Record<string, Record<string, EngineField>> = {
     telegram_enabled: { type: "bool", default: false },
     send_to_android: { type: "bool", default: false },
     request_boost: { type: "bool", default: false },
+    captcha_policy: { type: "str", default: "stop" },
+    captcha_threshold_percent: { type: "float", default: 5.0 },
+    captcha_threshold_action: { type: "str", default: "warn" },
   },
 };
 
@@ -84,6 +87,7 @@ const ENGINE_LIMITS: Record<string, { min: number; max: number }> = {
   "behavior.loop_wait_time": { min: 0, max: 86400 },
   "behavior.wait_factor": { min: 0.01, max: 100 },
   "behavior.max_scroll_limit": { min: 0, max: 3600 },
+  "behavior.captcha_threshold_percent": { min: 0, max: 100 },
 };
 
 /** Какие типы формы допустимы для типа движка (enum — тоже свой тип). */
@@ -137,6 +141,15 @@ describe("settingsSchema: секции и поля против _SCHEMA", () => 
 
     expect([...formPaths].filter((path) => !enginePaths.has(path))).toEqual([]);
     expect([...enginePaths].filter((path) => !formPaths.has(path))).toEqual([]);
+  });
+
+  // Счётчик — смотри на сумму ключей _SCHEMA, а не на него самого: он ловит
+  // потерю поля и дубль пути разом. Меняется только вместе с _SCHEMA
+  // (36 полей до политики CAPTCHA + 3 новых = 39).
+  it("в форме ровно 39 полей, без повторов пути", () => {
+    const paths = allFields().map((row) => row.path);
+    expect(new Set(paths).size, "пути полей повторяются").toBe(paths.length);
+    expect(paths).toHaveLength(39);
   });
 
   it("типы формы соответствуют типам движка", () => {

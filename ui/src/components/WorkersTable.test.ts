@@ -67,6 +67,7 @@ function snapshot(workers: WorkerRow[]): StateSnapshot {
 function table(props: {
   phase: PollPhase;
   snapshot: StateSnapshot | null;
+  captchaAlertIds?: string[];
 }): Promise<string> {
   return render(WorkersTable, props);
 }
@@ -138,6 +139,39 @@ describe("WorkersTable: строки из /state", () => {
     expect(textOf(html, "worker-uptime-br-1")).toBe("—");
     expect(textOf(html, "worker-error-br-1")).toBe("—");
     expect(html).not.toContain("NaN");
+  });
+});
+
+describe("WorkersTable: подсветка CAPTCHA", () => {
+  it("воркер из captchaAlertIds получает warning-индикатор, остальные — нет", async () => {
+    const html = await table({
+      phase: "online",
+      snapshot: snapshot([worker(), worker({ browser_id: "br-2" })]),
+      captchaAlertIds: ["br-1"],
+    });
+
+    expect(html).toContain('data-test="worker-captcha-br-1"');
+    expect(html).toContain("Нерешённая CAPTCHA");
+    expect(html).not.toContain('data-test="worker-captcha-br-2"');
+  });
+
+  it("без prop подсветки ни одна строка не помечена", async () => {
+    const html = await table({
+      phase: "online",
+      snapshot: snapshot([worker()]),
+    });
+
+    expect(html).not.toContain("worker-captcha-");
+  });
+
+  it("событие чужого воркера не подсвечивает лишние строки", async () => {
+    const html = await table({
+      phase: "online",
+      snapshot: snapshot([worker(), worker({ browser_id: "br-2" })]),
+      captchaAlertIds: ["br-9"],
+    });
+
+    expect(html).not.toContain("worker-captcha-");
   });
 });
 
