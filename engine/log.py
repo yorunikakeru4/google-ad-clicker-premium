@@ -217,6 +217,9 @@ class _UnavailableStore:
     def record_network_request(self, **kwargs: Any) -> None:
         raise RuntimeError(self._error)
 
+    def mark_degraded(self, **kwargs: Any) -> None:
+        raise RuntimeError(self._error)
+
     def flush(self) -> None:
         raise RuntimeError(self._error)
 
@@ -304,6 +307,30 @@ class StructuredLogger:
                 browser_id=target,
                 ts=ts,
             )
+        except Exception as exc:
+            with self._lock:
+                self._dropped += 1
+                self._last_error = str(exc)
+
+    def mark_degraded(self, reason: str, browser_id: str | None = None) -> None:
+        """Пометить воркер деградировавшим в ``workers``.
+
+        Сигнал живёт в таблице ``workers``, а не в ``logs``: супервизор и UI
+        читают статус воркера, а не перебирают сообщения. ``browser_id``
+        берётся из биндинга (``browser_id=`` в вызове перебивает), причина
+        ``reason`` не должна содержать креды прокси — маскирование остаётся
+        за вызывающим кодом. Без ``browser_id`` (CLI-прогон без ``--id``)
+        строку некуда писать, поэтому вызов пропускается: WARNING о
+        деградации вызывающий код делает сам. Ошибки гасятся так же, как у
+        :meth:`record_network_request` — счётчик ``dropped`` + ``last_error``,
+        исключение наружу не выходит.
+        """
+        with self._lock:
+            target = self._browser_id if browser_id is None else browser_id
+        if target is None:
+            return
+        try:
+            self._store.mark_degraded(browser_id=target, reason=reason)
         except Exception as exc:
             with self._lock:
                 self._dropped += 1
