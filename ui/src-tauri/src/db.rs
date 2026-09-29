@@ -1905,4 +1905,203 @@ mod tests {
             );
         }
     }
+
+    // --- list_diagnostics -------------------------------------------------
+
+    /// Строка `diagnostics` для тестов: заполняются только поля, важные
+    /// конкретному тесту, остальные остаются NULL, как в реальном снимке.
+    fn insert_diagnostic(
+        conn: &Connection,
+        ts: f64,
+        browser_id: Option<&str>,
+        ip: Option<&str>,
+    ) -> i64 {
+        conn.execute(
+            "INSERT INTO diagnostics (ts, browser_id, ip) VALUES (?1, ?2, ?3)",
+            rusqlite::params![ts, browser_id, ip],
+        )
+        .expect("строка diagnostics вставляется");
+        conn.last_insert_rowid()
+    }
+
+    #[test]
+    fn list_diagnostics_on_empty_db_returns_nothing() {
+        let tmp = TempDb::new();
+        let path = tmp.path();
+        let _writer = seed(&path, &[]);
+
+        let reader = DbReader::open(&path).expect("БД открывается");
+
+        assert_eq!(
+            reader
+                .list_diagnostics()
+                .expect("пустая БД — пустой список"),
+            vec![] as Vec<DiagnosticRow>,
+            "отсутствие снимков — не ошибка чтения"
+        );
+    }
+
+    #[test]
+    fn list_diagnostics_returns_freshest_snapshot_per_browser() {
+        let tmp = TempDb::new();
+        let path = tmp.path();
+        let writer = seed(&path, &[]);
+
+        // Снимки одного воркера вперемешку по времени: нужен самый свежий
+        // по ts, а не последняя вставленная и не первая попавшаяся строка.
+        insert_diagnostic(&writer, 100.0, Some("br-1"), Some("1.1.1.1"));
+        insert_diagnostic(&writer, 300.0, Some("br-1"), Some("3.3.3.3"));
+        insert_diagnostic(&writer, 200.0, Some("br-1"), Some("2.2.2.2"));
+        insert_diagnostic(&writer, 250.0, Some("br-2"), Some("4.4.4.4"));
+
+        let reader = DbReader::open(&path).expect("БД открывается");
+        let rows = reader.list_diagnostics().expect("список читается");
+
+        assert_eq!(
+            rows.len(),
+            2,
+            "на воркера — ровно один последний снимок, а не вся история"
+        );
+        assert_eq!(rows[0].browser_id.as_deref(), Some("br-1"));
+        assert_eq!(rows[0].ts, 300.0, "строка br-1 — самый свежий снимок");
+        assert_eq!(rows[0].ip.as_deref(), Some("3.3.3.3"));
+        assert_eq!(rows[1].browser_id.as_deref(), Some("br-2"));
+        assert_eq!(rows[1].ip.as_deref(), Some("4.4.4.4"));
+    }
+
+    #[test]
+    fn list_diagnostics_breaks_equal_ts_ties_by_insertion_order() {
+        let tmp = TempDb::new();
+        let path = tmp.path();
+        let writer = seed(&path, &[]);
+
+        // Одинаковый ts бывает при пакетной записи: свежее считается то,
+        // что вставлено позже (больший id), а не произвольная строка.
+        insert_diagnostic(&writer, 500.0, Some("br-1"), Some("old.example"));
+        insert_diagnostic(&writer, 500.0, Some("br-1"), Some("new.example"));
+
+        let reader = DbReader::open(&path).expect("БД открывается");
+        let rows = reader.list_diagnostics().expect("список читается");
+
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].ip.as_deref(), Some("new.example"));
+    }
+
+    #[test]
+    fn list_diagnostics_keeps_null_columns_and_raw_json_untouched() {
+        let tmp = TempDb::new();
+        let path = tmp.path();
+        let writer = seed(&path, &[]);
+
+        writer
+            .execute(
+                "INSERT INTO diagnostics (ts, browser_id, headers, suspicion_flags) \
+                 VALUES (1000.0, 'br-1', \
+                  '{\"User-Agent\":\"Mozilla/5.0\",\"Accept-Language\":\"de-DE\"}', \
+                  '[\"language_mismatch\",\"ua_old\"]')",
+                [],
+            )
+            .expect("снимок с JSON вставляется");
+        writer
+            .execute(
+                "INSERT INTO diagnostics (ts, browser_id, headers, suspicion_flags) \
+                 VALUES (900.0, 'br-2', '{broken', 'тоже не JSON')",
+                [],
+            )
+            .expect("снимок с битым JSON вставляется");
+        // Снимок без данных вообще: только время и воркер.
+        insert_diagnostic(&writer, 800.0, Some("br-3"), None);
+
+        let reader = DbReader::open(&path).expect("БД открывается");
+        let rows = reader.list_diagnostics().expect("список читается");
+        assert_eq!(rows.len(), 3);
+
+        let filled = rows
+            .iter()
+            .find(|row| row.browser_id.as_deref() == Some("br-1"))
+            .expect("заполненный снимок в списке");
+        // Сырые строки, а не разобранный JSON: парсинг — работа фронтенда.
+        assert_eq!(
+            filled.headers.as_deref(),
+            Some(r#"{"User-Agent":"Mozilla/5.0","Accept-Language":"de-DE"}"#)
+        );
+        assert_eq!(
+            filled.suspicion_flags.as_deref(),
+            Some(r#"["language_mismatch","ua_old"]"#)
+        );
+        assert_eq!(filled.ip, None, "не заполненные колонки — NULL");
+        assert_eq!(filled.country, None);
+        assert_eq!(filled.user_agent, None);
+        assert_eq!(filled.accept_language, None);
+        assert_eq!(filled.timezone_id, None);
+        assert_eq!(filled.screen_w, None);
+        assert_eq!(filled.screen_h, None);
+        assert_eq!(filled.platform, None);
+        assert_eq!(filled.webgl_vendor, None);
+        assert_eq!(filled.webgl_renderer, None);
+        assert_eq!(filled.browser_version, None);
+        assert_eq!(filled.proxy_id, None);
+
+        // Битый JSON не теряется и не «чинится»: читалка отдаёт строку как есть.
+        let broken = rows
+            .iter()
+            .find(|row| row.browser_id.as_deref() == Some("br-2"))
+            .expect("снимок с битым JSON в списке");
+        assert_eq!(broken.headers.as_deref(), Some("{broken"));
+        assert_eq!(broken.suspicion_flags.as_deref(), Some("тоже не JSON"));
+
+        // Контракт колонок: фронт получает все 16 полей, включая NULL.
+        let json = serde_json::to_value(filled).expect("строка сериализуется");
+        let object = json.as_object().expect("JSON — объект");
+        for field in [
+            "ts",
+            "browser_id",
+            "proxy_id",
+            "ip",
+            "country",
+            "user_agent",
+            "accept_language",
+            "timezone_id",
+            "screen_w",
+            "screen_h",
+            "platform",
+            "webgl_vendor",
+            "webgl_renderer",
+            "browser_version",
+            "headers",
+            "suspicion_flags",
+        ] {
+            assert!(
+                object.contains_key(field),
+                "контрактная колонка {field} должна попасть в ответ"
+            );
+        }
+    }
+
+    #[test]
+    fn list_diagnostics_groups_rows_without_browser_id_and_puts_them_last() {
+        let tmp = TempDb::new();
+        let path = tmp.path();
+        let writer = seed(&path, &[]);
+
+        insert_diagnostic(&writer, 10.0, None, Some("anonymous-old"));
+        insert_diagnostic(&writer, 20.0, None, Some("anonymous-new"));
+        insert_diagnostic(&writer, 15.0, Some("br-1"), Some("1.1.1.1"));
+
+        let reader = DbReader::open(&path).expect("БД открывается");
+        let rows = reader.list_diagnostics().expect("список читается");
+
+        assert_eq!(
+            rows.len(),
+            2,
+            "снимки без browser_id складываются в одну группу"
+        );
+        assert_eq!(rows[0].browser_id.as_deref(), Some("br-1"));
+        assert_eq!(
+            rows[1].browser_id, None,
+            "анонимный снимок не выбрасывается, но идёт последним"
+        );
+        assert_eq!(rows[1].ip.as_deref(), Some("anonymous-new"));
+        assert_eq!(rows[1].ts, 20.0);
+    }
 }
