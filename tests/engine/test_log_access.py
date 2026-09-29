@@ -255,3 +255,25 @@ class TestDualWrite:
 
         assert len(_logs(db_path)) == 1
         assert _legacy_records(caplog) == []
+
+    def test_mirror_survives_poison_fields(self, writer, db_path, caplog):
+        """Ядовитое значение в fields не роняет ни store, ни зеркало."""
+
+        class Poison:
+            def __repr__(self) -> str:
+                raise RuntimeError("repr is broken")
+
+        legacy = __import__(LEGACY_LOGGER_NAME)
+        with caplog.at_level(logging.DEBUG, logger=legacy.__name__):
+            log = StructuredLogger(writer, browser_id="br-1", mirror=legacy_mirror)
+            log.info("browser", "weird", fields={"p": Poison()})
+        writer.flush()
+
+        rows = _logs(db_path)
+        assert len(rows) == 1
+        assert json.loads(rows[0]["fields"]) == {"p": "<unrepresentable> Poison"}
+        assert log.dropped == 0
+
+        mirrored = _legacy_records(caplog)
+        assert len(mirrored) == 1
+        assert "<unrepresentable>" in mirrored[0].getMessage()
