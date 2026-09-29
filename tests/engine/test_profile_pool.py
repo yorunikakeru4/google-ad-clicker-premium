@@ -399,6 +399,56 @@ class TestListProfiles:
         assert [row["name"] for row in pool.list_profiles()] == ["c", "a", "b"]
 
 
+class TestGetProfile:
+    """Read-only строка профиля для воркера (engine.profile_apply).
+
+    Воркеру нужны настройки, а не решение о праве работать: никаких
+    проверок статуса и владения здесь нет — их делает машина статусов в
+    ``mark_active``/``mark_done``.
+    """
+
+    def test_returns_the_row_with_fields_as_an_object(self, pool):
+        pool.add_profiles(
+            [
+                {
+                    "name": "alice",
+                    "user_agent": "UA/1.0",
+                    "locale": "en-US",
+                    "timezone": "UTC",
+                    "fields": {"cookie_set": "alice.txt"},
+                }
+            ]
+        )
+
+        row = pool.get_profile(profile_ids(pool)[0])
+
+        assert row is not None
+        assert row["name"] == "alice"
+        assert row["user_agent"] == "UA/1.0"
+        assert row["locale"] == "en-US"
+        assert row["timezone"] == "UTC"
+        assert row["status"] == "free"
+        assert row["fields"] == {"cookie_set": "alice.txt"}
+
+    def test_null_settings_stay_null_not_empty_strings(self, pool):
+        add_free_profiles(pool, 1)
+
+        row = pool.get_profile(profile_ids(pool)[0])
+
+        assert row["user_agent"] is None
+        assert row["locale"] is None
+        assert row["timezone"] is None
+
+    def test_unknown_id_yields_none(self, pool):
+        add_free_profiles(pool, 1)
+
+        assert pool.get_profile(424242) is None
+
+    @pytest.mark.parametrize("bad_id", [True, "3", 3.0, None, 0, -1])
+    def test_ids_outside_the_contract_yield_none(self, pool, bad_id):
+        assert pool.get_profile(bad_id) is None
+
+
 class TestDelete:
     def test_deletes_a_free_profile(self, pool, db_path):
         (profile_id,) = add_free_profiles(pool, 1)
