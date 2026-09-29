@@ -310,3 +310,105 @@ class TestProfileUserAgent:
             ad_clicker.run_scenario(query="usb hub")
 
         assert capture_user_agent["user_agent"] == "UA/Random"
+
+
+class TestDiagnosticsCheckpoint:
+    """Снимок диагностики в сценарии: две точки входа и защита от сбоев.
+
+    Сбор обязан проходить при живом браузере (автосбор за сессию и kv-сигнал
+    из UI) и ни при каких условиях не ронять прогон — иначе диагностика
+    стоила бы сценария.
+    """
+
+    @staticmethod
+    def _record(monkeypatch, error=None):
+        calls = []
+        warnings = []
+
+        def fake_checkpoint(driver, **kwargs):
+            calls.append((driver, kwargs))
+            if error is not None:
+                raise error
+
+        monkeypatch.setattr(ad_clicker, "session_checkpoint", fake_checkpoint)
+        monkeypatch.setattr(
+            ad_clicker.log,
+            "warning",
+            lambda *args, **kwargs: warnings.append((args, kwargs)),
+        )
+        return calls, warnings
+
+    def test_forwards_driver_browser_id_store_and_logger(self, monkeypatch):
+        calls, _ = self._record(monkeypatch)
+        driver = object()
+
+        ad_clicker.diagnostics_checkpoint(driver, "br-1")
+
+        assert len(calls) == 1
+        got_driver, kwargs = calls[0]
+        assert got_driver is driver
+        assert kwargs["browser_id"] == "br-1"
+        assert kwargs["store"] is not None
+        assert kwargs["logger"] is ad_clicker.log
+
+    def test_without_a_browser_id_nowhere_to_write(self, monkeypatch):
+        calls, warnings = self._record(monkeypatch)
+
+        ad_clicker.diagnostics_checkpoint(object(), None)
+
+        assert calls == [], "CLI-прогон без --id не должен трогать БД"
+        assert warnings == []
+
+    def test_a_failing_checkpoint_never_escapes(self, monkeypatch):
+        calls, warnings = self._record(monkeypatch, RuntimeError("checkpoint exploded"))
+
+        ad_clicker.diagnostics_checkpoint(object(), "br-1")
+
+        assert len(calls) == 1, "попытка была"
+        assert warnings, "сбой обязан остаться в логе"
+        assert "checkpoint exploded" in str(warnings)
+
+
+class TestScenarioCheckpoints:
+    """Места вызова в run_scenario: сразу после создания браузера и в finally."""
+
+    @pytest.fixture
+    def fake_driver(self):
+        class Driver:
+            def quit(self):
+                pass
+
+        return Driver()
+
+    @pytest.fixture
+    def checkpoints(self, monkeypatch, fake_driver):
+        calls = []
+        monkeypatch.setattr(
+            ad_clicker,
+            "diagnostics_checkpoint",
+            lambda driver, browser_id: calls.append((driver, browser_id)),
+        )
+        # Поиск падает сразу: дальше по сценарию идти некуда, а обе точки
+        # сбора (после create_webdriver и в finally) уже должны были пройти.
+        def boom(*args, **kwargs):
+            raise RuntimeError("no search")
+
+        monkeypatch.setattr(ad_clicker, "SearchController", boom)
+        return calls
+
+    def test_checkpoint_runs_after_the_browser_opens_and_before_it_closes(
+        self, fake_driver, checkpoints, monkeypatch
+    ):
+        monkeypatch.setattr(
+            ad_clicker, "create_webdriver", lambda *args, **kwargs: (fake_driver, None)
+        )
+        monkeypatch.setattr(
+            ad_clicker, "get_random_user_agent_string", lambda: "UA/Random"
+        )
+
+        completed = ad_clicker.run_scenario(query="usb hub")
+
+        assert completed is False, "упавший поиск — прогон с ошибкой, а не падение процесса"
+        assert checkpoints == [(fake_driver, None), (fake_driver, None)], (
+            "снимок должен быть и при открытии браузера, и перед его закрытием"
+        )

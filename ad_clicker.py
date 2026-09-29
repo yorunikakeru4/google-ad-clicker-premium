@@ -10,7 +10,9 @@ from pathlib import Path
 import hooks
 from clicklogs_db import ClickLogsDB
 from config_reader import config
-from engine.log import get_logger
+from engine.control_plane.state import StateStore
+from engine.diagnostics import session_checkpoint
+from engine.log import get_logger, resolve_db_path
 from engine.profile_apply import current_profile, resolve_user_agent
 from engine.worker import proxy_from_environ
 from logger import update_log_formats
@@ -103,6 +105,37 @@ def resolve_proxy(args) -> str | None:
     return None
 
 
+def diagnostics_checkpoint(driver, browser_id: str | None) -> None:
+    """Снимок диагностики при живом браузере. Никогда не бросает.
+
+    Два вызова на прогон: сразу после ``create_webdriver`` (автосбор за
+    сессию + kv-сигнал, пришедший между сценариями) и в ``finally`` перед
+    закрытием браузера (сигнал, пришедший во время сценария). Между
+    итерациями цикла браузера нет — там сигнал только наблюдается
+    (``engine.worker``), поэтому эти две точки и есть места, где сбор
+    реально возможен.
+
+    Без ``browser_id`` писать некуда (CLI-прогон без ``--id``) — пропускается.
+    Любая ошибка гасится здесь с WARNING: диагностика не должна ронять ни
+    воркер, ни сценарий.
+    """
+    if not browser_id:
+        return
+    try:
+        session_checkpoint(
+            driver,
+            browser_id=browser_id,
+            store=StateStore(resolve_db_path()),
+            logger=log,
+        )
+    except Exception as exp:  # noqa: BLE001 - сценарий важнее снимка
+        log.warning(
+            "browser",
+            "diagnostics checkpoint failed",
+            fields={"error": str(exp), "error_type": type(exp).__name__},
+        )
+
+
 def run_scenario(
     *,
     query: str,
@@ -142,6 +175,11 @@ def run_scenario(
     plugin_folder_name = "".join(random.choices(string.ascii_lowercase, k=5))
 
     driver, country_code = create_webdriver(proxy, user_agent, plugin_folder_name)
+
+    # Старт сессии: автосбор один раз за жизнь процесса + запрос из UI,
+    # пришедший, пока браузера не было. До поиска и до cookies — снимок
+    # отражает именно то, что увидит сайт на входе.
+    diagnostics_checkpoint(driver, browser_id)
 
     if check_stealth:
         from time import sleep
@@ -261,6 +299,11 @@ def run_scenario(
             hooks.exception_hook(driver)
 
     finally:
+        # Последний чекпоинт за прогон: браузер ещё жив, а запрос из UI мог
+        # прийти в любой момент сценария — сигнал снимается здесь, не дожидаясь
+        # следующего прогона.
+        diagnostics_checkpoint(driver, browser_id)
+
         if search_controller:
             if config.behavior.hooks_enabled:
                 hooks.before_browser_close_hook(driver)

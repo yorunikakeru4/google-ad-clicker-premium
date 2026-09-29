@@ -108,11 +108,14 @@ class RecordingLogger:
         self.diagnostics: list[dict] = []
         self.record_error = record_error
 
+    def log(self, level, category, message, **kwargs):
+        self.records.append((level, category, message, kwargs))
+
     def info(self, category, message, **kwargs):
-        self.records.append(("INFO", category, message, kwargs))
+        self.log("INFO", category, message, **kwargs)
 
     def warning(self, category, message, **kwargs):
-        self.records.append(("WARNING", category, message, kwargs))
+        self.log("WARNING", category, message, **kwargs)
 
     def record_diagnostic(self, **kwargs):
         if self.record_error is not None:
@@ -217,9 +220,10 @@ class TestSignalDrivenCollection:
         used = checkpoint(FakeDriver(), store=store, logger=logger)
 
         assert used is True
-        assert logger.info_fields(SNAPSHOT_LOGGED) == [
-            {"reason": "signal", "signal": value}
-        ]
+        assert logger.info_fields(SNAPSHOT_LOGGED)[-1] == {
+            "reason": "signal",
+            "signal": value,
+        }
         assert read_signal(store, "br-1") is None, "флаг обязан сняться после попытки"
 
     def test_replayed_value_is_stale_and_does_not_collect(self, store):
@@ -355,7 +359,9 @@ class TestFailureIsolation:
         assert logger.warnings
         assert "chrome crashed" in str(logger.records)
 
-    def test_exploding_fetcher_is_contained(self, store):
+    def test_exploding_fetcher_becomes_a_flag_not_a_failure(self, store):
+        """Отказ echo — это повод для флага в снимке, а не падение сбора:
+        контракт — «поля null + ошибка в снимке, не падение»."""
         logger = RecordingLogger()
 
         def boom(_driver):
@@ -363,8 +369,12 @@ class TestFailureIsolation:
 
         used = checkpoint(FakeDriver(), store=store, logger=logger, echo_fetcher=boom)
 
-        assert used is False
-        assert logger.warnings
+        assert used is True
+        assert logger.warnings == []
+        flags = logger.diagnostics[0]["suspicion_flags"]
+        assert any("fetcher exploded" in flag for flag in flags)
+        assert logger.diagnostics[0]["headers"] is None
+        assert logger.diagnostics[0]["ip"] is None
 
     def test_exploding_store_read_is_contained(self, store):
         logger = RecordingLogger()
@@ -388,8 +398,10 @@ class TestFailureIsolation:
         assert logger.warnings
         assert "disk full" in str(logger.records)
 
-    def test_missing_logger_is_tolerated(self, store):
-        assert checkpoint(FakeDriver(), store=store, logger=None) is True
+    def test_missing_logger_does_not_raise(self, store):
+        """Без логгера писать некуда: сбор не роняет процесс, но и не
+        считается записанным — иначе «успех» означал бы снимок в никуда."""
+        assert checkpoint(FakeDriver(), store=store, logger=None) is False
 
 
 # --- прокси и страна -----------------------------------------------------------
@@ -485,6 +497,32 @@ class TestRowInDatabase:
         assert "s3cr3t" not in blob
         assert "alice" not in blob
 
+    def test_language_flag_uses_the_proxy_country(self, store, db_path, writer):
+        """Страна в правиле «язык ↔ страна» приходит из строки прокси
+        воркера, а не из гео: именно её закрепляет супервизор."""
+        with sqlite3.connect(db_path) as conn:
+            cursor = conn.execute(
+                "INSERT INTO proxies (host, port, country) VALUES ('10.0.0.1', 8080, 'DE')"
+            )
+            conn.execute(
+                "INSERT INTO workers (browser_id, status, proxy_id) VALUES "
+                "('br-1', 'running', ?)",
+                (cursor.lastrowid,),
+            )
+            conn.commit()
+
+        logger = StructuredLogger(writer, browser_id="br-1")
+        page = dict(PAGE, accept_language="ru-RU,ru;q=0.9")
+
+        checkpoint(FakeDriver(page), store=store, logger=logger)
+
+        row = diagnostics_rows(db_path)[0]
+        assert row["country"] == "DE"
+        assert row["proxy_id"] is not None
+        flags = json.loads(row["suspicion_flags"])
+        assert len(flags) == 1, flags
+        assert "DE" in flags[0] and "ru" in flags[0]
+
     def test_flags_and_errors_land_in_the_json_column(self, store, db_path, writer):
         logger = StructuredLogger(writer, browser_id="br-1")
         page = dict(PAGE, accept_language="ru-RU", platform="MacIntel")
@@ -497,8 +535,8 @@ class TestRowInDatabase:
         )
 
         flags = json.loads(diagnostics_rows(db_path)[0]["suspicion_flags"])
-        assert len(flags) == 3, flags
-        assert any("DE" in flag for flag in flags)
+        assert len(flags) == 2, flags
+        assert any("Платформа" in flag for flag in flags)
         assert any("echo" in flag for flag in flags)
 
 
@@ -565,6 +603,28 @@ class TestWorkerLoopCheckpoint:
 
         messages = [r["message"] for r in _read_logs(db_path)]
         assert SIGNAL_PENDING not in messages
+
+    def test_loop_observes_the_signal_while_paused(self, logger, stop_event, db_path, writer):
+        """Пауза — отдельный чекпоинт из контракта: воркер ждёт resume,
+        но запрос из UI обязан быть замечен и не потерян до возобновления."""
+        from tests.engine.test_worker import ScriptedPauseStore
+
+        store = ScriptedPauseStore(db_path, hold_for=3)
+        request_signal(store, "br-1", now=1700000100.0)
+        source = self._stopping_source(stop_event)
+
+        code = self._runner(source, store, logger, stop_event).run()
+        writer.flush()
+
+        assert code == EXIT_OK
+        assert store._reads >= 3, "воркер действительно стоял на паузе"
+        assert read_signal(store, "br-1") is not None, (
+            "флаг пережил паузу: без браузера его снимать некому"
+        )
+        messages = [r["message"] for r in _read_logs(db_path)]
+        assert SIGNAL_PENDING in messages
+        assert diagnostics_rows(db_path) == []
+        assert source.requests, "после паузы сценарий должен был отработать"
 
     def test_loop_survives_a_failing_signal_check(
         self, store, logger, stop_event, db_path, writer

@@ -409,6 +409,7 @@ class TestCollectSnapshot:
 
     def test_explicit_proxy_country_wins_over_the_geo_one(self):
         driver = FakeDriver(dict(FULL_PAGE), capabilities={})
+        driver._geo_country = "DE"
 
         snapshot = collect_snapshot(
             driver,
@@ -418,7 +419,6 @@ class TestCollectSnapshot:
             local_ip_fetcher=lambda _driver: None,
             locales={"TR": ["tr-TR"]},
         )
-        driver._geo_country = "DE"
 
         assert snapshot.country == "TR"
 

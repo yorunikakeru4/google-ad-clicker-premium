@@ -421,6 +421,12 @@ def create_webdriver(
     chrome_options.add_argument("--profile-directory=Default")
 
     country_code = None
+    # Гео до приоритета профиля: их читает диагностика (engine.diagnostics),
+    # чтобы сверить часовой пояс и страну страницы с прокси, а не с тем, что
+    # оператор захотел видеть в профиле. Оба — best effort: без прокси и без
+    # get_location здесь остаётся None, и правила сравнения их пропускают.
+    geo_country: Optional[str] = None
+    geo_timezone: Optional[str] = None
 
     multi_procs_enabled = is_multi_procs_enabled()
     driver_exe_path = None
@@ -449,6 +455,9 @@ def create_webdriver(
 
         # get location of the proxy IP
         lat, long, country_code, timezone = get_location(geolocation_db_client, proxy)
+        # До resolve_timezone: дальше пояс может заменить профильный, а
+        # гео-значение для диагностики должно остаться именно гео.
+        geo_country, geo_timezone = country_code, timezone
 
         # Профильная локаль главнее гео-вычисления; само гео вызывается
         # только когда включён language_from_proxy, как и раньше.
@@ -488,6 +497,9 @@ def create_webdriver(
 
                 if response.status_code == 200:
                     timezone = response.json()["tz_name"]
+                # Ветка возможна только когда не гео, не профиль не дали
+                # пояса, поэтому найденный здесь — тоже гео-вычисление.
+                geo_timezone = timezone
 
             _override_timezone(driver, timezone, fields={"proxy": host_port})
 
@@ -496,6 +508,11 @@ def create_webdriver(
             # geolocation вернул пояс отдельно от широты/долготы. Профильный
             # применяется сам по себе: он к гео не привязан.
             _override_timezone(driver, profile_timezone)
+
+        # Для диагностики: страна и пояс прокси, какими их дал get_location,
+        # — по ним правило «timezone ↔ гео» отличает рассинхрон от профиля.
+        driver._geo_country = geo_country
+        driver._geo_timezone = geo_timezone
 
     else:
         # Без прокси legacy локаль и пояс не ставил ни в каком виде; с профилем
@@ -555,6 +572,9 @@ def create_seleniumbase_driver(
     profile_timezone = resolve_timezone(profile, None)
 
     country_code = None
+    # Гео до приоритета профиля — их читает диагностика (см. UC-ветку).
+    geo_country: Optional[str] = None
+    geo_timezone: Optional[str] = None
     credentials: tuple[str, str] | None = None
     host_port = ""
     lang = None
@@ -569,6 +589,9 @@ def create_seleniumbase_driver(
 
         # get location of the proxy IP
         lat, long, country_code, timezone = get_location(geolocation_db_client, proxy)
+        # Как в UC-ветке: гео-пояс фиксируется до приоритета профиля — его
+        # читает диагностика.
+        geo_country, geo_timezone = country_code, timezone
 
         if config.webdriver.language_from_proxy:
             lang = get_locale_language(country_code)
@@ -625,6 +648,8 @@ def create_seleniumbase_driver(
             response = requests.get(f"http://timezonefinder.michelfe.it/api/0_{long}_{lat}")
             if response.status_code == 200:
                 timezone = response.json()["tz_name"]
+            # Ни гео, ни профиль пояса не дали — значит, он гео-вычисленный.
+            geo_timezone = timezone
 
         _override_timezone(driver, timezone, fields={"proxy": host_port})
 
@@ -632,6 +657,11 @@ def create_seleniumbase_driver(
         # Без координат legacy пояс не ставил вовсе; профильный применяется
         # сам по себе — и в прокси-ветке, и без прокси.
         _override_timezone(driver, profile_timezone)
+
+    if proxy:
+        # Для диагностики: гео-страна и гео-пояс прокси, как их дал get_location.
+        driver._geo_country = geo_country
+        driver._geo_timezone = geo_timezone
 
     # handle window size and position
     if config.webdriver.window_size:
