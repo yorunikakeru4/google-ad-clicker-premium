@@ -12,6 +12,7 @@
 
 from __future__ import annotations
 
+import json
 import sqlite3
 import threading
 import time
@@ -427,6 +428,136 @@ class TestMarkDegraded:
 
         assert writer.dropped >= 1
         assert writer.last_error is not None
+
+
+class TestRecordDiagnostic:
+    """Снимок диагностики: немедленная запись, JSON-колонки, политика ошибок."""
+
+    def test_writes_every_column_without_an_explicit_flush(self, db_path):
+        writer = StoreWriter(db_path, batch_size=100, flush_interval=60.0)
+        try:
+            writer.record_diagnostic(
+                browser_id="br-1",
+                ts=1700000000.25,
+                proxy_id=3,
+                ip="203.0.113.7",
+                country="DE",
+                user_agent="UA/1.0",
+                accept_language="de-DE,de;q=0.9",
+                timezone_id="Europe/Berlin",
+                screen_w=1920,
+                screen_h=1080,
+                platform="Win32",
+                webgl_vendor="Google Inc. (NVIDIA)",
+                webgl_renderer="ANGLE (NVIDIA, GeForce)",
+                browser_version="131.0.6778.86",
+                headers={"User-Agent": "UA/1.0", "Accept-Language": "de-DE"},
+                suspicion_flags=["timezone не соответствует гео"],
+            )
+
+            rows = _read(db_path, "SELECT * FROM diagnostics")
+        finally:
+            writer.close()
+
+        assert len(rows) == 1, "снимок должен попасть в БД сразу, без flush"
+        row = rows[0]
+        assert row["ts"] == 1700000000.25
+        assert row["browser_id"] == "br-1"
+        assert row["proxy_id"] == 3
+        assert row["ip"] == "203.0.113.7"
+        assert row["country"] == "DE"
+        assert row["user_agent"] == "UA/1.0"
+        assert row["accept_language"] == "de-DE,de;q=0.9"
+        assert row["timezone_id"] == "Europe/Berlin"
+        assert row["screen_w"] == 1920
+        assert row["screen_h"] == 1080
+        assert row["platform"] == "Win32"
+        assert row["webgl_vendor"] == "Google Inc. (NVIDIA)"
+        assert row["webgl_renderer"] == "ANGLE (NVIDIA, GeForce)"
+        assert row["browser_version"] == "131.0.6778.86"
+        assert json.loads(row["headers"]) == {"User-Agent": "UA/1.0", "Accept-Language": "de-DE"}
+        assert json.loads(row["suspicion_flags"]) == ["timezone не соответствует гео"]
+
+    def test_optional_fields_are_null_and_json_columns_stay_json(self, db_path):
+        writer = StoreWriter(db_path, batch_size=100, flush_interval=60.0)
+        try:
+            writer.record_diagnostic(browser_id="br-2")
+
+            rows = _read(db_path, "SELECT * FROM diagnostics")
+        finally:
+            writer.close()
+
+        row = rows[0]
+        assert row["proxy_id"] is None
+        assert row["ip"] is None
+        assert row["country"] is None
+        assert row["headers"] is None
+        assert json.loads(row["suspicion_flags"]) == [], "пустой список — это JSON, а не NULL"
+        assert row["ts"] > 0
+
+    def test_flag_list_survives_as_a_list_even_when_empty(self, db_path):
+        writer = StoreWriter(db_path, batch_size=100, flush_interval=60.0)
+        try:
+            writer.record_diagnostic(browser_id="br-1", suspicion_flags=[])
+
+            flags = _read(db_path, "SELECT suspicion_flags FROM diagnostics")[0][
+                "suspicion_flags"
+            ]
+        finally:
+            writer.close()
+
+        assert json.loads(flags) == []
+
+    @pytest.mark.parametrize("browser_id", ["", "   ", None])
+    def test_browser_id_is_required(self, db_path, browser_id):
+        writer = StoreWriter(db_path, batch_size=100, flush_interval=60.0)
+        try:
+            with pytest.raises(ValueError):
+                writer.record_diagnostic(browser_id=browser_id)
+        finally:
+            writer.close()
+
+    def test_missing_browser_id_argument_is_a_type_error(self, db_path):
+        writer = StoreWriter(db_path, batch_size=100, flush_interval=60.0)
+        try:
+            with pytest.raises(TypeError):
+                writer.record_diagnostic()
+        finally:
+            writer.close()
+
+    def test_closed_writer_counts_loss_and_never_raises(self, db_path):
+        writer = StoreWriter(db_path, batch_size=100, flush_interval=60.0)
+        writer.close()
+
+        writer.record_diagnostic(browser_id="br-1", ip="203.0.113.7")
+
+        assert writer.dropped >= 1
+        assert writer.last_error is not None
+
+    def test_broken_connection_counts_loss_and_never_raises(self, db_path):
+        writer = StoreWriter(db_path, batch_size=100, flush_interval=60.0)
+        try:
+            writer._conn.close()
+
+            writer.record_diagnostic(browser_id="br-1")
+
+            assert writer.dropped >= 1
+            assert writer.last_error is not None
+        finally:
+            writer.close()
+
+    def test_writer_keeps_accepting_records_after_a_failed_diagnostic(self, db_path):
+        writer = StoreWriter(db_path, batch_size=100, flush_interval=60.0)
+        try:
+            writer._conn.close()
+            writer.record_diagnostic(browser_id="br-1")
+            dropped_after_first = writer.dropped
+
+            writer.record_diagnostic(browser_id="br-1")
+
+            assert writer.dropped == dropped_after_first + 1
+        finally:
+            writer.close()
 
 
 class TestConstructor:

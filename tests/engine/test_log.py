@@ -397,3 +397,84 @@ class TestMarkDegraded:
             ("degraded", "cdp connection lost"),
         ]
         assert [r for r in caplog.records if r.name == legacy.__name__] == []
+
+
+def _diagnostics(db_path):
+    with sqlite3.connect(db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        return conn.execute(
+            "SELECT browser_id, ip, headers, suspicion_flags FROM diagnostics "
+            "ORDER BY browser_id"
+        ).fetchall()
+
+
+class TestRecordDiagnostic:
+    """Снимок диагностики через логгер: биндинг и политика ошибок.
+
+    Путь воркера именно такой: в ``ad_clicker`` уже есть общий логгер
+    процесса, и снимок пишется через него — как и ``mark_degraded``, без
+    отдельного соединения и без зеркалирования в legacy-лог.
+    """
+
+    def test_uses_bound_browser_id_and_writes_a_row(self, writer, db_path):
+        logger = StructuredLogger(writer, browser_id="br-1")
+
+        logger.record_diagnostic(
+            ip="203.0.113.7",
+            headers={"Accept": "application/json"},
+            suspicion_flags=["платформа не соответствует ОС"],
+        )
+
+        rows = _diagnostics(db_path)
+        assert [(r["browser_id"], r["ip"]) for r in rows] == [("br-1", "203.0.113.7")]
+        assert json.loads(rows[0]["headers"]) == {"Accept": "application/json"}
+        assert json.loads(rows[0]["suspicion_flags"]) == ["платформа не соответствует ОС"]
+
+    def test_explicit_browser_id_overrides_bound_one(self, writer, db_path):
+        logger = StructuredLogger(writer, browser_id="br-1")
+
+        logger.record_diagnostic(browser_id="br-2", ip="198.51.100.1")
+
+        assert [r["browser_id"] for r in _diagnostics(db_path)] == ["br-2"]
+
+    def test_without_browser_id_writes_nothing_and_does_not_raise(self, writer, db_path):
+        """CLI-прогон без --id: писать некуда, но падать нельзя."""
+
+        logger = StructuredLogger(writer)
+
+        logger.record_diagnostic(ip="203.0.113.7")
+
+        assert _diagnostics(db_path) == []
+        assert logger.dropped == 0
+        assert logger.last_error is None
+
+    def test_broken_store_counts_loss_and_never_raises(self):
+        logger = StructuredLogger(_BrokenStore(), browser_id="br-1")
+
+        logger.record_diagnostic(ip="203.0.113.7")
+
+        assert logger.dropped == 1
+        assert logger.last_error is not None
+
+    def test_unavailable_store_explains_itself_in_last_error(self):
+        from engine.log import _UnavailableStore
+
+        logger = StructuredLogger(_UnavailableStore("хранилище недоступно"), browser_id="br-1")
+
+        logger.record_diagnostic(ip="203.0.113.7")
+
+        assert logger.dropped == 1
+        assert "хранилище недоступно" in logger.last_error
+
+    def test_snapshot_row_does_not_mirror_into_legacy_log(self, writer, db_path, caplog):
+        """Снимок живёт в ``diagnostics``, а не дублируется в логи."""
+
+        legacy = __import__("logger")
+        logger = StructuredLogger(writer, browser_id="br-1", mirror=legacy_mirror)
+
+        with caplog.at_level(logging.DEBUG, logger=legacy.__name__):
+            logger.record_diagnostic(ip="203.0.113.7")
+        writer.flush()
+
+        assert [r["ip"] for r in _diagnostics(db_path)] == ["203.0.113.7"]
+        assert [r for r in caplog.records if r.name == legacy.__name__] == []
