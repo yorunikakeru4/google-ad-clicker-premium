@@ -4,6 +4,7 @@ import {
   controlRequest,
   disabledReason,
   errorMessage,
+  profilesRequest,
   proxiesRequest,
   toStatusView,
   type StatusView,
@@ -129,6 +130,63 @@ describe("proxiesRequest", () => {
     expect(first.body).toBe(JSON.stringify({ lines: ["a:1"] }));
     expect(second.body).toBe('{"id":42}');
     expect(JSON.parse(second.body ?? "{}")).toEqual({ id: 42 });
+  });
+});
+
+describe("profilesRequest", () => {
+  it("каждое действие профиля уходит на свой endpoint с телом контракта", () => {
+    expect(profilesRequest({ kind: "list" })).toEqual({
+      method: "GET",
+      path: "/control/profiles",
+    });
+    expect(
+      profilesRequest({
+        kind: "add",
+        profiles: [{ name: "alpha", key_ref: "k-1" }],
+      }),
+    ).toEqual({
+      method: "POST",
+      path: "/control/profiles",
+      body: JSON.stringify({ profiles: [{ name: "alpha", key_ref: "k-1" }] }),
+    });
+    expect(profilesRequest({ kind: "import", lines: ["k-1", "k-2"] })).toEqual({
+      method: "POST",
+      path: "/control/profiles/import",
+      body: JSON.stringify({ lines: ["k-1", "k-2"] }),
+    });
+    expect(profilesRequest({ kind: "delete", id: 7 })).toEqual({
+      method: "POST",
+      path: "/control/profiles/delete",
+      body: '{"id":7}',
+    });
+    expect(profilesRequest({ kind: "assign", start_id: 1, end_id: 10 })).toEqual({
+      method: "POST",
+      path: "/control/profiles/assign",
+      body: '{"start_id":1,"end_id":10}',
+    });
+    expect(profilesRequest({ kind: "unassign" })).toEqual({
+      method: "POST",
+      path: "/control/profiles/unassign",
+      body: "{}",
+    });
+    expect(profilesRequest({ kind: "status", id: 3, status: "blocked" })).toEqual({
+      method: "POST",
+      path: "/control/profiles/status",
+      body: '{"id":3,"status":"blocked"}',
+    });
+  });
+
+  it("тело собирается из payload, а не из глобального состояния", () => {
+    const first = profilesRequest({ kind: "add", profiles: [{ name: "a" }] });
+    const second = profilesRequest({ kind: "assign", start_id: 5, end_id: 9 });
+
+    expect(first.body).toBe(JSON.stringify({ profiles: [{ name: "a" }] }));
+    expect(second.body).toBe('{"start_id":5,"end_id":9}');
+    expect(JSON.parse(second.body ?? "{}")).toEqual({ start_id: 5, end_id: 9 });
+  });
+
+  it("GET-список не несёт тела", () => {
+    expect(profilesRequest({ kind: "list" }).body).toBeUndefined();
   });
 });
 

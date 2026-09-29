@@ -4,6 +4,7 @@ import {
   formatPid,
   formatUptime,
   formatClockTime,
+  formatLastUsed,
 } from "./format";
 
 describe("formatUptime", () => {
@@ -57,5 +58,22 @@ describe("formatClockTime", () => {
   it("время — HH:MM:SS локального часового пояса", () => {
     const at = new Date(2026, 8, 29, 7, 5, 3).getTime();
     expect(formatClockTime(at)).toBe("07:05:03");
+  });
+});
+
+describe("formatLastUsed", () => {
+  it("неиспользованный профиль — тире", () => {
+    expect(formatLastUsed(null)).toBe("—");
+    expect(formatLastUsed(undefined)).toBe("—");
+  });
+
+  it("эпоха в секундах (REAL в SQLite) — дата и время локального пояса", () => {
+    const at = new Date(2026, 8, 29, 7, 5, 3).getTime() / 1000;
+    expect(formatLastUsed(at)).toBe("2026-09-29 07:05");
+  });
+
+  it("дробные секунды не ломают формат", () => {
+    const at = new Date(2026, 0, 1, 23, 59, 59).getTime() / 1000 + 0.999;
+    expect(formatLastUsed(at)).toBe("2026-01-01 23:59");
   });
 });
