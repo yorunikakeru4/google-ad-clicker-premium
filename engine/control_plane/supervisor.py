@@ -22,6 +22,36 @@
 поднялся. Обратная сторона: мгновенно падающий воркер исчерпывает потолок за
 несколько секунд и замирает — это намеренно, потому что «поднимать зомби» и
 выжигать CPU куда хуже, чем остановиться и показать в UI ``circuit_open``.
+
+**Назначение прокси.** Супервизор — единственный, кто выдаёт
+``ADCLICKER_PROXY``: пул читается на каждом спавне, выбор делается по живым
+(``is_alive=1``) и не занятым другим живым воркером строкам, внутри
+категории берётся наименее используемая (``usage_count``, затем ``id``), чтобы
+нагрузка не садилась на один прокси. Свободных нет — прокси делится с WARNING
+(старт блокировать нельзя); живых нет или пул пуст — спавн без
+``ADCLICKER_PROXY``, как и до этой фичи. Наследие переменной из окружения
+демона снимается: иначе воркеры мимо пула получили бы один и тот же прокси.
+Факт выдачи уходит в ``workers.proxy_id`` (StateStore), строку ``proxy_usage``
+и лог с категорией ``proxy`` — без кредов, только ``proxy_id``.
+
+**Ротация.** Воркер, пометивший себя ``degraded`` (прокси/CDP перестал
+работать), не остаётся в ``running``: ``tick()`` видит сигнал и подменяет
+прокси на резервный — свободный живой, не текущий. Резерва нет — воркер
+остаётся ``degraded`` с WARNING и пробует снова через backoff, процесс при
+этом не убивается: без резерва убийство ничего не чинит, а теряло бы
+работающий сценарий. Ротация — не падение воркера, поэтому ``restart_count``
+и circuit breaker она не трогает (иначе несколько смен прокси убили бы
+здорового воркера потолком рестартов); наблюдаемость дают ``proxy_usage``,
+логи и статус в ``/state``. Темп задаётся тем же ``backoff_delay``, что и у
+рестартов: повторная деградация сразу после подмены не превращается в
+плотный цикл.
+
+**Лексика ``proxy_usage.result``** (пишется только здесь, значений больше нет):
+
+* ``assigned`` — выдача при спавне/респавне;
+* ``shared`` — выдача при дележе: свободных живых прокси не осталось;
+* ``rotated`` — выдача резервного прокси при ротации;
+* ``exhausted`` — запись по прокси, который воркер пометил деградировавшим.
 """
 
 from __future__ import annotations
@@ -36,10 +66,33 @@ from dataclasses import dataclass
 from typing import Any, Protocol
 
 from engine.control_plane.state import StateStore, WorkerStatus
+from engine.proxy_pool import ProxyError, ProxyPool
 
 # Heartbeat в БД раз в 5 секунд: чаще — лишние записи в SQLite, реже — UI
 # начнёт считать живого воркера мёртвым.
 HEARTBEAT_INTERVAL_SECONDS = 5.0
+
+# Env-контракт воркера (engine.worker.PROXY_ENV): значение вида
+# user:pass@host:port. Дублируется, а не импортируется из engine.worker:
+# тот тянет selenium, а супервизор обязан оставаться бесплатным от браузера.
+PROXY_ENV = "ADCLICKER_PROXY"
+
+# Лексика proxy_usage.result, которую пишет супервизор (см. докстринг модуля).
+PROXY_USAGE_ASSIGNED = "assigned"
+PROXY_USAGE_SHARED = "shared"
+PROXY_USAGE_ROTATED = "rotated"
+PROXY_USAGE_EXHAUSTED = "exhausted"
+
+# Как каждый результат выглядит в логе. Уровень и формулировка живут здесь,
+# а не в местах вызова: «дележ» и «исчерпание» — WARNING (нужно решение
+# оператора), «выдача» — INFO, и расхождение между двумя ротациями
+# невозможно по построению.
+_PROXY_USAGE_LOGS: dict[str, tuple[str, str]] = {
+    PROXY_USAGE_ASSIGNED: ("INFO", "proxy assigned"),
+    PROXY_USAGE_SHARED: ("WARNING", "proxy shared: no free proxy left"),
+    PROXY_USAGE_ROTATED: ("INFO", "proxy rotated"),
+    PROXY_USAGE_EXHAUSTED: ("WARNING", "proxy exhausted"),
+}
 
 # SIGTERM, затем 10 секунд на доработку текущего сценария, затем SIGKILL.
 SHUTDOWN_GRACE_SECONDS = 10.0
@@ -190,6 +243,34 @@ def default_command(browser_id: str) -> list[str]:
     return [os.environ.get("PYTHON", "python3"), "-m", "engine.worker", "--browser-id", browser_id]
 
 
+def _least_used(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Наименее используемые строки вперёд, при равенстве — по возрастанию id.
+
+    ``usage_count`` берётся потому, что уже посчитан в ``list_proxies()``
+    (join с ``proxy_usage``): отдельный запрос ради сортировки стоил бы
+    второго прохода по таблице. ``id`` замыкает порядок, иначе два прокси с
+    одинаковым счётчиком менялись бы местами между чтениями.
+    """
+    return sorted(rows, key=lambda row: (row["usage_count"], row["id"]))
+
+
+def proxy_env_value(proxy: dict[str, Any]) -> str:
+    """Значение ``ADCLICKER_PROXY`` для воркера: ``[user:pass@]host:port``.
+
+    Схема (``socks5://`` и friends) не передаётся: env-контракт воркера
+    (``engine.worker.proxy_from_environ``) зафиксирован на
+    ``user:pass@host:port`` и раньше никогда не получал схемы. Строка
+    уходит только в окружение процесса — в логи и в ``proxy_usage`` попадает
+    исключительно ``proxy_id`` (см. ``_record_proxy_use``).
+    """
+    host_port = f"{proxy['host']}:{proxy['port']}"
+    username = proxy.get("username")
+    password = proxy.get("password")
+    if username and password:
+        return f"{username}:{password}@{host_port}"
+    return host_port
+
+
 def spawn_subprocess(browser_id: str, command: list[str], env: dict[str, str]) -> ProcessLike:
     """Настоящий запуск дочернего процесса.
 
@@ -233,6 +314,14 @@ class _Worker:
     crash_recorded: bool = False
     # circuit открыт: воркер больше не поднимается без явного рестарта демона.
     circuit_open: bool = False
+    # Ротация прокси: число попыток подмены и момент следующей. Живут в
+    # памяти, как и restart_count, — решение принимает демон, а в БД
+    # результат уходит статусом и строками proxy_usage.
+    rotation_count: int = 0
+    next_rotation_at: float = 0.0
+    # «exhausted» для текущей деградации уже записан: без флага каждый тик
+    # плодил бы новую строку, пока резерв не найден.
+    degraded_recorded: bool = False
 
     def is_alive(self) -> bool:
         return self.process.poll() is None
@@ -256,6 +345,7 @@ class Supervisor:
         browser_ids: Callable[[int], list[str]] = default_browser_ids,
         command_for: Callable[[str], list[str]] = default_command,
         env_for: Callable[[str], dict[str, str]] | None = None,
+        proxy_pool: ProxyPool | None = None,
     ):
         self.store = store
         self.settings = settings or SupervisorSettings()
@@ -264,6 +354,12 @@ class Supervisor:
         self._browser_ids = browser_ids
         self._command_for = command_for
         self._env_for = env_for or self._default_env
+        # Пул прокси — своя таблица в той же БД, поэтому пустой по умолчанию
+        # экземпляр равнозначен «пула нет»: строк нет → спавн без прокси, как
+        # до этой фичи. Демон передаёт свой (общий с /control/proxies).
+        self.proxy_pool = (
+            proxy_pool if proxy_pool is not None else ProxyPool(store.db_path)
+        )
         self._workers: dict[str, _Worker] = {}
         self._pool_size = 0
         self._lock = threading.RLock()
@@ -327,7 +423,9 @@ class Supervisor:
             )
 
     def _start_worker(self, browser_id: str, restart_count: int) -> None:
-        process = self._spawn_checked(browser_id)
+        picked = self._pick_proxy(browser_id, allow_shared=True)
+        proxy = None if picked is None else picked[0]
+        process = self._spawn_checked(browser_id, proxy)
         now = self._clock.wall()
         worker_id = self.store.register_worker(browser_id, process.pid, now=now)
         self._workers[browser_id] = _Worker(
@@ -339,6 +437,9 @@ class Supervisor:
             next_start_at=now,
             run_id=self.store.start_run(worker_id),
         )
+        # Назначение — строго после register_worker: assign_proxy делает
+        # UPDATE существующей строки, а для нового воркера её ещё нет.
+        self._bind_proxy(browser_id, picked)
         self.store.log(
             "INFO",
             "supervisor",
@@ -347,15 +448,293 @@ class Supervisor:
             browser_id=browser_id,
         )
 
-    def _spawn_checked(self, browser_id: str) -> ProcessLike:
+    # --- прокси: выбор, выдача, ротация -----------------------------------
+
+    def _pick_proxy(
+        self,
+        browser_id: str,
+        *,
+        exclude: int | None = None,
+        allow_shared: bool = False,
+    ) -> tuple[dict[str, Any], str] | None:
+        """Строка прокси с настоящими кредами и результат использования.
+
+        ``None`` — выдавать нечего (пул пуст или живых строк нет): спавн
+        продолжается без ``ADCLICKER_PROXY``, как и до этой фичи.
+
+        Порядок отбора:
+
+        1. живые (``is_alive=1``) и не исключённые — ротация не берёт
+           текущий прокси, даже когда строка выглядит свободной;
+        2. среди них сначала своё назначение (воркер, упавший и поднятый
+           заново, продолжает работать через тот же прокси), потом свободные
+           — не держимые ни одним живым воркером;
+        3. при ``allow_shared`` — занятые другим живым воркером: дележ
+           важнее отказа в старте, но помечается результатом ``shared``;
+        4. иначе ``None``.
+
+        Внутри каждой категории берётся наименее используемая строка
+        (``usage_count``, затем ``id``): нагрузка распределяется по пулу, а
+        порядок остаётся предсказуемым для тестов и разбора инцидентов.
+        """
+        rows = self.proxy_pool.list_proxies()
+        candidates = [row for row in rows if row["is_alive"] == 1 and row["id"] != exclude]
+        own = [row for row in candidates if row["assigned_browser_id"] == browser_id]
+        free = [row for row in candidates if row["assigned_browser_id"] is None]
+        shared: list[dict[str, Any]] = []
+        if allow_shared:
+            shared = [
+                row
+                for row in candidates
+                if row["assigned_browser_id"] not in (None, browser_id)
+            ]
+        ordered: list[tuple[dict[str, Any], str]] = [
+            (row, PROXY_USAGE_ASSIGNED) for row in _least_used(own)
+        ]
+        ordered += [(row, PROXY_USAGE_ASSIGNED) for row in _least_used(free)]
+        ordered += [(row, PROXY_USAGE_SHARED) for row in _least_used(shared)]
+        for row, result in ordered:
+            proxy = self.proxy_pool.get(row["id"])
+            if proxy is not None:
+                # get() отдельно от list_proxies(): env нужны настоящие креды,
+                # а список их маскирует. Между чтениями строку могли удалить —
+                # тогда пропускаем следующую, а не выдаём полустроку.
+                return proxy, result
+        return None
+
+    def _bind_proxy(self, browser_id: str, picked: tuple[dict[str, Any], str] | None) -> None:
+        """Крепит выбор к строке воркера: ``workers.proxy_id`` + использование.
+
+        Вызывается после ``register_worker`` — иначе UPDATE не найдёт строки.
+        """
+        if picked is None:
+            self.store.release_assignment(browser_id)
+            if self.proxy_pool.list_proxies():
+                # Пул непустой, но живых строк нет: воркер работает без
+                # прокси не по своему выбору, и это должно быть видно.
+                self.store.log(
+                    "WARNING",
+                    "proxy",
+                    "no alive proxy available, worker runs without one",
+                    {},
+                    browser_id=browser_id,
+                )
+            return
+        proxy, result = picked
+        self.store.assign_proxy(browser_id, proxy["id"])
+        self._record_proxy_use(proxy["id"], browser_id, result)
+
+    def _record_proxy_use(
+        self,
+        proxy_id: int,
+        browser_id: str,
+        result: str,
+        fields: dict[str, Any] | None = None,
+    ) -> None:
+        """Строка ``proxy_usage`` и лог с категорией ``proxy`` — всегда вместе.
+
+        Счётчик в UI и событие для разбора инцидента читают разные места, и
+        расхождение между ними выглядело бы как потеря записи. Креды не
+        попадают ни туда, ни туда: уходит только ``proxy_id``.
+        """
+        level, message = _PROXY_USAGE_LOGS[result]
+        try:
+            self.proxy_pool.record_usage(proxy_id, browser_id=browser_id, result=result)
+        except ProxyError as exc:
+            # Прокси удалили между выбором и записью. Воркер уже запущен,
+            # поэтому роняем только строку использования, а не спавн;
+            # текст ProxyError построен без значений кредов (см. proxy_pool).
+            self.store.log(
+                "WARNING",
+                "proxy",
+                "proxy usage was not recorded",
+                {"proxy_id": proxy_id, "error": str(exc)},
+                browser_id=browser_id,
+            )
+        self.store.log(
+            level,
+            "proxy",
+            message,
+            {"proxy_id": proxy_id, "result": result, **(fields or {})},
+            browser_id=browser_id,
+        )
+
+    def _handle_degraded(
+        self, browser_id: str, worker: _Worker, stored: dict[str, Any]
+    ) -> None:
+        """Ротация прокси для воркера, пометившего себя ``degraded``.
+
+        Сначала фиксируется исчерпание текущего прокси (ровно раз на
+        деградацию — иначе каждый тик плодил бы строки), потом ищется
+        резерв. Резерва нет — воркер не трогается: он остаётся degraded с
+        WARNING и пробует снова через backoff, потому что убийство процесса
+        без замены ничего не чинило бы, а теряло бы работающий сценарий.
+        """
+        now = self._clock.wall()
+        if now < worker.next_rotation_at:
+            return
+
+        current_id = stored.get("proxy_id")
+        if not worker.degraded_recorded:
+            worker.degraded_recorded = True
+            # Причина воркера — та же строка, что уже лежит в workers.last_error
+            # и видна в UI: в лог она попадает, чтобы событие было читаемо
+            # само по себе. Кредов в ней нет — их туда не кладёт mark_degraded.
+            reason = stored.get("last_error")
+            reason_fields: dict[str, Any] | None = {"reason": reason} if reason else None
+            if current_id is None:
+                self.store.log(
+                    "WARNING",
+                    "proxy",
+                    "worker degraded without an assigned proxy",
+                    reason_fields,
+                    browser_id=browser_id,
+                )
+            else:
+                self._record_proxy_use(
+                    current_id,
+                    browser_id,
+                    PROXY_USAGE_EXHAUSTED,
+                    reason_fields,
+                )
+
+        reserve = self._pick_proxy(browser_id, exclude=current_id, allow_shared=False)
+        if reserve is None:
+            self._defer_rotation(
+                browser_id, worker, now, reason="no free alive proxy"
+            )
+            return
+        self._rotate_to(browser_id, worker, current_id, reserve, now)
+
+    def _defer_rotation(
+        self, browser_id: str, worker: _Worker, now: float, *, reason: str
+    ) -> None:
+        """Откладывает ротацию: растёт интервал и пишется одна причина.
+
+        Задержка считается тем же ``backoff_delay``, что и у рестартов, —
+        это и есть защита от плотного цикла: подмена, за которой сразу идёт
+        новая деградация, ждёт 2, 4, 8... секунд, а не крутится на каждом
+        тике. Счётчик попыток сбрасывается только после здорового участка
+        работы (см. ``_maybe_reset_restart_count``).
+        """
+        worker.rotation_count += 1
+        delay = backoff_delay(
+            worker.rotation_count,
+            base=self.settings.restart_backoff_base,
+            maximum=self.settings.restart_backoff_max,
+        )
+        worker.next_rotation_at = now + delay
+        self.store.log(
+            "WARNING",
+            "proxy",
+            "proxy rotation postponed, worker stays degraded",
+            {"reason": reason, "retry_in": delay, "attempt": worker.rotation_count},
+            browser_id=browser_id,
+        )
+
+    def _rotate_to(
+        self,
+        browser_id: str,
+        worker: _Worker,
+        old_proxy_id: int | None,
+        reserve: tuple[dict[str, Any], str],
+        now: float,
+    ) -> None:
+        """Гасит старый процесс и поднимает нового с резервным прокси.
+
+        Процесс гасится до спавна: два живых процесса с одним browser_id
+        означали бы два браузера, читающих один профиль и один набор логов.
+        """
+        proxy, _ = reserve
+        if not self._terminate_one(worker):
+            # Старый процесс пережил и SIGTERM, и SIGKILL. Второй запускать
+            # нельзя, остаёмся degraded до следующей попытки.
+            self._defer_rotation(
+                browser_id, worker, now, reason="old process did not exit"
+            )
+            return
+
+        self._finish_run(worker, "stopped", "proxy rotated")
+        process = self._spawn_checked(browser_id, proxy)
+        worker.process = process
+        worker.started_at = now
+        worker.last_heartbeat = now
+        worker.next_start_at = now
+        worker.crash_recorded = False
+        worker.degraded_recorded = False
+        worker.rotation_count += 1
+        worker.next_rotation_at = now + backoff_delay(
+            worker.rotation_count,
+            base=self.settings.restart_backoff_base,
+            maximum=self.settings.restart_backoff_max,
+        )
+        # register_worker ставит status=starting и не трогает proxy_id,
+        # поэтому назначение пишется явно — тем же кодом, что и на спавне.
+        # release_assignment идёт первым: профиль прошлой сессии должен
+        # освободиться, а не переехать на нового воркера (план, фаза 5).
+        self.store.register_worker(browser_id, process.pid, now=now)
+        self.store.release_assignment(browser_id)
+        self.store.assign_proxy(browser_id, proxy["id"])
+        self._record_proxy_use(
+            proxy["id"],
+            browser_id,
+            PROXY_USAGE_ROTATED,
+            {
+                "from_proxy_id": old_proxy_id,
+                "pid": process.pid,
+                "attempt": worker.rotation_count,
+            },
+        )
+
+    def _terminate_one(self, worker: _Worker) -> bool:
+        """SIGTERM, выдержка, SIGKILL одному воркеру. True — процесс завершён.
+
+        Возвращает флаг, а не исключение: ротация обязана знать, что старый
+        процесс пережил обе фазы, иначе поднимет второй на том же browser_id.
+        Тот же сигнал, что в ``_stop_all_locked``, только дедлайн свой: ждать
+        grace на каждого воркера пула можно, а на одного — тем более.
+        """
+        if not worker.is_alive():
+            return True
+        worker.process.terminate()
+        deadline = self._clock.time() + self.settings.shutdown_grace_seconds
+        while worker.is_alive() and self._clock.time() < deadline:
+            self._clock.sleep(0.1)
+        if not worker.is_alive():
+            return True
+        worker.process.kill()
+        kill_deadline = self._clock.time() + self.settings.shutdown_grace_seconds
+        while worker.is_alive() and self._clock.time() < kill_deadline:
+            self._clock.sleep(0.1)
+        if worker.is_alive():
+            self.store.log(
+                "ERROR",
+                "proxy",
+                "worker process survived SIGKILL during proxy rotation",
+                {"pid": worker.process.pid},
+                browser_id=worker.browser_id,
+            )
+        return not worker.is_alive()
+
+    def _spawn_checked(self, browser_id: str, proxy: dict[str, Any] | None) -> ProcessLike:
         """Запуск с приведением любой ошибки ОС к WorkerSpawnError.
 
         Подменяемая фабрика (в тестах и в будущем пути запуска) может бросить
         что угодно, а вызывающему нужен один тип ошибки, иначе обработчик
         HTTP отдаст 500 там, где положен 503 с понятным текстом.
+
+        Окружение воркера достраивается здесь, а не в ``env_for``: выбор
+        прокси принимается до спавна (иначе нечем снабдить процесс), а
+        ``env_for`` остаётся точкой подмены для тестов. ``ADCLICKER_PROXY``
+        сначала снимается — наследие из окружения демона не должно обходить
+        пул — и только потом выставляется назначенное значение.
         """
+        env = dict(self._env_for(browser_id))
+        env.pop(PROXY_ENV, None)
+        if proxy is not None:
+            env[PROXY_ENV] = proxy_env_value(proxy)
         try:
-            return self._spawn(browser_id, self._command_for(browser_id), self._env_for(browser_id))
+            return self._spawn(browser_id, self._command_for(browser_id), env)
         except SupervisorError:
             raise
         except OSError as exc:
@@ -424,6 +803,10 @@ class Supervisor:
             worker = self._workers.pop(browser_id)
             if not worker.circuit_open:
                 self.store.set_status(browser_id, WorkerStatus.STOPPED)
+            # Назначение снимается вместе со смертью процесса: прокси
+            # освобождается для других, а профиль — для respawn, который
+            # поднимет нового воркера уже с чистым profile_id.
+            self.store.release_assignment(browser_id)
 
     def restart(self, count: int) -> list[str]:
         """Полная перезагрузка пула: stop, затем start с новым числом воркеров."""
@@ -534,18 +917,25 @@ class Supervisor:
     def _reconcile(self, browser_id: str, worker: _Worker) -> None:
         """Приводит одного воркера в соответствие с реальностью.
 
-        Три состояния, и порядок проверок важен:
+        Четыре состояния, и порядок проверок важен:
 
         1. circuit открыт — ничего не делаем, пользователь должен вмешаться;
-        2. процесс жив — обновляем статус на running;
-        3. процесс мёртв — либо ждём backoff, либо падение уже записано и
+        2. процесс жив и помечен ``degraded`` — ротация прокси, и статус
+           НЕ затирается на running: сигнал воркера иначе прожил бы ровно
+           один тик, и подмена прокси никогда не случилась бы;
+        3. процесс жив — обновляем статус на running;
+        4. процесс мёртв — либо ждём backoff, либо падение уже записано и
            пора поднимать, либо записываем падение впервые.
         """
         if worker.circuit_open:
             return
 
         if worker.is_alive():
-            self._mark_running(browser_id, worker)
+            stored = self.store.get_worker(browser_id)
+            if stored is not None and stored["status"] == WorkerStatus.DEGRADED.value:
+                self._handle_degraded(browser_id, worker, stored)
+                return
+            self._mark_running(browser_id, worker, stored)
             return
 
         if worker.crash_recorded:
@@ -554,14 +944,20 @@ class Supervisor:
 
         self._handle_crash(browser_id, worker)
 
-    def _mark_running(self, browser_id: str, worker: _Worker) -> None:
+    def _mark_running(
+        self, browser_id: str, worker: _Worker, stored: dict[str, Any] | None
+    ) -> None:
         """Переводит воркера в running и обнуляет счётчик рестартов.
 
         Обнуление здесь, а не по отдельному таймеру, — потому что момент
         "воркер здоров" наступает ровно тогда, когда супервизор увидел живой
         процесс. Тикает чаще — перевода не происходит, статус уже running.
+
+        ``stored`` приходит из ``_reconcile``: строка уже прочитана там для
+        проверки degraded, и второе чтение на каждом тике было бы лишним.
         """
-        stored = self.store.get_worker(browser_id)
+        if stored is None:
+            stored = self.store.get_worker(browser_id)
         if stored is not None and stored["status"] != WorkerStatus.RUNNING.value:
             self.store.set_status(browser_id, WorkerStatus.RUNNING)
         self._maybe_reset_restart_count(worker)
@@ -573,19 +969,30 @@ class Supervisor:
         self._restart_worker(browser_id, worker)
 
     def _maybe_reset_restart_count(self, worker: _Worker) -> None:
-        """Обнуляет счётчик рестартов, если воркер проработал достаточно долго.
+        """Обнуляет счётчики, если воркер проработал достаточно долго.
 
         Без этого потолок рестартов копился бы за всю жизнь воркера, и пара
         сбоев за сутки однажды остановила бы его навсегда. Порог — половина
         потолка: показывать пользователю, что демон считает воркера проблемным,
         полезно и до того, как circuit breaker его убьёт.
+
+        Тем же правилом обнуляются счётчик и таймер ротаций: воркер,
+        продержавшийся после подмены прокси достаточно долго, заслуживает
+        свежего интервала, а не нарастающей задержки от старой деградации.
         """
-        if worker.restart_count == 0:
+        if (
+            worker.restart_count == 0
+            and worker.rotation_count == 0
+            and not worker.degraded_recorded
+        ):
             return
         if self._clock.wall() - worker.started_at < self.settings.restart_count_reset_after:
             return
         worker.restart_count = 0
         worker.crash_recorded = False
+        worker.rotation_count = 0
+        worker.next_rotation_at = 0.0
+        worker.degraded_recorded = False
         self.store.reset_restart_count(worker.browser_id)
 
     def _handle_crash(self, browser_id: str, worker: _Worker) -> None:
@@ -649,10 +1056,18 @@ class Supervisor:
             browser_id=browser_id,
         )
         self._finish_run(worker, "crashed", reason)
+        # Воркер убит и без явного рестарта не поднимется — значит, прокси и
+        # профиль принадлежат уже никому: освобождаем, как и на stop.
+        self.store.release_assignment(browser_id)
         del self._workers[browser_id]
 
     def _restart_worker(self, browser_id: str, worker: _Worker) -> None:
-        process = self._spawn_checked(browser_id)
+        # Прокси выбирается заново, а не берётся из строки: назначение могло
+        # освободиться или стать мёртвым, пока воркер сидел в backoff.
+        # Своё же (если оно живо) возвращается — чужое не берётся никогда.
+        picked = self._pick_proxy(browser_id, allow_shared=True)
+        proxy = None if picked is None else picked[0]
+        process = self._spawn_checked(browser_id, proxy)
         now = self._clock.wall()
         worker.process = process
         worker.started_at = now
@@ -661,8 +1076,13 @@ class Supervisor:
         # Сбрасываем флаг, иначе следующее падение не было бы засчитано:
         # тик увидел бы crash_recorded=True и ушёл в ветку backoff без записи.
         worker.crash_recorded = False
+        # Свежий процесс начинает деградацию с чистого листа: «exhausted» за
+        # прошлую причину падения не должен висеть на новом прокси.
+        worker.degraded_recorded = False
+        worker.next_rotation_at = 0.0
         self.store.register_worker(browser_id, process.pid, now=now)
         self.store.set_status(browser_id, WorkerStatus.STARTING)
+        self._bind_proxy(browser_id, picked)
         self.store.log(
             "INFO",
             "supervisor",

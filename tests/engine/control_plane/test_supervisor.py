@@ -16,6 +16,8 @@ import pytest
 
 from engine.control_plane import supervisor as sup
 from engine.control_plane.state import StateStore, WorkerStatus
+from engine.proxy_pool import ProxyPool
+from engine.store import StoreWriter
 
 
 class FakeProcess:
@@ -1205,3 +1207,515 @@ class TestParallelShutdown:
         assert sorted(set(registry.killed)) == ["br-1", "br-2", "br-3"]
         for worker in store.list_workers():
             assert worker["status"] == WorkerStatus.STOPPED.value
+
+
+# --- назначение и ротация прокси ------------------------------------------
+
+
+def make_pool(db_path) -> ProxyPool:
+    """Пул прокси над той же БД, что и супервизор (у супервизора свой
+    экземпляр, но файл один — состояние общее, как в демоне)."""
+    return ProxyPool(db_path)
+
+
+def hold_proxy(store, proxy_id, browser_id, status="running", pid=4242):
+    """Строка чужого живого воркера, уже держащего прокси."""
+    store.register_worker(browser_id, pid)
+    with store._connect() as conn:
+        conn.execute(
+            "UPDATE workers SET proxy_id = ?, status = ? WHERE browser_id = ?",
+            (proxy_id, status, browser_id),
+        )
+        conn.commit()
+
+
+def degrade(db_path, browser_id, reason="cdp connection lost"):
+    """Пишет в ``workers`` ровно то, что пишет воркер в on_proxy_dead.
+
+    ``StoreWriter.mark_degraded`` — реальный сигнал воркера (ветка transport),
+    поэтому тест ротации проверяет путь «воркер сообщил → супервизор заметил»,
+    а не SQL, скопированный в тест.
+    """
+    writer = StoreWriter(db_path)
+    try:
+        writer.mark_degraded(browser_id, reason)
+    finally:
+        writer.close()
+
+
+def usage_rows(store):
+    with store._connect() as conn:
+        rows = conn.execute(
+            "SELECT proxy_id, browser_id, result FROM proxy_usage ORDER BY id"
+        ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def proxy_logs(store, level=None):
+    with store._connect() as conn:
+        rows = conn.execute(
+            "SELECT level, category, browser_id, message, fields FROM logs "
+            "WHERE category = 'proxy' ORDER BY id"
+        ).fetchall()
+    logs = [dict(row) for row in rows]
+    if level is None:
+        return logs
+    return [row for row in logs if row["level"] == level]
+
+
+def all_log_text(store) -> str:
+    with store._connect() as conn:
+        rows = conn.execute(
+            "SELECT level, category, browser_id, message, fields FROM logs ORDER BY id"
+        ).fetchall()
+    return "\n".join(
+        f"{row['level']} {row['category']} {row['browser_id']} {row['message']} {row['fields']}"
+        for row in rows
+    )
+
+
+def assign_profile(store, browser_id, name="default"):
+    with store._connect() as conn:
+        conn.execute("INSERT INTO profiles (name) VALUES (?)", (name,))
+        profile_id = conn.execute(
+            "SELECT id FROM profiles WHERE name = ?", (name,)
+        ).fetchone()["id"]
+        conn.execute(
+            "UPDATE workers SET profile_id = ? WHERE browser_id = ?",
+            (profile_id, browser_id),
+        )
+        conn.commit()
+    return profile_id
+
+
+class TestProxyAssignment:
+    """Назначение прокси при спавне: живые строки, дележ, пустой пул.
+
+    Супервизор — единственный, кто выдаёт ``ADCLICKER_PROXY``: выбор делается
+    по живым (``is_alive=1``) и не занятым другим живым воркером строкам, а
+    факт выдачи уходит в ``workers.proxy_id``, ``proxy_usage`` и лог с
+    категорией ``proxy`` без кредов.
+    """
+
+    def test_spawn_assigns_alive_free_proxy_and_passes_it_via_env(
+        self, store, registry, clock, settings, db_path
+    ):
+        pool = make_pool(db_path)
+        pool.add_lines(["alice:s3cr3t@10.0.0.1:8080"])
+        proxy_id = pool.list_proxies()[0]["id"]
+        supervisor = make_supervisor(store, registry, clock, settings)
+
+        supervisor.start(1)
+
+        assert store.get_worker("br-1")["proxy_id"] == proxy_id
+        assert registry.start_calls[0]["env"]["ADCLICKER_PROXY"] == (
+            "alice:s3cr3t@10.0.0.1:8080"
+        )
+
+    def test_spawn_does_not_duplicate_live_assignments(
+        self, store, registry, clock, settings, db_path
+    ):
+        """Прокси, занятый живым воркером, не достаётся никому ещё."""
+        pool = make_pool(db_path)
+        pool.add_lines(
+            [
+                "alice:s3cr3t@10.0.0.1:8080",
+                "alice:s3cr3t@10.0.0.2:8080",
+                "alice:s3cr3t@10.0.0.3:8080",
+            ]
+        )
+        ids = [row["id"] for row in pool.list_proxies()]
+        hold_proxy(store, ids[0], "br-9")
+        supervisor = make_supervisor(store, registry, clock, settings)
+
+        supervisor.start(2)
+
+        assigned = [store.get_worker(b)["proxy_id"] for b in ("br-1", "br-2")]
+        assert ids[0] not in assigned, "живое назначение br-9 должно уцелеть"
+        assert assigned[0] != assigned[1], "свободных прокси хватает — дележа нет"
+        assert [call["env"]["ADCLICKER_PROXY"] for call in registry.start_calls] == [
+            "alice:s3cr3t@10.0.0.2:8080",
+            "alice:s3cr3t@10.0.0.3:8080",
+        ]
+
+    def test_spawn_shares_the_only_alive_proxy_with_a_warning(
+        self, store, registry, clock, settings, db_path
+    ):
+        """Свободных нет — дележ, но старт блокировать нельзя."""
+        pool = make_pool(db_path)
+        pool.add_lines(["alice:s3cr3t@10.0.0.1:8080"])
+        proxy_id = pool.list_proxies()[0]["id"]
+        hold_proxy(store, proxy_id, "br-9")
+        supervisor = make_supervisor(store, registry, clock, settings)
+
+        supervisor.start(1)
+
+        assert store.get_worker("br-1")["proxy_id"] == proxy_id
+        assert registry.start_calls[0]["env"]["ADCLICKER_PROXY"] == (
+            "alice:s3cr3t@10.0.0.1:8080"
+        )
+        assert [(row["proxy_id"], row["result"]) for row in usage_rows(store)] == [
+            (proxy_id, "shared")
+        ]
+        warnings = proxy_logs(store, level="WARNING")
+        assert warnings, "дележ обязан быть виден в логе"
+        assert all(row["browser_id"] == "br-1" for row in warnings)
+        assert all("shared" in row["message"] for row in warnings)
+
+    def test_spawn_with_an_empty_pool_keeps_worker_without_proxy(
+        self, store, registry, clock, settings, db_path
+    ):
+        supervisor = make_supervisor(store, registry, clock, settings)
+
+        supervisor.start(2)
+
+        assert len(registry.created) == 2, "пустой пул не должен мешать старту"
+        assert all(
+            "ADCLICKER_PROXY" not in call["env"] for call in registry.start_calls
+        )
+        assert all(store.get_worker(b)["proxy_id"] is None for b in ("br-1", "br-2"))
+        assert usage_rows(store) == []
+
+    def test_dead_proxy_is_never_assigned(self, store, registry, clock, settings, db_path):
+        """Жив только ``is_alive=1``: мёртвый прокси не выдаётся даже в дележе."""
+        pool = make_pool(db_path)
+        pool.add_lines(["alice:s3cr3t@10.0.0.1:8080"])
+        proxy_id = pool.list_proxies()[0]["id"]
+        pool.record_check_result(proxy_id, alive=False, error="timeout")
+        supervisor = make_supervisor(store, registry, clock, settings)
+
+        supervisor.start(1)
+
+        assert "ADCLICKER_PROXY" not in registry.start_calls[0]["env"]
+        assert store.get_worker("br-1")["proxy_id"] is None
+        assert proxy_logs(store, level="WARNING"), (
+            "непустой, но мёртвый пул должен быть заметен в логе"
+        )
+
+    def test_assignment_is_logged_without_credentials(
+        self, store, registry, clock, settings, db_path
+    ):
+        pool = make_pool(db_path)
+        pool.add_lines(["alice:s3cr3t@10.0.0.1:8080"])
+        supervisor = make_supervisor(store, registry, clock, settings)
+
+        supervisor.start(1)
+
+        logs = proxy_logs(store)
+        assert logs, "назначение прокси обязано попадать в лог"
+        assert logs[0]["category"] == "proxy"
+        assert logs[0]["browser_id"] == "br-1"
+        assert any(row["message"] == "proxy assigned" for row in logs)
+        assert "s3cr3t" not in all_log_text(store), "креды не должны утекать в логи"
+
+    def test_stop_releases_proxy_and_profile(self, store, registry, clock, settings, db_path):
+        pool = make_pool(db_path)
+        pool.add_lines(["alice:s3cr3t@10.0.0.1:8080"])
+        supervisor = make_supervisor(store, registry, clock, settings)
+        supervisor.start(1)
+        assign_profile(store, "br-1")
+
+        supervisor.stop()
+
+        worker = store.get_worker("br-1")
+        assert worker["proxy_id"] is None, "после stop прокси должен быть свободен"
+        assert worker["profile_id"] is None, "профиль должен освободиться при остановке"
+
+    def test_open_circuit_releases_proxy(self, store, clock, db_path):
+        pool = make_pool(db_path)
+        pool.add_lines(["alice:s3cr3t@10.0.0.1:8080"])
+        registry = FakeProcessRegistry()
+        settings = sup.SupervisorSettings(
+            heartbeat_interval=5.0,
+            shutdown_grace_seconds=0.2,
+            restart_backoff_base=0.1,
+            restart_backoff_max=0.2,
+            max_restarts=1,
+            restart_count_reset_after=3600.0,
+            max_workers=4,
+        )
+        supervisor = make_supervisor(store, registry, clock, settings)
+        supervisor.start(1)
+        assert store.get_worker("br-1")["proxy_id"] is not None, "спавн должен назначить"
+
+        # Два падения подряд при max_restarts=1 — дальше circuit open.
+        for _ in range(2):
+            registry.created[-1].exit(1)
+            supervisor.tick()
+            clock.advance(60.0)
+            supervisor.tick()
+
+        worker = store.get_worker("br-1")
+        assert worker["status"] == WorkerStatus.CIRCUIT_OPEN.value
+        assert worker["proxy_id"] is None, "убитый воркер не должен держать прокси"
+
+    def test_restart_after_stop_assigns_a_fresh_proxy_row(
+        self, store, registry, clock, settings, db_path
+    ):
+        pool = make_pool(db_path)
+        pool.add_lines(["alice:s3cr3t@10.0.0.1:8080", "alice:s3cr3t@10.0.0.2:8080"])
+        supervisor = make_supervisor(store, registry, clock, settings)
+        supervisor.start(1)
+        supervisor.stop()
+
+        supervisor.start(1)
+
+        worker = store.get_worker("br-1")
+        assert worker["proxy_id"] is not None
+        assert worker["profile_id"] is None, "новый воркер стартует с чистым профилем"
+        assert "ADCLICKER_PROXY" in registry.start_calls[-1]["env"]
+
+
+class TestProxyRotation:
+    """Ротация на ``degraded``: подмена, backoff, отказ при отсутствии резерва.
+
+    Деградацию пишет воркер (``StoreWriter.mark_degraded``), решение принимает
+    ``tick()``. Ротация — не падение воркера: ``restart_count`` не растёт, а
+    темп задаётся тем же backoff'ом, что и у рестартов, чтобы подмена не
+    превращалась в плотный цикл.
+    """
+
+    def test_degraded_worker_is_respawned_with_a_reserve_proxy(
+        self, store, registry, clock, settings, db_path
+    ):
+        pool = make_pool(db_path)
+        pool.add_lines(
+            ["alice:s3cr3t@10.0.0.1:8080", "bob:hunter2@10.0.0.2:9090"]
+        )
+        ids = [row["id"] for row in pool.list_proxies()]
+        supervisor = make_supervisor(store, registry, clock, settings)
+        supervisor.start(1)
+        assert store.get_worker("br-1")["proxy_id"] == ids[0]
+
+        degrade(db_path, "br-1")
+        supervisor.tick()
+
+        assert len(registry.created) == 2, "ротация обязана поднять новый процесс"
+        assert registry.created[0].poll() is not None, "старый процесс должен быть погашен"
+        assert store.get_worker("br-1")["proxy_id"] == ids[1]
+        assert store.get_worker("br-1")["status"] == WorkerStatus.STARTING.value
+        assert registry.start_calls[1]["env"]["ADCLICKER_PROXY"] == (
+            "bob:hunter2@10.0.0.2:9090"
+        )
+        assert registry.start_calls[1]["env"]["ADCLICKER_PROXY"] != (
+            registry.start_calls[0]["env"]["ADCLICKER_PROXY"]
+        )
+
+    def test_rotation_records_usage_and_keeps_restart_count_clean(
+        self, store, registry, clock, settings, db_path
+    ):
+        """Ротация — не вина воркера: счётчик падений и circuit breaker молчат.
+
+        Наблюдаемость обеспечивают ``proxy_usage`` и лог с категорией ``proxy``,
+        а не ``restart_count``: иначе несколько смен прокси убили бы здорового
+        воркера потолком рестартов.
+        """
+        pool = make_pool(db_path)
+        pool.add_lines(
+            ["alice:s3cr3t@10.0.0.1:8080", "bob:hunter2@10.0.0.2:9090"]
+        )
+        ids = [row["id"] for row in pool.list_proxies()]
+        supervisor = make_supervisor(store, registry, clock, settings)
+        supervisor.start(1)
+
+        degrade(db_path, "br-1")
+        supervisor.tick()
+
+        worker = store.get_worker("br-1")
+        assert worker["restart_count"] == 0
+        assert worker["status"] == WorkerStatus.STARTING.value
+        assert [(row["proxy_id"], row["browser_id"], row["result"]) for row in usage_rows(store)] == [
+            (ids[0], "br-1", "assigned"),
+            (ids[0], "br-1", "exhausted"),
+            (ids[1], "br-1", "rotated"),
+        ]
+        assert "s3cr3t" not in all_log_text(store)
+        assert "hunter2" not in all_log_text(store)
+
+    def test_rotation_waits_backoff_before_the_next_rotation(
+        self, store, registry, clock, settings, db_path
+    ):
+        pool = make_pool(db_path)
+        pool.add_lines(
+            ["alice:s3cr3t@10.0.0.1:8080", "bob:hunter2@10.0.0.2:9090"]
+        )
+        supervisor = make_supervisor(store, registry, clock, settings)
+        supervisor.start(1)
+
+        degrade(db_path, "br-1")
+        supervisor.tick()
+        assert len(registry.created) == 2
+
+        # Новый прокси тоже оказался плохим: подряд ротировать нельзя.
+        degrade(db_path, "br-1")
+        supervisor.tick()
+        assert len(registry.created) == 2, "вторая ротация раньше backoff — плотный цикл"
+
+        clock.advance(sup.RESTART_BACKOFF_BASE_SECONDS)
+        supervisor.tick()
+        assert len(registry.created) == 3, "после backoff повторная ротация обязательна"
+
+    def test_degraded_worker_without_reserve_stays_degraded(
+        self, store, registry, clock, settings, db_path
+    ):
+        """Резерва нет — воркер остаётся degraded и пробует снова по интервалу."""
+
+        def postponed():
+            return [
+                row
+                for row in proxy_logs(store, level="WARNING")
+                if "rotation postponed" in row["message"]
+            ]
+
+        def exhausted():
+            return [row for row in proxy_logs(store) if row["message"] == "proxy exhausted"]
+
+        pool = make_pool(db_path)
+        pool.add_lines(["alice:s3cr3t@10.0.0.1:8080"])
+        supervisor = make_supervisor(store, registry, clock, settings)
+        supervisor.start(1)
+
+        degrade(db_path, "br-1")
+        supervisor.tick()
+
+        worker = store.get_worker("br-1")
+        assert worker["status"] == WorkerStatus.DEGRADED.value, (
+            "без резерва статус обязан остаться degraded, а не уйти в running/backoff"
+        )
+        assert worker["proxy_id"] is not None
+        assert registry.created[0].poll() is None, "процесс без резерва не убиваем"
+        assert len(registry.created) == 1
+        assert len(postponed()) == 1
+        assert len(exhausted()) == 1, "исчерпание фиксируется один раз на деградацию"
+
+        # Тики без времени не должны плодить предупреждения и попытки.
+        supervisor.tick()
+        supervisor.tick()
+        assert len(postponed()) == 1
+        assert len(exhausted()) == 1
+        assert len(registry.created) == 1
+
+        clock.advance(sup.RESTART_BACKOFF_BASE_SECONDS)
+        supervisor.tick()
+        assert len(postponed()) == 2, (
+            "попытка обязана повторяться по интервалу, а не затихнуть"
+        )
+        assert len(exhausted()) == 1, "повторная попытка не должна дублировать запись"
+        assert len(registry.created) == 1, "пока резерва нет — респавнов не бывает"
+
+    def test_rotation_never_takes_another_workers_proxy(
+        self, store, registry, clock, settings, db_path
+    ):
+        pool = make_pool(db_path)
+        pool.add_lines(
+            ["alice:s3cr3t@10.0.0.1:8080", "bob:hunter2@10.0.0.2:9090"]
+        )
+        ids = [row["id"] for row in pool.list_proxies()]
+        supervisor = make_supervisor(store, registry, clock, settings)
+        supervisor.start(1)
+        hold_proxy(store, ids[1], "br-9")
+
+        degrade(db_path, "br-1")
+        supervisor.tick()
+
+        worker = store.get_worker("br-1")
+        assert worker["status"] == WorkerStatus.DEGRADED.value
+        assert worker["proxy_id"] == ids[0], "чужой занятый прокси не годится в резерв"
+        assert len(registry.created) == 1
+
+    def test_rotation_frees_the_profile_and_leaves_other_workers_alone(
+        self, store, registry, clock, settings, db_path
+    ):
+        pool = make_pool(db_path)
+        pool.add_lines(
+            [
+                "alice:s3cr3t@10.0.0.1:8080",
+                "alice:s3cr3t@10.0.0.2:8080",
+                "alice:s3cr3t@10.0.0.3:8080",
+            ]
+        )
+        ids = [row["id"] for row in pool.list_proxies()]
+        supervisor = make_supervisor(store, registry, clock, settings)
+        supervisor.start(2)
+        assign_profile(store, "br-1")
+        second_pid = store.get_worker("br-2")["pid"]
+
+        degrade(db_path, "br-1")
+        supervisor.tick()
+
+        rotated = store.get_worker("br-1")
+        assert rotated["proxy_id"] == ids[2], "резерв — свободный живой прокси"
+        assert rotated["profile_id"] is None, "при ротации профиль освобождается"
+        untouched = store.get_worker("br-2")
+        assert untouched["proxy_id"] == ids[1]
+        assert untouched["status"] == WorkerStatus.RUNNING.value
+        assert untouched["pid"] == second_pid, "ротация не должна трогать соседа"
+        assert len(registry.created) == 3, "новый процесс только у деградировавшего"
+
+    def test_rotation_is_logged_with_proxy_category_and_no_credentials(
+        self, store, registry, clock, settings, db_path
+    ):
+        pool = make_pool(db_path)
+        pool.add_lines(
+            ["alice:s3cr3t@10.0.0.1:8080", "bob:hunter2@10.0.0.2:9090"]
+        )
+        supervisor = make_supervisor(store, registry, clock, settings)
+        supervisor.start(1)
+
+        degrade(db_path, "br-1")
+        supervisor.tick()
+
+        logs = proxy_logs(store)
+        assert any(row["message"] == "proxy exhausted" for row in logs)
+        assert any(row["message"] == "proxy rotated" for row in logs)
+        assert all(row["category"] == "proxy" for row in logs)
+        assert all(row["browser_id"] == "br-1" for row in logs)
+        assert "s3cr3t" not in all_log_text(store)
+        assert "hunter2" not in all_log_text(store)
+
+    def test_rotation_does_not_happen_before_the_first_degrade(
+        self, store, registry, clock, settings, db_path
+    ):
+        pool = make_pool(db_path)
+        pool.add_lines(
+            ["alice:s3cr3t@10.0.0.1:8080", "bob:hunter2@10.0.0.2:9090"]
+        )
+        supervisor = make_supervisor(store, registry, clock, settings)
+        supervisor.start(1)
+
+        supervisor.tick()
+        supervisor.tick()
+
+        assert len(registry.created) == 1, "здоровый воркер не должен ротироваться"
+        assert store.get_worker("br-1")["status"] == WorkerStatus.RUNNING.value
+        assert [(row["result"]) for row in usage_rows(store)] == ["assigned"]
+
+    def test_crash_respawn_keeps_its_own_proxy(
+        self, store, registry, clock, settings, db_path
+    ):
+        """Падение — не повод менять прокси: подмена бывает только по degraded.
+
+        Иначе любое падение (диск, сайт, OOM) тихо меняло бы назначение, а
+        план привязывает ротацию именно к сигналу воркера о мёртвом прокси.
+        """
+        pool = make_pool(db_path)
+        pool.add_lines(["alice:s3cr3t@10.0.0.1:8080", "alice:s3cr3t@10.0.0.2:8080"])
+        ids = [row["id"] for row in pool.list_proxies()]
+        supervisor = make_supervisor(store, registry, clock, settings)
+        supervisor.start(1)
+        assert store.get_worker("br-1")["proxy_id"] == ids[0]
+
+        registry.created[0].exit(1)
+        supervisor.tick()
+        clock.advance(sup.RESTART_BACKOFF_BASE_SECONDS)
+        supervisor.tick()
+
+        worker = store.get_worker("br-1")
+        assert worker["proxy_id"] == ids[0], "свой прокси должен вернуться"
+        assert registry.start_calls[1]["env"]["ADCLICKER_PROXY"] == (
+            "alice:s3cr3t@10.0.0.1:8080"
+        )
+        assert [(row["proxy_id"], row["result"]) for row in usage_rows(store)] == [
+            (ids[0], "assigned"),
+            (ids[0], "assigned"),
+        ]

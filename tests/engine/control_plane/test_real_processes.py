@@ -21,12 +21,14 @@ import os
 import signal
 import sys
 import time
+from pathlib import Path
 
 import psutil
 import pytest
 
 from engine.control_plane import supervisor as sup
 from engine.control_plane.state import StateStore, WorkerStatus
+from engine.proxy_pool import ProxyPool
 
 # Пишет "<browser_id>:<pid>" построчно и засыпает. Файл — это проверка того,
 # что все трое стартовали, а не только то, что супервизор про них записал.
@@ -472,3 +474,110 @@ class TestRealSpawnFailures:
         assert not any(_alive(pid) for pid in db_pids(store)), (
             "процесс, поднятый до сбоя, обязан быть погашен"
         )
+
+
+# Воркер, который сразу сигнализирует деградацию (реальным StoreWriter, как
+# on_proxy_dead/on_connection_lost) и засыпает. PID пишется до сигнала, чтобы
+# тест дождался и строки в БД, и самого процесса.
+DEGRADING_SLEEPER = """
+import os, sys, time
+with open(sys.argv[1], "a", encoding="utf-8") as handle:
+    handle.write(f"{sys.argv[2]}:{os.getpid()}\\n")
+sys.path.insert(0, sys.argv[4])
+from engine.store import StoreWriter
+writer = StoreWriter(sys.argv[3])
+try:
+    writer.mark_degraded(sys.argv[2], "proxy rejected credentials")
+finally:
+    writer.close()
+time.sleep(300)
+"""
+
+
+class TestRealProxyRotation:
+    """Ротация на настоящих процессах.
+
+    Решение принимает супервизор, но проверяется оно по тому, что получает
+    НОВЫЙ процесс: ``ADCLICKER_PROXY`` читается напрямую из окружения живого
+    PID (``psutil``), а не из логов и не из записей супервизора — иначе тест
+    подтвердил бы только то, что демон себе записал.
+    """
+
+    def test_degraded_real_worker_respawns_with_a_different_proxy_env(
+        self, store, db_path, pid_file, cleanup_pids
+    ):
+        pool = ProxyPool(db_path)
+        pool.add_lines(["alice:s3cr3t@10.0.0.1:8080", "bob:hunter2@10.0.0.2:9090"])
+        first_id, second_id = [row["id"] for row in pool.list_proxies()]
+        repo_root = str(Path(__file__).resolve().parents[3])
+        supervisor = make_real_supervisor(
+            store,
+            pid_file,
+            lambda bid: [
+                sys.executable,
+                "-c",
+                DEGRADING_SLEEPER,
+                str(pid_file),
+                bid,
+                str(db_path),
+                repo_root,
+            ],
+            settings=sup.SupervisorSettings(
+                heartbeat_interval=0.05,
+                shutdown_grace_seconds=1.0,
+                restart_backoff_base=0.05,
+                restart_backoff_max=0.2,
+                max_restarts=5,
+                restart_count_reset_after=3600.0,
+                # Воркер-заглушка не стучит heartbeat'ом: зависанием его
+                # считать нельзя, иначе тест проверял бы устаревание.
+                stale_after_seconds=3600.0,
+            ),
+        )
+
+        supervisor.start(1)
+        assert _wait_until(lambda: len(started_records(pid_file)) == 1)
+        assert _wait_until(lambda: store.get_worker("br-1")["status"] == "degraded")
+
+        first_pid = store.get_worker("br-1")["pid"]
+        assert psutil.Process(first_pid).environ()["ADCLICKER_PROXY"] == (
+            "alice:s3cr3t@10.0.0.1:8080"
+        )
+        with store._connect() as conn:
+            conn.execute("INSERT INTO profiles (name) VALUES ('default')")
+            conn.execute(
+                "UPDATE workers SET profile_id = (SELECT id FROM profiles WHERE name = 'default') "
+                "WHERE browser_id = 'br-1'"
+            )
+            conn.commit()
+
+        supervisor.tick()
+
+        assert _wait_until(lambda: len(started_records(pid_file)) >= 2), (
+            "ротация обязана поднять новый процесс"
+        )
+        second_pid = int(started_records(pid_file)[-1].split(":", 1)[1])
+        assert second_pid != first_pid
+        assert not _alive(first_pid), "старый процесс должен быть погашен ротацией"
+        assert psutil.Process(second_pid).environ()["ADCLICKER_PROXY"] == (
+            "bob:hunter2@10.0.0.2:9090"
+        )
+        worker = store.get_worker("br-1")
+        assert worker["proxy_id"] == second_id
+        assert worker["profile_id"] is None, "профиль освобождается при ротации"
+
+        with store._connect() as conn:
+            rows = conn.execute(
+                "SELECT proxy_id, browser_id, result FROM proxy_usage ORDER BY id"
+            ).fetchall()
+        assert [(row["proxy_id"], row["browser_id"], row["result"]) for row in rows] == [
+            (first_id, "br-1", "assigned"),
+            (first_id, "br-1", "exhausted"),
+            (second_id, "br-1", "rotated"),
+        ]
+
+        supervisor.stop()
+
+        worker = store.get_worker("br-1")
+        assert worker["proxy_id"] is None, "после stop прокси должен быть свободен"
+        assert worker["profile_id"] is None

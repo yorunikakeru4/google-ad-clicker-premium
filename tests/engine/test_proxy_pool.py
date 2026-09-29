@@ -291,6 +291,21 @@ class TestListProxies:
 
         assert pool.list_proxies()[0]["assigned_browser_id"] is None
 
+    def test_degraded_worker_still_holds_its_proxy(self, pool, db_path):
+        """Деградация не освобождает прокси: процесс жив и продолжает им пользоваться.
+
+        Без этого списка супервизор выдал бы прокси второму воркеру, пока
+        первый ещё держит соединение, а ``delete()`` позволил бы удалить то,
+        чем пользуются (409 пропал бы).
+        """
+        pool.add_lines(["alice:s3cr3t@10.0.0.1:8080"])
+        proxy_id = pool.list_proxies()[0]["id"]
+        assign_worker(db_path, proxy_id, "br-7", status="degraded")
+
+        assert pool.list_proxies()[0]["assigned_browser_id"] == "br-7"
+        with pytest.raises(ProxyInUseError):
+            pool.delete(proxy_id)
+
     def test_usage_count_comes_from_proxy_usage(self, pool, db_path):
         pool.add_lines(["alice:s3cr3t@10.0.0.1:8080"])
         proxy_id = pool.list_proxies()[0]["id"]
