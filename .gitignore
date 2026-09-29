@@ -171,6 +171,10 @@ ui/target/
 ui/src-tauri/target/
 ui/gen/
 
+# Python-шаблон выше игнорирует lib/ на ЛЮБОМ уровне, а у UI исходники лежат
+# в ui/src/lib/ — исключаем именно её, иначе весь TS-код молча вне индекса
+!ui/src/lib/
+
 # движок
 engine/logs/
 engine/screenshots/

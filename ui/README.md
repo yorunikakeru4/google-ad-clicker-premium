@@ -1,9 +1,11 @@
 # Google Ad Clicker Premium — UI
 
-Desktop UI scaffold: **Tauri 2 + Vue 3 + TypeScript + Vuetify 3 + vue-router**.
+Desktop UI: **Tauri 2 + Vue 3 + TypeScript + Vuetify 3 + vue-router**.
 
-This is the Phase 0 foundation. The real screens are not implemented yet — the
-placeholder route exists only so the stack is wired up and buildable.
+App shell with the seven screens from the plan (Dashboard, Logs, Profiles,
+Proxies, Tasks, Settings, Diagnostics), daemon heartbeat indicator and control
+buttons (Start/Pause/Resume/Restart/Kill) over the daemon's control API. The
+screens themselves are stubs until their phases land.
 
 ## Requirements
 
@@ -16,6 +18,7 @@ placeholder route exists only so the stack is wired up and buildable.
 | Command             | What it does                                              |
 | ------------------- | --------------------------------------------------------- |
 | `pnpm install`      | install JS dependencies                                    |
+| `pnpm test`         | run unit tests (vitest)                                    |
 | `pnpm tauri dev`    | run the app in dev mode (Vite on :1420 + Rust)             |
 | `pnpm tauri build`  | type-check, build the frontend, then bundle a release      |
 | `pnpm build`        | frontend only: `vue-tsc --noEmit` then `vite build`        |
@@ -26,16 +29,44 @@ placeholder route exists only so the stack is wired up and buildable.
 ```
 src/
   main.ts                  app bootstrap: vue + router + vuetify
-  App.vue                  v-app shell, app bar, <router-view />
-  router/index.ts          routes (placeholder only)
-  views/HomeView.vue       placeholder screen + scaffold self-check
-  components/ThemeToggle.vue
-  composables/useThemeToggle.ts
+  App.vue                  shell: nav drawer, app bar, control panel, routes
+  router/index.ts          the 7 routes + NAV_ITEMS for the drawer
+  views/                   Dashboard, Logs, Profiles, Proxies, Tasks,
+                           Settings, Diagnostics (stubs until their phases)
+  components/
+    ControlPanel.vue       Start/Pause/Resume/Restart/Kill + workers table
+    HeartbeatChip.vue      daemon alive/offline indicator
+    ScreenStub.vue         shared stub for unimplemented screens
+    ThemeToggle.vue
+  composables/
+    useDaemonStatus.ts     1s polling of /health + /state, control commands
+    useThemeToggle.ts
+  lib/
+    control.ts             control requests + button disabled rules
+    daemonApi.ts           /health, /state, /control/* over the Tauri proxy
+    poll.ts                polling reducer (online/offline, tick dedup)
+    format.ts              uptime/PID/last-error formatting
+    types.ts               daemon payload types
   plugins/vuetify.ts       light/dark theme definitions
 src-tauri/                 Rust shell
-  src/lib.rs               tauri builder, `greet` command
+  src/lib.rs               tauri builder, command registration
+  src/control.rs           HTTP proxy to the daemon control API
+  src/db.rs                read-only SQLite log reader
   tauri.conf.json          app id, window, build + bundle config
 ```
+
+## Daemon connection
+
+The frontend never talks HTTP directly (CSP/scopes); it calls the Tauri
+command `control_request`, implemented in `src-tauri/src/control.rs`. It reads
+the same environment contract as the daemon:
+
+| Variable                 | Meaning                          | Default                     |
+| ------------------------ | -------------------------------- | --------------------------- |
+| `ADCLICKER_CONTROL_TOKEN`| auth token (same name as daemon) | required                    |
+| `ADCLICKER_API_URL`      | daemon control API base URL      | `http://127.0.0.1:8787`     |
+
+The token is never logged or echoed back to the frontend.
 
 ## Theming
 
