@@ -420,7 +420,12 @@ def parse_echo_payload(raw: Any) -> EchoResult:
     if isinstance(origin, str) and origin.strip():
         # При цепочке прокси httpbin отдаёт "ip1, ip2" — наружу ушёл первый.
         ip = origin.split(",")[0].strip() or None
-    return EchoResult(headers if isinstance(headers, Mapping) else None, ip, None)
+    # dict(...) здесь — не копия ради копии: из JSON приходит Mapping с
+    # произвольными ключами, а колонка хранит dict[str, Any].
+    clean_headers = (
+        {str(key): value for key, value in headers.items()} if isinstance(headers, Mapping) else None
+    )
+    return EchoResult(clean_headers, ip, None)
 
 
 def browser_core_from_ua(user_agent: str | None) -> str | None:
@@ -974,7 +979,7 @@ def session_checkpoint(
                 _warn(logger, browser_id, "diagnostics signal was not cleared", exc)
             state.last_handled = signal
 
-    if recorded:
+    if recorded and logger is not None:
         reason = "auto+signal" if (was_auto and fresh) else ("auto" if was_auto else "signal")
         fields: dict[str, Any] = {"reason": reason}
         if fresh:

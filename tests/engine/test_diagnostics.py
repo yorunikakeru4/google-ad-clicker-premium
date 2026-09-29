@@ -731,7 +731,10 @@ class TestCountryLocales:
 
 class TestSignal:
     def test_flag_key_follows_the_documented_pattern(self):
-        assert diagnostics_flag_key("br-1") == f"{DIAGNOSTICS_FLAG_PREFIX}br-1"
+        """Формат ключа — контракт с API и (потенциально) с UI: литерал
+        зафиксирован, а не выведен из той же константы, что и реализация."""
+        assert diagnostics_flag_key("br-1") == "DIAGNOSTICS_REQUESTED_br-1"
+        assert DIAGNOSTICS_FLAG_PREFIX == "DIAGNOSTICS_REQUESTED_"
 
     def test_request_sets_a_timestamp_value(self, store):
         value = request_signal(store, "br-1")
