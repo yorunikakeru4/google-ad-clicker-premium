@@ -111,7 +111,7 @@ describe("createProxiesApi: список", () => {
     });
     const api = createProxiesApi(transport);
 
-    await expect(api.list()).rejects.toThrow(/список прокси/);
+    await expect(api.list()).rejects.toThrow(/без списка прокси/);
   });
 
   it("обрыв транспорта доходит до вызывающего", async () => {

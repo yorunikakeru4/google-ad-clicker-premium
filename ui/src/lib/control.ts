@@ -28,6 +28,51 @@ export function controlRequest(action: ControlAction): ControlRequest {
   return { method: "POST", path: CONTROL_PATHS[action] };
 }
 
+/** Действия API прокси (контракт /control/proxies* параллельной ветки). */
+export type ProxiesAction =
+  | { kind: "list" }
+  | { kind: "add"; lines: string[] }
+  | { kind: "import" }
+  | { kind: "delete"; id: number }
+  | { kind: "check" };
+
+export interface ProxiesRequest {
+  method: "GET" | "POST";
+  path: string;
+  /** JSON-тело POST; у GET его нет вовсе. */
+  body?: string;
+}
+
+/**
+ * Билдер запросов к API прокси.
+ *
+ * Тела собираются здесь, а не в вызывающем коде: контракт демона
+ * (`{"lines": [...]}`, `{"id"}`, пустой объект) живёт в одном месте, и
+ * тесты видят ровно то, что уйдёт в control_request.
+ */
+export function proxiesRequest(action: ProxiesAction): ProxiesRequest {
+  switch (action.kind) {
+    case "list":
+      return { method: "GET", path: "/control/proxies" };
+    case "add":
+      return {
+        method: "POST",
+        path: "/control/proxies",
+        body: JSON.stringify({ lines: action.lines }),
+      };
+    case "import":
+      return { method: "POST", path: "/control/proxies/import", body: "{}" };
+    case "delete":
+      return {
+        method: "POST",
+        path: "/control/proxies/delete",
+        body: JSON.stringify({ id: action.id }),
+      };
+    case "check":
+      return { method: "POST", path: "/control/proxies/check", body: "{}" };
+  }
+}
+
 /** Сводное состояние, из которого считаются disabled-правила. */
 export interface StatusView {
   online: boolean;
