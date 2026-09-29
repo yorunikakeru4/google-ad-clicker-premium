@@ -50,6 +50,7 @@ import json
 import sqlite3
 import threading
 import time
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
@@ -83,6 +84,36 @@ _DEGRADED_UPSERT = (
     "ON CONFLICT (browser_id) DO UPDATE SET "
     "status = 'degraded', last_error = excluded.last_error"
 )
+# Снимок диагностики — единственный append в diagnostics, и он немедленный:
+# UI поллит таблицу после нажатия кнопки и не должен ждать батча (1 с) или
+# размера очереди (200 записей). Порядок колонок соответствует schema.sql.
+_DIAGNOSTIC_INSERT = (
+    "INSERT INTO diagnostics ("
+    "ts, browser_id, proxy_id, ip, country, user_agent, accept_language, "
+    "timezone_id, screen_w, screen_h, platform, webgl_vendor, webgl_renderer, "
+    "browser_version, headers, suspicion_flags"
+    ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)"
+)
+
+
+def _encode_json_or_none(value: Any, *, empty: str | None = None) -> str | None:
+    """Колонка JSON: None → ``empty`` (обычно NULL), строка → как есть,
+    контейнер → ``json.dumps``.
+
+    Строка проходит без перекодирования: вызывающий мог закодировать значение
+    сам (готовый payload echo), а раскодировать и закодировать заново
+    значило бы менять его без причины. Несериализуемое уходит в ``repr`` —
+    как и в ``_coerce_fields``: битый объект не должен ронять запись, но и
+    теряться в молчании не должен.
+    """
+    if value is None:
+        return empty
+    if isinstance(value, str):
+        return value
+    try:
+        return json.dumps(value, ensure_ascii=False, sort_keys=True)
+    except (TypeError, ValueError):
+        return repr(value)
 
 
 class StoreWriter:
@@ -300,8 +331,82 @@ class StoreWriter:
                 self._rollback_quietly_locked()
                 self._record_loss_locked(1, f"mark_degraded {browser_id}: {exc}")
 
-    # --- запуски: делегирование StateStore --------------------------------
+    # --- диагностика: немедленная запись снимка ---------------------------
 
+    def record_diagnostic(
+        self,
+        *,
+        browser_id: str,
+        ts: float | None = None,
+        proxy_id: int | None = None,
+        ip: str | None = None,
+        country: str | None = None,
+        user_agent: str | None = None,
+        accept_language: str | None = None,
+        timezone_id: str | None = None,
+        screen_w: int | None = None,
+        screen_h: int | None = None,
+        platform: str | None = None,
+        webgl_vendor: str | None = None,
+        webgl_renderer: str | None = None,
+        browser_version: str | None = None,
+        headers: str | dict[str, Any] | None = None,
+        suspicion_flags: str | Sequence[str] | None = None,
+    ) -> None:
+        """Записать снимок сессии в ``diagnostics``. Немедленно, как heartbeat.
+
+        Снимок — ответ на кнопку в UI: оператор ждёт строку в таблице сейчас,
+        а не через секунду батча, поэтому запись идёт напрямую в соединение
+        тем же способом, что и heartbeat/mark_degraded, без буфера.
+
+        ``browser_id`` обязателен и не может быть пустым: снимок без
+        воркера не сопоставить ни в UI, ни в разборе инцидента — это ошибка
+        вызывающего кода, поэтому она поднимает ``ValueError`` ДО обращения к
+        БД. Ошибки самого хранения (закрытая БД, полный диск) не бросают и
+        идут в ``dropped``/``last_error``, как у остальных записей writer'а.
+
+        ``headers`` и ``suspicion_flags`` — JSON-колонки: словарь/список
+        кодируется здесь, готовая строка проходит как есть. ``None`` у
+        ``suspicion_flags`` становится ``[]`` («подозрений нет» — это
+        состояние, а не отсутствие данных), у ``headers`` — NULL (echo
+        не ответил).
+        """
+        if browser_id is None or not str(browser_id).strip():
+            raise ValueError(
+                "browser_id обязателен для снимка диагностики, "
+                f"получено {browser_id!r}"
+            )
+        stamp = time.time() if ts is None else ts
+        row = (
+            stamp,
+            browser_id,
+            proxy_id,
+            ip,
+            country,
+            user_agent,
+            accept_language,
+            timezone_id,
+            screen_w,
+            screen_h,
+            platform,
+            webgl_vendor,
+            webgl_renderer,
+            browser_version,
+            _encode_json_or_none(headers),
+            _encode_json_or_none(suspicion_flags, empty="[]"),
+        )
+        with self._lock:
+            if self._closed:
+                self._record_loss_locked(1, "writer закрыт: снимок диагностики отброшен")
+                return
+            try:
+                self._conn.execute(_DIAGNOSTIC_INSERT, row)
+                self._conn.commit()
+            except Exception as exc:
+                self._rollback_quietly_locked()
+                self._record_loss_locked(1, f"record_diagnostic {browser_id}: {exc}")
+
+    # --- запуски: делегирование StateStore --------------------------------
     def start_run(self, worker_id: int) -> int | None:
         """Id строки runs. None — записать не удалось, детали в last_error."""
         state = self._state

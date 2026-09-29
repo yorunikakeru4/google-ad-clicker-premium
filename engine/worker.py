@@ -39,6 +39,7 @@ from typing import Any, Callable, Mapping, Protocol, Sequence
 
 from engine.control_plane.state import StateStore
 from engine.db import migrations
+from engine.diagnostics import observe_signal
 from engine.log import StructuredLogger
 from engine.profile_apply import profile_id_from_environ
 from engine.profile_pool import ProfilePool
@@ -316,6 +317,12 @@ class WorkerRunner:
 
         round_index = 0
         while not self._stop.is_set():
+            # Чекпоинт диагностики стоит до паузы: запрос из UI приходит и во
+            # время работы, и в ожидании resume, и воркер обязан его увидеть
+            # в обоих случаях. Сам сигнал здесь не снимается — живого
+            # браузера между сценариями нет, флаг ждёт первого драйвера.
+            self._observe_diagnostics()
+
             # Пауза проверяется ДО чтения конфига: пока воркер ждёт resume,
             # ему нечего планировать, а опрос config.json каждые 0.5 с на
             # каждом воркере — это лишние чтения файла и ложные ERROR в
@@ -572,6 +579,26 @@ class WorkerRunner:
             {"previous_wait": self._wait_reason[1], "worker_index": worker_index},
         )
         self._wait_reason = None
+
+    def _observe_diagnostics(self) -> None:
+        """Чекпоинт цикла: увидеть запрос на диагностику из UI.
+
+        В цикле живого браузера нет (драйвер существует только внутри
+        сценария), поэтому наблюдение ограничено уведомлением один раз на
+        свежий сигнал — флаг остаётся для :func:`engine.diagnostics
+        .session_checkpoint` при следующем драйвере. Ошибка чтения не
+        должна ронять цикл: она идёт в WARNING, пауза и сценарии работают
+        как раньше.
+        """
+        try:
+            observe_signal(self._browser_id, self._store, self._logger)
+        except Exception as exc:  # noqa: BLE001 - наблюдение не должно валить цикл
+            self._log(
+                "WARNING",
+                "browser",
+                "diagnostics signal was not observed",
+                {"error": str(exc), "error_type": type(exc).__name__},
+            )
 
     def _log(
         self,
