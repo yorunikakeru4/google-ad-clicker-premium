@@ -59,6 +59,13 @@ _UNKNOWN_LEVEL_RANK = _LEVEL_RANK["ERROR"]
 # Каталог дневных экспортов: <cwd>/logs, он же в .gitignore.
 EXPORT_DIRNAME = "logs"
 
+# Значения по умолчанию полей behavior.* хранения логов. Их же берут _SCHEMA
+# control plane и config_reader: дефолты обязаны совпадать, иначе старый
+# config.json читал бы одно, а демон после сохранения из UI — другое.
+DEFAULT_LOG_RETENTION_DAYS = 30
+DEFAULT_LOG_FILE_LEVEL = "INFO"
+DEFAULT_DB_SIZE_LIMIT_MB = 0
+
 _DAY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
 
 # Имя файла дневного экспорта. Только он подлежит удалению по retention:
@@ -450,6 +457,9 @@ def _reclaim_space(db_path: str | Path) -> None:
 
 
 __all__ = [
+    "DEFAULT_DB_SIZE_LIMIT_MB",
+    "DEFAULT_LOG_FILE_LEVEL",
+    "DEFAULT_LOG_RETENTION_DAYS",
     "EXPORT_DIRNAME",
     "LEVEL_ORDER",
     "DbSizeResult",
