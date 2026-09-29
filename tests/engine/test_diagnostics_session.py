@@ -279,6 +279,31 @@ class TestSignalDrivenCollection:
         assert used is True, "снимок записан — упала только попытка снятия флага"
         assert logger.warnings, "невозможное снятие флага обязано уйти в WARNING"
 
+    def test_a_request_arriving_during_collection_is_not_lost(self, store):
+        """Гонка «собираю — а оператор нажал ещё раз»: снятие не должно
+        затирать метку, поставленную пока шёл сбор."""
+        logger = RecordingLogger()
+        checkpoint(FakeDriver(), store=store, logger=logger)  # автосбор закрыт
+        request_signal(store, "br-1", now=1700000100.0)
+
+        def racing_fetcher(_driver):
+            request_signal(store, "br-1", now=1700000200.0)
+            return EchoResult(headers={}, ip="203.0.113.7", error=None)
+
+        first = checkpoint(
+            FakeDriver(), store=store, logger=logger, echo_fetcher=racing_fetcher
+        )
+
+        assert first is True
+        assert read_signal(store, "br-1") is not None, (
+            "второй запрос обязан пережить снятие первого"
+        )
+
+        second = checkpoint(FakeDriver(), store=store, logger=logger)
+
+        assert second is True, "следующий чекпоинт собирает отложенный запрос"
+        assert read_signal(store, "br-1") is None
+
     def test_new_requests_never_come_out_of_order(self, store):
         """Контракт «значение > последнего обработанного»: повторный запрос
         при уже выставленном флаге обязан его продвинуть, а не совпасть."""

@@ -178,6 +178,20 @@ class TestParsePagePayload:
 
         assert page == PageSnapshot()
 
+    def test_unknown_keys_never_reach_the_snapshot(self):
+        """Снимок — белый список полей: лишнее из ответа страницы (cookies,
+        токены, что угодно) не попадает ни в поля объекта, ни в колонки."""
+        from dataclasses import asdict
+
+        payload = dict(FULL_PAGE, cookies="session=SECRET", password="hunter2")
+
+        page = parse_page_payload(payload)
+
+        assert set(asdict(page)) == set(asdict(PageSnapshot()))
+        dumped = json.dumps(asdict(page))
+        assert "SECRET" not in dumped
+        assert "hunter2" not in dumped
+
     def test_json_string_response_is_parsed(self):
         """Драйвер может вернуть JSON-строкой, если JS отдал её как есть."""
         page = parse_page_payload(json.dumps(FULL_PAGE))
