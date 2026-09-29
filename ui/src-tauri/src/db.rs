@@ -2187,4 +2187,165 @@ mod tests {
         assert_eq!(rows[1].ip.as_deref(), Some("anonymous-new"));
         assert_eq!(rows[1].ts, 20.0);
     }
+
+    /// Строка `captcha_events` для ленты CAPTCHA: время, воркер и исход
+    /// решения; остальные колонки в тесте заполняются явно.
+    fn insert_captcha(conn: &Connection, ts: f64, browser_id: Option<&str>, solved: bool) -> i64 {
+        conn.execute(
+            "INSERT INTO captcha_events (ts, browser_id, solved) VALUES (?1, ?2, ?3)",
+            rusqlite::params![ts, browser_id, solved as i64],
+        )
+        .expect("строка captcha_events вставляется");
+        conn.last_insert_rowid()
+    }
+
+    #[test]
+    fn list_captcha_events_on_empty_db_returns_nothing() {
+        let tmp = TempDb::new();
+        let path = tmp.path();
+        let _writer = seed(&path, &[]);
+
+        let reader = DbReader::open(&path).expect("БД открывается");
+
+        assert_eq!(
+            reader
+                .list_captcha_events(10)
+                .expect("пустая БД — пустой список"),
+            vec![] as Vec<CaptchaEventRow>,
+            "отсутствие событий — не ошибка чтения"
+        );
+    }
+
+    #[test]
+    fn list_captcha_events_returns_newest_first_and_breaks_ts_ties_by_id() {
+        let tmp = TempDb::new();
+        let path = tmp.path();
+        let writer = seed(&path, &[]);
+
+        let first = insert_captcha(&writer, 100.0, Some("br-1"), true);
+        let tied_old = insert_captcha(&writer, 300.0, Some("br-2"), false);
+        let tied_new = insert_captcha(&writer, 300.0, Some("br-3"), false);
+        insert_captcha(&writer, 200.0, Some("br-4"), true);
+
+        let reader = DbReader::open(&path).expect("БД открывается");
+        let rows = reader.list_captcha_events(10).expect("список читается");
+
+        assert_eq!(
+            rows.iter().map(|row| row.ts).collect::<Vec<_>>(),
+            vec![300.0, 300.0, 200.0, 100.0],
+            "порядок — по убыванию ts"
+        );
+        assert_eq!(
+            rows[0].id, tied_new,
+            "равный ts разрывается по id: свежевставленная строка первой"
+        );
+        assert_eq!(rows[1].id, tied_old);
+        assert_eq!(rows[3].id, first, "самое старое событие — последним");
+        assert_eq!(rows[0].browser_id.as_deref(), Some("br-3"));
+    }
+
+    #[test]
+    fn list_captcha_events_caps_limit_and_treats_zero_as_empty() {
+        let tmp = TempDb::new();
+        let path = tmp.path();
+        let writer = seed(&path, &[]);
+
+        // Потолок строк — тот же, что у логов: запрос с большим limit
+        // усекается, а не выгружает в UI всю историю событий.
+        let total = MAX_LOGS_LIMIT + 25;
+        for index in 0..total {
+            insert_captcha(&writer, f64::from(index), Some("br-1"), false);
+        }
+
+        let reader = DbReader::open(&path).expect("БД открывается");
+        let rows = reader
+            .list_captcha_events(u32::MAX)
+            .expect("лимит усекается без ошибки");
+
+        assert_eq!(rows.len(), MAX_LOGS_LIMIT as usize);
+        assert_eq!(
+            rows[0].ts,
+            f64::from(total - 1),
+            "усечение оставляет самые свежие события"
+        );
+        assert!(
+            reader
+                .list_captcha_events(0)
+                .expect("limit = 0 — пустой список")
+                .is_empty(),
+            "нулевой limit не должен читать таблицу"
+        );
+    }
+
+    #[test]
+    fn list_captcha_events_keeps_null_columns_and_converts_solved_flag() {
+        let tmp = TempDb::new();
+        let path = tmp.path();
+        let writer = seed(&path, &[]);
+
+        writer
+            .execute(
+                "INSERT INTO captcha_events (ts, browser_id, page_url, sitekey, \
+                  screenshot_path, solved, solver, elapsed_ms) \
+                  VALUES (1000.0, 'br-1', 'https://www.google.com/search?q=ad', \
+                  '6Le-waAUAAAAAPuu', '/tmp/engine/screenshots/br-1.png', 1, \
+                  '2captcha', 4200)",
+                [],
+            )
+            .expect("событие с полными полями вставляется");
+        // Событие без воркера, страницы и решателя: NULL — норма, а не ошибка.
+        insert_captcha(&writer, 900.0, None, false);
+
+        let reader = DbReader::open(&path).expect("БД открывается");
+        let rows = reader.list_captcha_events(10).expect("список читается");
+        assert_eq!(rows.len(), 2);
+
+        let solved = &rows[0];
+        assert_eq!(solved.id, 1);
+        assert_eq!(solved.ts, 1000.0);
+        assert_eq!(solved.browser_id.as_deref(), Some("br-1"));
+        assert_eq!(
+            solved.page_url.as_deref(),
+            Some("https://www.google.com/search?q=ad")
+        );
+        assert_eq!(solved.sitekey.as_deref(), Some("6Le-waAUAAAAAPuu"));
+        assert_eq!(
+            solved.screenshot_path.as_deref(),
+            Some("/tmp/engine/screenshots/br-1.png")
+        );
+        assert!(solved.solved, "1 в колонке solved — это true");
+        assert_eq!(solved.solver.as_deref(), Some("2captcha"));
+        assert_eq!(solved.elapsed_ms, Some(4200));
+
+        let unsolved = &rows[1];
+        assert_eq!(unsolved.browser_id, None);
+        assert_eq!(unsolved.page_url, None);
+        assert_eq!(unsolved.sitekey, None);
+        assert_eq!(unsolved.screenshot_path, None);
+        assert!(!unsolved.solved, "0 в колонке solved — это false");
+        assert_eq!(unsolved.solver, None);
+        assert_eq!(unsolved.elapsed_ms, None);
+        assert_eq!(unsolved.proxy_id, None);
+
+        // Контракт для фронта: все поля колонок доходят в JSON.
+        let json = serde_json::to_value(solved).expect("строка сериализуется");
+        let object = json.as_object().expect("JSON — объект");
+        for field in [
+            "id",
+            "ts",
+            "browser_id",
+            "proxy_id",
+            "page_url",
+            "sitekey",
+            "screenshot_path",
+            "solved",
+            "solver",
+            "elapsed_ms",
+        ] {
+            assert!(
+                object.contains_key(field),
+                "контрактное поле {field} должно попасть в ответ"
+            );
+        }
+    }
 }
