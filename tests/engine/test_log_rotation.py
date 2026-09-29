@@ -59,7 +59,7 @@ def _insert(
 # воркер, категория и сообщение. Поля JSON, если есть, приклеиваются в конец.
 LINE_RE = re.compile(
     r"^(?P<iso>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}[+-]\d{2}:\d{2}) "
-    r"\[(?P<level>[A-Z]+)\] (?P<browser>\S+) (?P<category>[^:]+): (?P<rest>.*)$"
+    r"\[(?P<level>[A-Z]+)\] (?P<browser>\S+) (?P<category>\S+): (?P<rest>.*)$"
 )
 
 
