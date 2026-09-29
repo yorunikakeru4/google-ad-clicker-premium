@@ -7,17 +7,29 @@ import type { StatusKind } from "../../constants/statusMap";
 const props = withDefaults(
   defineProps<{
     label: string;
+    /** Приписка к подписи: окно метрики, единицы, источник. */
+    hint?: string;
     value?: string;
+    /** Тест-хук: data-test на числе (корень карточки занят card-*). */
+    valueTest?: string;
     delta?: string;
     deltaDirection?: "up" | "down" | "flat";
     status?: StatusKind;
+    /** Текст статуса вместо подписи по умолчанию из statusMap. */
+    statusLabel?: string;
+    /** Тест-хук: data-test на чипе статуса. */
+    statusTest?: string;
     to?: RouteLocationRaw;
   }>(),
   {
+    hint: undefined,
     value: "—",
+    valueTest: undefined,
     delta: undefined,
     deltaDirection: "flat",
     status: undefined,
+    statusLabel: undefined,
+    statusTest: undefined,
     to: undefined,
   },
 );
@@ -43,16 +55,25 @@ const deltaColor = computed(() => {
 <template>
   <v-card :to="to" class="metric h-100" :class="{ 'metric--clickable': Boolean(to) }">
     <v-card-text class="pa-4">
-      <div class="metric__label text-muted">{{ label }}</div>
+      <div class="metric__label text-muted">
+        {{ label }}<span v-if="hint"> · {{ hint }}</span>
+      </div>
 
-      <div class="metric__value">{{ value }}</div>
+      <div class="metric__value" :data-test="valueTest">{{ value }}</div>
 
-      <div class="metric__footer d-flex align-center ga-2 mt-2">
+      <slot />
+
+      <div v-if="delta || status" class="metric__footer d-flex align-center ga-2 mt-2">
         <template v-if="delta">
           <v-icon :icon="deltaIcon" :color="deltaColor" size="14px" />
           <span class="metric__delta text-muted">{{ delta }}</span>
         </template>
-        <StatusChip v-if="status" :status="status" />
+        <StatusChip
+          v-if="status"
+          :status="status"
+          :label="statusLabel"
+          :data-test="statusTest"
+        />
       </div>
     </v-card-text>
   </v-card>
