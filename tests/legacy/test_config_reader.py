@@ -378,3 +378,67 @@ def test_log_settings_defaults_match_the_control_plane_schema(make_config, base_
     assert reader.behavior.log_retention_days == schema["log_retention_days"]
     assert reader.behavior.log_file_level == schema["log_file_level"]
     assert reader.behavior.db_size_limit_mb == schema["db_size_limit_mb"]
+
+
+@pytest.fixture
+def restore_file_level():
+    """Откатить уровень файлового лога: read_parameters() применяет его."""
+
+    from logger import file_handler
+
+    saved = file_handler.level
+    yield
+    file_handler.setLevel(saved)
+
+
+def test_read_parameters_applies_the_file_level_from_config(
+    make_config, base_config, restore_file_level
+):
+    """Уровень файла задаётся конфигом в той же точке, где читается config."""
+
+    import logging
+
+    from logger import file_handler
+
+    base_config["behavior"]["log_file_level"] = "WARNING"
+
+    make_config(base_config)
+
+    assert file_handler.level == logging.WARNING
+
+
+def test_missing_file_level_key_applies_the_default(
+    make_config, base_config, restore_file_level
+):
+    """Старый config.json: ключа нет, применяется дефолт INFO из схемы."""
+
+    import logging
+
+    from logger import file_handler
+
+    assert "log_file_level" not in base_config["behavior"]
+
+    make_config(base_config)
+
+    assert file_handler.level == logging.INFO
+
+
+def test_unknown_file_level_is_reported_and_keeps_the_current_level(
+    make_config, base_config, restore_file_level, caplog
+):
+    """Опечатка в конфиге не должна ронять запуск воркера."""
+
+    import logging
+
+    from logger import file_handler
+
+    file_handler.setLevel(logging.ERROR)
+    base_config["behavior"]["log_file_level"] = "TRACE"
+
+    reader = make_config(base_config)
+
+    assert reader.behavior is not None, "чтение конфига обязано дойти до конца"
+    assert file_handler.level == logging.ERROR, "уровень не меняется при ошибке"
+    assert any("log_file_level" in record.message for record in caplog.records), (
+        "причина отказа обязана быть видна в логе"
+    )

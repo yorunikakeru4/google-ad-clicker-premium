@@ -20,6 +20,7 @@ captcha-check:
 
 from __future__ import annotations
 
+import json
 import sqlite3
 import threading
 import time
@@ -589,3 +590,43 @@ class TestBuildDaemonLogJobs:
             build_daemon(db_path=db_path, config_path=config_path, port=0)
 
         assert env_var in str(excinfo.value)
+
+
+class TestBuildDaemonFileLevel:
+    """Уровень файлового лога применяется там, где демон читает конфиг."""
+
+    def test_build_applies_the_file_level_from_config(
+        self, db_path, config_path, monkeypatch
+    ):
+        import logger as legacy_logger
+
+        monkeypatch.setenv(TOKEN_ENV_VAR, "tok")
+        config_path.write_text(
+            json.dumps({"behavior": {"query": "", "log_file_level": "WARNING"}}),
+            encoding="utf-8",
+        )
+        applied = []
+        monkeypatch.setattr(legacy_logger, "apply_file_level", lambda name: applied.append(name))
+
+        daemon = build_daemon(db_path=db_path, config_path=config_path, port=0)
+
+        try:
+            assert applied == ["WARNING"], "демон обязан применить уровень из конфига"
+        finally:
+            daemon.shutdown()
+
+    def test_build_without_the_key_applies_the_default_level(
+        self, db_path, config_path, monkeypatch
+    ):
+        import logger as legacy_logger
+
+        monkeypatch.setenv(TOKEN_ENV_VAR, "tok")
+        applied = []
+        monkeypatch.setattr(legacy_logger, "apply_file_level", lambda name: applied.append(name))
+
+        daemon = build_daemon(db_path=db_path, config_path=config_path, port=0)
+
+        try:
+            assert applied == ["INFO"], "дефолт уровня — INFO, а не «не применять»"
+        finally:
+            daemon.shutdown()

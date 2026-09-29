@@ -1,13 +1,24 @@
-"""Тесты logger.py: фильтр browser_id для мультипроцессного режима.
+"""Тесты logger.py: фильтр browser_id и уровень файлового лога.
 
-update_log_formats() меняет глобальное состояние логгера, поэтому каждый тест
-работает с фикстурой restore_logging, которая возвращает исходные обработчики,
-форматтеры и фильтры.
+update_log_formats() и apply_file_level() меняют глобальное состояние
+логгера, поэтому каждый тест работает с фикстурами restore_logging и
+restore_levels, возвращающими исходные обработчики, форматтеры, фильтры и
+уровни.
 """
 
 import logging
 
-from logger import MultiprocessLogFilter, logger, update_log_formats
+import pytest
+
+from logger import (
+    FILE_LEVELS,
+    MultiprocessLogFilter,
+    apply_file_level,
+    console_handler,
+    file_handler,
+    logger,
+    update_log_formats,
+)
 
 
 def make_record(message="Starting search"):
@@ -135,3 +146,76 @@ def test_update_log_formats_does_not_accumulate_filters(restore_logging):
         assert "<<5>>" in render(handler, make_record()), (
             "остался фильтр не того воркера: последний вызов обязан перекрыть прежние"
         )
+
+
+@pytest.fixture
+def restore_levels():
+    """Откатить уровни обработчиков: apply_file_level меняет их глобально."""
+
+    saved = (console_handler.level, file_handler.level)
+    yield
+    console_handler.setLevel(saved[0])
+    file_handler.setLevel(saved[1])
+
+
+def test_apply_file_level_sets_the_file_handler(restore_levels):
+    assert apply_file_level("WARNING") == logging.WARNING
+
+    assert file_handler.level == logging.WARNING
+
+
+@pytest.mark.parametrize(
+    "name, expected",
+    [
+        ("DEBUG", logging.DEBUG),
+        ("INFO", logging.INFO),
+        ("WARNING", logging.WARNING),
+        ("ERROR", logging.ERROR),
+    ],
+)
+def test_apply_file_level_accepts_every_configured_level(restore_levels, name, expected):
+    apply_file_level(name)
+
+    assert file_handler.level == expected
+
+
+def test_console_stays_info_whatever_the_file_level_is(restore_levels):
+    """Консоль не настраивается: INFO в терминале остаётся прежним."""
+
+    apply_file_level("ERROR")
+
+    assert console_handler.level == logging.INFO
+
+
+def test_file_level_dictionary_matches_the_shared_level_order(restore_levels):
+    """Enum конфига и словарь логгера не должны разойтись."""
+
+    from engine.log_rotation import LEVEL_ORDER
+
+    assert frozenset(FILE_LEVELS) == frozenset(LEVEL_ORDER)
+
+
+def test_apply_file_level_rejects_unknown_level(restore_levels):
+    with pytest.raises(ValueError) as excinfo:
+        apply_file_level("TRACE")
+
+    assert "TRACE" in str(excinfo.value)
+    for name in FILE_LEVELS:
+        assert name in str(excinfo.value)
+
+
+@pytest.mark.parametrize("name", [None, 30, "info", "Warning"])
+def test_apply_file_level_rejects_wrong_type_or_spelling(restore_levels, name):
+    """Валидация идёт по тому же словарю, что и установка: мимо — ValueError."""
+
+    with pytest.raises(ValueError):
+        apply_file_level(name)
+
+
+def test_failed_validation_keeps_the_previous_level(restore_levels):
+    apply_file_level("ERROR")
+
+    with pytest.raises(ValueError):
+        apply_file_level("TRACE")
+
+    assert file_handler.level == logging.ERROR
