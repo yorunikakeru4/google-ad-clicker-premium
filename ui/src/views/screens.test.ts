@@ -16,6 +16,7 @@ import FilterBar from "../components/data/FilterBar.vue";
 import MetricCard from "../components/data/MetricCard.vue";
 import DashboardView from "./DashboardView.vue";
 import LogsView from "./LogsView.vue";
+import ProxiesView from "./ProxiesView.vue";
 
 // useLogs читает localStorage в момент создания — до первого рендера Logs.
 const storage = new Map<string, string>();
@@ -146,5 +147,26 @@ describe("экраны на шаблоне", () => {
     expect(html).not.toContain("logs-table");
     expect(html).not.toContain("logs-empty");
     expect(html).toContain("0 из");
+  });
+
+  it("Proxies: PageLayout, действия и пустое состояние без данных", async () => {
+    const html = await render(ProxiesView);
+
+    expect(html).toContain("Proxies");
+    for (const hook of [
+      "proxies-add",
+      "proxies-import",
+      "proxies-check",
+      "proxies-empty",
+    ]) {
+      expect(html).toContain(`data-test="${hook}"`);
+    }
+
+    // ни ошибок чтения, ни действий, ни диалогов — экран только открылся
+    expect(html).not.toContain("proxies-error");
+    expect(html).not.toContain("proxies-action-error");
+    expect(html).not.toContain("proxies-add-dialog");
+    expect(html).not.toContain("proxies-delete-dialog");
+    expect(html).not.toContain("proxies-check-progress");
   });
 });
