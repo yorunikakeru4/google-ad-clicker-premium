@@ -713,4 +713,316 @@ mod tests {
             "читатель ждёт ровно столько, сколько ждёт движок"
         );
     }
+
+    /// Ожидаемая строка страницы: id из таблицы плюс сама запись лога.
+    fn paged(id: i64, row: &Row) -> LogPageEntry {
+        LogPageEntry {
+            id,
+            log: entry(row),
+        }
+    }
+
+    #[test]
+    fn list_logs_page_first_page_matches_list_logs() {
+        let tmp = TempDb::new();
+        let path = tmp.path();
+        let data = [
+            Row::new(100.0, "INFO", "первая"),
+            Row::new(300.0, "ERROR", "третья"),
+            Row::new(200.0, "INFO", "вторая"),
+        ];
+        let _writer = seed(&path, &data);
+
+        let reader = DbReader::open(&path).expect("БД открывается");
+        let filters = LogFilters::default();
+        let page = reader
+            .list_logs_page(&filters, None, None, 10)
+            .expect("первая страница читается");
+
+        assert_eq!(
+            page,
+            vec![paged(2, &data[1]), paged(3, &data[2]), paged(1, &data[0])],
+            "первая страница — те же строки в том же порядке, что у list_logs"
+        );
+        let plain = reader
+            .list_logs(10, None, None, None)
+            .expect("list_logs читается");
+        let flat: Vec<LogEntry> = page.iter().map(|row| row.log.clone()).collect();
+        assert_eq!(flat, plain, "состав страницы неотличим от list_logs");
+    }
+
+    #[test]
+    fn list_logs_page_walks_distinct_ts_without_loss_or_duplicates() {
+        let tmp = TempDb::new();
+        let path = tmp.path();
+        let data: Vec<Row> = (0..7)
+            .map(|i| Row::new(100.0 + i as f64, "INFO", "строка"))
+            .collect();
+        let _writer = seed(&path, &data);
+
+        let reader = DbReader::open(&path).expect("БД открывается");
+        let filters = LogFilters::default();
+        let mut pages: Vec<Vec<LogPageEntry>> = Vec::new();
+        let mut before: Option<(f64, i64)> = None;
+        loop {
+            let (before_ts, before_id) = match before {
+                Some((ts, id)) => (Some(ts), Some(id)),
+                None => (None, None),
+            };
+            let page = reader
+                .list_logs_page(&filters, before_ts, before_id, 3)
+                .expect("страница читается");
+            if page.is_empty() {
+                break;
+            }
+            before = page.last().map(|row| (row.log.ts, row.id));
+            pages.push(page);
+            assert!(pages.len() <= 4, "пагинация должна завершиться пустой страницей");
+        }
+
+        assert_eq!(
+            pages.iter().map(Vec::len).collect::<Vec<_>>(),
+            vec![3, 3, 1],
+            "страницы режутся по limit, последняя забирает хвост"
+        );
+        let ids: Vec<i64> = pages.iter().flatten().map(|row| row.id).collect();
+        assert_eq!(
+            ids,
+            vec![7, 6, 5, 4, 3, 2, 1],
+            "проход по курсору не теряет и не дублирует строки"
+        );
+        assert_eq!(
+            reader.count_logs(&filters).expect("count_logs"),
+            7,
+            "count_logs согласован с числом прочитанных строк"
+        );
+    }
+
+    #[test]
+    fn list_logs_page_splits_equal_ts_rows_with_id_cursor() {
+        let tmp = TempDb::new();
+        let path = tmp.path();
+        let data: Vec<Row> = (0..6)
+            .map(|_| Row::new(100.0, "INFO", "равные ts"))
+            .chain((0..3).map(|_| Row::new(50.0, "INFO", "старые")))
+            .collect();
+        let _writer = seed(&path, &data);
+
+        let reader = DbReader::open(&path).expect("БД открывается");
+        let filters = LogFilters::default();
+
+        let first = reader
+            .list_logs_page(&filters, None, None, 3)
+            .expect("первая страница");
+        assert_eq!(
+            first.iter().map(|row| row.id).collect::<Vec<_>>(),
+            vec![6, 5, 4],
+            "при равном ts идёт порядок id DESC"
+        );
+
+        let second = reader
+            .list_logs_page(&filters, Some(100.0), Some(first[2].id), 3)
+            .expect("вторая страница");
+        assert_eq!(
+            second.iter().map(|row| row.id).collect::<Vec<_>>(),
+            vec![3, 2, 1],
+            "курсор (ts, id) продолжает группу равных ts, а не бросает её"
+        );
+
+        let third = reader
+            .list_logs_page(&filters, Some(100.0), Some(second[2].id), 3)
+            .expect("третья страница");
+        assert_eq!(
+            third.iter().map(|row| row.id).collect::<Vec<_>>(),
+            vec![9, 8, 7],
+            "после группы равных ts берутся более старые строки"
+        );
+
+        let fourth = reader
+            .list_logs_page(&filters, Some(50.0), Some(third[2].id), 3)
+            .expect("четвёртая страница");
+        assert!(fourth.is_empty(), "за последней строкей — пустая страница");
+
+        let mut read: Vec<i64> = [first, second, third]
+            .concat()
+            .iter()
+            .map(|row| row.id)
+            .collect();
+        read.sort_unstable();
+        assert_eq!(
+            read,
+            (1..=9).collect::<Vec<_>>(),
+            "каждая строка прочитана ровно один раз"
+        );
+        assert_eq!(reader.count_logs(&filters).expect("count_logs"), 9);
+    }
+
+    #[test]
+    fn list_logs_page_before_ts_without_id_is_exclusive() {
+        let tmp = TempDb::new();
+        let path = tmp.path();
+        let data = [
+            Row::new(10.0, "INFO", "старая"),
+            Row::new(20.0, "INFO", "граница"),
+            Row::new(30.0, "INFO", "свежая"),
+        ];
+        let _writer = seed(&path, &data);
+
+        let reader = DbReader::open(&path).expect("БД открывается");
+        let filters = LogFilters::default();
+        let page = reader
+            .list_logs_page(&filters, Some(20.0), None, 10)
+            .expect("страница с ts-курсором");
+
+        assert_eq!(
+            page,
+            vec![paged(1, &data[0])],
+            "без id курсор строго старше before_ts: строка с ts = 20 не возвращается"
+        );
+    }
+
+    #[test]
+    fn list_logs_page_keeps_filters_on_every_page() {
+        let tmp = TempDb::new();
+        let path = tmp.path();
+        let data = [
+            Row::new(1.0, "ERROR", "ошибка 1"),
+            Row::new(1.0, "INFO", "инфо 1"),
+            Row::new(2.0, "ERROR", "ошибка 2"),
+            Row::new(2.0, "INFO", "инфо 2"),
+            Row::new(3.0, "ERROR", "ошибка 3"),
+            Row::new(3.0, "INFO", "инфо 3"),
+        ];
+        let _writer = seed(&path, &data);
+
+        let reader = DbReader::open(&path).expect("БД открывается");
+        let filters = LogFilters {
+            level: Some("ERROR".to_string()),
+            ..LogFilters::default()
+        };
+
+        let page1 = reader
+            .list_logs_page(&filters, None, None, 2)
+            .expect("первая страница");
+        assert_eq!(page1.iter().map(|row| row.id).collect::<Vec<_>>(), vec![5, 3]);
+
+        let page2 = reader
+            .list_logs_page(&filters, Some(page1[1].log.ts), Some(page1[1].id), 2)
+            .expect("вторая страница");
+        assert_eq!(page2.iter().map(|row| row.id).collect::<Vec<_>>(), vec![1]);
+
+        let page3 = reader
+            .list_logs_page(&filters, Some(page2[0].log.ts), Some(page2[0].id), 2)
+            .expect("третья страница");
+        assert!(page3.is_empty(), "фильтр не пропускает строки на границе");
+        assert_eq!(
+            reader.count_logs(&filters).expect("count_logs под фильтром"),
+            3,
+            "count_logs считает ровно то, что читает list_logs_page"
+        );
+    }
+
+    #[test]
+    fn list_logs_page_caps_limit_and_treats_zero_as_empty() {
+        let tmp = TempDb::new();
+        let path = tmp.path();
+        let data: Vec<Row> = (0..(MAX_LOGS_LIMIT + 5))
+            .map(|i| Row::new(i as f64, "INFO", "строка"))
+            .collect();
+        let _writer = seed(&path, &data);
+
+        let reader = DbReader::open(&path).expect("БД открывается");
+        let filters = LogFilters::default();
+
+        let page = reader
+            .list_logs_page(&filters, None, None, u32::MAX)
+            .expect("бешеный limit не должен ронять чтение");
+        assert_eq!(
+            page.len(),
+            MAX_LOGS_LIMIT as usize,
+            "limit упирается в потолок, как у list_logs"
+        );
+        assert_eq!(
+            page.first().map(|row| row.log.ts),
+            Some(MAX_LOGS_LIMIT as f64 + 4.0),
+            "верхушка — самые новые строки"
+        );
+
+        let empty = reader
+            .list_logs_page(&filters, None, None, 0)
+            .expect("нулевой limit — не ошибка");
+        assert!(empty.is_empty(), "limit = 0 — пустая страница");
+    }
+
+    #[test]
+    fn count_logs_counts_rows_under_filters() {
+        let tmp = TempDb::new();
+        let path = tmp.path();
+        let data = [
+            Row::new(1.0, "ERROR", "ошибка").browser("b1"),
+            Row::new(2.0, "INFO", "инфо").browser("b1"),
+            Row::new(3.0, "ERROR", "ошибка").browser("b2"),
+            Row::new(4.0, "INFO", "инфо"),
+        ];
+        let _writer = seed(&path, &data);
+
+        let reader = DbReader::open(&path).expect("БД открывается");
+
+        assert_eq!(
+            reader
+                .count_logs(&LogFilters::default())
+                .expect("count без фильтров"),
+            4
+        );
+        assert_eq!(
+            reader
+                .count_logs(&LogFilters {
+                    level: Some("ERROR".to_string()),
+                    ..LogFilters::default()
+                })
+                .expect("count по уровню"),
+            2
+        );
+        assert_eq!(
+            reader
+                .count_logs(&LogFilters {
+                    level: Some("ERROR".to_string()),
+                    browser_id: Some("b1".to_string()),
+                    ..LogFilters::default()
+                })
+                .expect("count по уровню и браузеру"),
+            1
+        );
+        assert_eq!(
+            reader
+                .count_logs(&LogFilters {
+                    category: Some("нет_такой".to_string()),
+                    ..LogFilters::default()
+                })
+                .expect("count по несуществующей категории"),
+            0
+        );
+    }
+
+    #[test]
+    fn count_logs_on_empty_database_is_zero_not_an_error() {
+        let tmp = TempDb::new();
+        let path = tmp.path();
+        let _writer = seed(&path, &[]);
+
+        let reader = DbReader::open(&path).expect("БД открывается");
+
+        assert_eq!(
+            reader
+                .count_logs(&LogFilters::default())
+                .expect("пустая БД — это ноль, а не ошибка"),
+            0
+        );
+        assert!(
+            reader
+                .list_logs_page(&LogFilters::default(), None, None, 10)
+                .expect("пустая БД отдаёт пустую страницу")
+                .is_empty()
+        );
+    }
 }
