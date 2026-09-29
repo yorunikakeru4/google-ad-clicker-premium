@@ -25,6 +25,8 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
+from engine.proxy_auth import DEFAULT_PROXY_TRANSPORT, PROXY_TRANSPORTS
+
 # Значение, которым секрет заменяется в любом JSON наружу.
 SECRET_MASK = "********"
 
@@ -49,6 +51,9 @@ _SCHEMA: dict[str, dict[str, tuple[type | tuple[type, ...], Any]]] = {
         "window_size": (str, ""),
         "shift_windows": (bool, False),
         "use_seleniumbase": (bool, False),
+        # Как креды доходят до Chrome: cdp_auth (дефолт) | extension | direct.
+        # Дефолт и словарь значений — из engine.proxy_auth, а не отсюда.
+        "proxy_transport": (str, DEFAULT_PROXY_TRANSPORT),
     },
     "behavior": {
         "query": (str, ""),
@@ -78,6 +83,12 @@ _SCHEMA: dict[str, dict[str, tuple[type | tuple[type, ...], Any]]] = {
 
 # Секреты: наружу уходят замаскированными.
 _SECRET_FIELDS = frozenset({"behavior.2captcha_apikey", "webdriver.proxy"})
+
+# Поля-перечисления: путь поля -> допустимые значения. Словаря значений здесь
+# нет намеренно: он живёт в engine.proxy_auth рядом с resolve_proxy_transport,
+# и второе место правды для него недопустимо. Проверка выполняется только
+# после проверки типа, поэтому к этому месту доходит строка.
+_ENUM_FIELDS: dict[str, frozenset[str]] = {"webdriver.proxy_transport": PROXY_TRANSPORTS}
 
 # browser_count: legacy трактует 0 как "столько, сколько ядер". Демон держит
 # ту же договорённость, иначе конфиг из старой установки молча сменит смысл.
@@ -152,6 +163,16 @@ def _validate_field(field_path: str, value: Any, expected: type) -> list[dict[st
             {
                 "field": field_path,
                 "message": f"ожидается {_type_name(expected)}, получено {type(value).__name__}",
+            }
+        )
+        return problems
+
+    allowed = _ENUM_FIELDS.get(field_path)
+    if allowed is not None and value not in allowed:
+        problems.append(
+            {
+                "field": field_path,
+                "message": f"ожидается одно из {sorted(allowed)}, получено {value!r}",
             }
         )
         return problems
@@ -329,8 +350,9 @@ def validate_settings(data: dict[str, Any], *, base_dir: str | Path | None = Non
     Точка входа для формы (Tauri-HTTP и ``gui.py``): типы, диапазоны,
     ``min <= max`` для пауз, ``ЧЧ:ММ`` для интервалов, взаимная exclusivity
     ``proxy_file``/``proxy`` и ``query_file``/``query``, границы
-    ``browser_count``, — всё это правила ``_validate`` из этого же модуля, без
-    копий. Дополнительно проверяется существование файлов из секции ``paths``.
+    ``browser_count``, допустимые значения ``webdriver.proxy_transport``, —
+    всё это правила ``_validate`` из этого же модуля, без копий. Дополнительно
+    проверяется существование файлов из секции ``paths``.
 
     Порядок списка: сначала ошибки структуры и типов, потом файлы — UI показывает
     их в этом порядке, а проверка файлов на мусорной структуре не выполняется.
