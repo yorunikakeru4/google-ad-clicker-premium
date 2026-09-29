@@ -231,7 +231,8 @@ impl DaemonSpec {
     /// Спецификация из окружения процесса, с дефолтами для dev-запуска.
     pub fn from_env() -> Result<Self, String> {
         let vars: HashMap<String, String> = env::vars().collect();
-        let cwd = env::current_dir().map_err(|error| format!("не удалось определить cwd: {error}"))?;
+        let cwd =
+            env::current_dir().map_err(|error| format!("не удалось определить cwd: {error}"))?;
         Self::resolve(&vars, cwd)
     }
 
@@ -253,7 +254,10 @@ impl DaemonSpec {
                 .split_whitespace()
                 .map(str::to_string)
                 .collect::<Vec<_>>(),
-            _ => DEFAULT_ARGS.iter().map(|item| (*item).to_string()).collect(),
+            _ => DEFAULT_ARGS
+                .iter()
+                .map(|item| (*item).to_string())
+                .collect(),
         };
 
         let cwd = match vars.get("ADCLICKER_DAEMON_CWD") {
@@ -371,9 +375,7 @@ impl DaemonSupervisor {
         // Молчаливый no-op здесь недопустим: вызывающий поверил бы, что
         // демон поднят.
         if inner.monitor_alive {
-            return Err(
-                "монитор демона ещё не завершился — повторите запрос позже".to_string(),
-            );
+            return Err("монитор демона ещё не завершился — повторите запрос позже".to_string());
         }
         self.shared.stop.store(false, Ordering::SeqCst);
         inner.gave_up = false;
@@ -784,8 +786,14 @@ mod tests {
     #[test]
     fn spec_honours_overrides_and_existing_token() {
         let mut vars = HashMap::new();
-        vars.insert("ADCLICKER_DAEMON_PYTHON".to_string(), "/nix/bin/python".to_string());
-        vars.insert("ADCLICKER_DAEMON_ARGS".to_string(), "-m my.daemon --verbose".to_string());
+        vars.insert(
+            "ADCLICKER_DAEMON_PYTHON".to_string(),
+            "/nix/bin/python".to_string(),
+        );
+        vars.insert(
+            "ADCLICKER_DAEMON_ARGS".to_string(),
+            "-m my.daemon --verbose".to_string(),
+        );
         vars.insert("ADCLICKER_DAEMON_CWD".to_string(), "/srv/app".to_string());
         vars.insert(TOKEN_ENV.to_string(), "known-token".to_string());
 
@@ -852,14 +860,18 @@ mod tests {
         // Никакой генерации: control.rs считает отсутствие переменной явной
         // ошибкой, и параллельный источник дал бы UI токен, которым оно не
         // умеет авторизовываться.
-        let error =
-            token_from_vars(&HashMap::new()).expect_err("без токена старт запрещён");
-        assert!(error.contains(TOKEN_ENV), "причина должна назвать переменную: {error}");
+        let error = token_from_vars(&HashMap::new()).expect_err("без токена старт запрещён");
+        assert!(
+            error.contains(TOKEN_ENV),
+            "причина должна назвать переменную: {error}"
+        );
 
-        let blank =
-            token_from_vars(&HashMap::from([(TOKEN_ENV.to_string(), "   ".to_string())]))
-                .expect_err("пробелы — не токен");
-        assert!(blank.contains(TOKEN_ENV), "причина должна назвать переменную: {blank}");
+        let blank = token_from_vars(&HashMap::from([(TOKEN_ENV.to_string(), "   ".to_string())]))
+            .expect_err("пробелы — не токен");
+        assert!(
+            blank.contains(TOKEN_ENV),
+            "причина должна назвать переменную: {blank}"
+        );
     }
 
     #[test]
@@ -877,7 +889,8 @@ mod tests {
         // Перевод строки в значении сломал бы HTTP-заголовок запроса.
         let vars = HashMap::from([(TOKEN_ENV.to_string(), "bad\ntoken".to_string())]);
 
-        let error = token_from_vars(&vars).expect_err("токен с переводом строки должен быть отвергнут");
+        let error =
+            token_from_vars(&vars).expect_err("токен с переводом строки должен быть отвергнут");
         assert!(error.contains("перевод строки"), "{error}");
     }
 
@@ -889,7 +902,10 @@ mod tests {
         supervisor.start(spec("sleep 60")).expect("старт");
 
         let pid = supervisor.status().pid;
-        assert!(pid.is_some(), "пока процесс жив, статус обязан показывать pid");
+        assert!(
+            pid.is_some(),
+            "пока процесс жив, статус обязан показывать pid"
+        );
 
         supervisor.stop();
 
@@ -906,8 +922,9 @@ mod tests {
         let supervisor = DaemonSupervisor::new(fast_options());
         supervisor.start(spec("exit 1")).expect("старт");
 
-        let restarted =
-            wait_until(Duration::from_secs(10), || supervisor.status().restarts >= 2);
+        let restarted = wait_until(Duration::from_secs(10), || {
+            supervisor.status().restarts >= 2
+        });
         assert!(restarted, "упавший демон обязан быть перезапущен");
 
         supervisor.stop();
@@ -990,7 +1007,11 @@ mod tests {
         supervisor.start(spec("sleep 60")).expect("повторный старт");
         thread::sleep(Duration::from_millis(100));
 
-        assert_eq!(supervisor.status().pid, first, "второй процесс не должен появиться");
+        assert_eq!(
+            supervisor.status().pid,
+            first,
+            "второй процесс не должен появиться"
+        );
 
         supervisor.stop();
     }
