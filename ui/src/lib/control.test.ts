@@ -3,6 +3,7 @@ import {
   apiErrorMessage,
   configRequest,
   controlRequest,
+  diagnosticsRequest,
   disabledReason,
   errorMessage,
   profilesRequest,
@@ -196,6 +197,33 @@ describe("profilesRequest", () => {
 
   it("GET-список не несёт тела", () => {
     expect(profilesRequest({ kind: "list" }).body).toBeUndefined();
+  });
+});
+
+describe("diagnosticsRequest", () => {
+  it("сбор для одного воркера — POST с browser_id по контракту", () => {
+    expect(diagnosticsRequest({ kind: "collect", browserId: "br-1" })).toEqual({
+      method: "POST",
+      path: "/control/diagnostics/collect",
+      body: JSON.stringify({ browser_id: "br-1" }),
+    });
+  });
+
+  it("сбор для всех — тот же endpoint с флагом all", () => {
+    expect(diagnosticsRequest({ kind: "collectAll" })).toEqual({
+      method: "POST",
+      path: "/control/diagnostics/collect",
+      body: '{"all":true}',
+    });
+  });
+
+  it("тело собирается из action, а не из глобального состояния", () => {
+    const one = diagnosticsRequest({ kind: "collect", browserId: "br-9" });
+    const all = diagnosticsRequest({ kind: "collectAll" });
+
+    expect(JSON.parse(one.body)).toEqual({ browser_id: "br-9" });
+    expect(JSON.parse(all.body)).toEqual({ all: true });
+    expect(JSON.parse(one.body)).not.toHaveProperty("all");
   });
 });
 
