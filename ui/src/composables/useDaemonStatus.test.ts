@@ -35,7 +35,7 @@ const STATE_BODY = JSON.stringify({
 
 interface PendingCall {
   path: string;
-  resolve: (body: string) => void;
+  resolve: (payload: unknown) => void;
   reject: (error: Error) => void;
 }
 
@@ -71,7 +71,7 @@ function fakeApi() {
       stateBody: string = STATE_BODY,
     ) {
       for (const call of pending.splice(0)) {
-        call.resolve(call.path === "/health" ? healthBody : stateBody);
+        call.resolve(JSON.parse(call.path === "/health" ? healthBody : stateBody));
       }
     },
     failAll(message: string) {
