@@ -9,7 +9,7 @@ use std::sync::{Mutex, MutexGuard};
 
 use tauri::State;
 
-use crate::db::{DbError, DbReader, LogEntry, LogFilters, LogPageEntry};
+use crate::db::{DbError, DbReader, LogEntry, LogFilters, LogPageEntry, ProxyRow};
 use crate::metrics::{ActiveWorker, HourlyClicks, RequestsLastHour, RunsSummary};
 
 /// Имя переменной окружения с путём к БД — зеркало `DB_ENV_VAR` из
@@ -248,6 +248,14 @@ pub fn active_workers(
     with_reader(&state.0, |reader| {
         reader.active_workers(now, threshold_secs)
     })
+}
+
+/// Список прокси экрана Proxies: строки таблицы + назначенный воркер и
+/// счётчик использований. Креды в ответ не входят (см. [`ProxyRow`]),
+/// мутации списка идут только через control API демона, не через эту команду.
+#[tauri::command]
+pub fn list_proxies(state: State<'_, DbState>) -> Result<Vec<ProxyRow>, DbError> {
+    with_reader(&state.0, |reader| reader.list_proxies())
 }
 
 #[cfg(test)]

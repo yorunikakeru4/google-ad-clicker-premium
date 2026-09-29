@@ -1,4 +1,4 @@
-//! Read-only читалка боевой БД для экрана Logs.
+//! Read-only читалка боевой БД для экранов Logs и Proxies.
 //!
 //! Контракт: движок (`engine/db`) пишет в WAL, UI читает тот же файл, но
 //! только соединением `SQLITE_OPEN_READ_ONLY` — без создания файла и без
@@ -99,6 +99,31 @@ pub struct LogPageEntry {
     pub id: i64,
     #[serde(flatten)]
     pub log: LogEntry,
+}
+
+/// Строка списка прокси — экран Proxies (контракт GET /control/proxies,
+/// только без кредов: `username`/`password` сюда не входят вообще).
+///
+/// Маскирование (план §5, фаза 5): пароль не должен покидать БД даже через
+/// read-only читалку — UI они не нужны, а риск утечки в лог или ответ нулевой
+/// только пока поля нет в структуре. `assigned_browser_id` — воркер,
+/// сидящий на прокси (`workers.proxy_id`), `usage_count` — строк в
+/// `proxy_usage`.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ProxyRow {
+    pub id: i64,
+    pub label: Option<String>,
+    pub scheme: String,
+    pub host: String,
+    pub port: i64,
+    pub country: Option<String>,
+    pub latency_ms: Option<i64>,
+    pub is_alive: bool,
+    pub fail_count: i64,
+    pub last_checked_at: Option<f64>,
+    pub last_error: Option<String>,
+    pub assigned_browser_id: Option<String>,
+    pub usage_count: i64,
 }
 
 /// Читатель боевой БД: одно соединение, строго на чтение.
@@ -203,6 +228,58 @@ impl DbReader {
             .query_row(binds.as_slice(), |row| row.get(0))
             .map_err(read_failed)?;
         Ok(count)
+    }
+
+    /// Список прокси для экрана Proxies: строки `proxies` плюс назначенный
+    /// воркер и счётчик использований. Порядок — по `id`: стабильный и
+    /// совпадает с порядком вставки демона.
+    ///
+    /// Назначение и счётчик — подзапросами, а не JOIN: два воркера на одном
+    /// прокси размножили бы строку, а экрану нужен ровно один адрес на строку.
+    /// При нескольких воркерах отдаётся первый `browser_id` по алфавиту —
+    /// выбор детерминирован, а не зависит от порядка в таблице.
+    ///
+    /// Креды (`username`, `password`) в выборку не входят: поля нет в
+    /// [`ProxyRow`], поэтому в JSON для UI их не может быть по построению.
+    pub fn list_proxies(&self) -> Result<Vec<ProxyRow>, DbError> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT p.id, p.label, p.scheme, p.host, p.port, p.country, \
+                        p.latency_ms, p.is_alive, p.fail_count, p.last_checked_at, \
+                        p.last_error, \
+                        (SELECT w.browser_id FROM workers w \
+                          WHERE w.proxy_id = p.id \
+                          ORDER BY w.browser_id LIMIT 1) AS assigned_browser_id, \
+                        (SELECT COUNT(*) FROM proxy_usage u WHERE u.proxy_id = p.id) \
+                          AS usage_count \
+                   FROM proxies p \
+                  ORDER BY p.id",
+            )
+            .map_err(read_failed)?;
+
+        let rows = stmt
+            .query_map([], |row| {
+                let is_alive: i64 = row.get(7)?;
+                Ok(ProxyRow {
+                    id: row.get(0)?,
+                    label: row.get(1)?,
+                    scheme: row.get(2)?,
+                    host: row.get(3)?,
+                    port: row.get(4)?,
+                    country: row.get(5)?,
+                    latency_ms: row.get(6)?,
+                    is_alive: is_alive != 0,
+                    fail_count: row.get(8)?,
+                    last_checked_at: row.get(9)?,
+                    last_error: row.get(10)?,
+                    assigned_browser_id: row.get(11)?,
+                    usage_count: row.get(12)?,
+                })
+            })
+            .map_err(read_failed)?;
+
+        rows.map(|row| row.map_err(read_failed)).collect()
     }
 
     /// Общий путь запросов логов: одна страница в порядке `ts DESC, id DESC`.

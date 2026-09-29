@@ -165,6 +165,11 @@ pub fn parse_endpoint(base_url: &str) -> Result<Endpoint, String> {
 }
 
 /// Allowlist путей: даже с чужим телом прокси не уедет на произвольный URL.
+///
+/// Хвост `/control/` — сегменты из строчных латинских букв, разделённых
+/// одинарным `/`: это открывает подпути вида `/control/proxies/import`
+/// (контракт API прокси), но не открывает обход (`..`), верхний регистр,
+/// точку, пробел, перевод строки и произвольные URL.
 pub fn allowed_path(path: &str) -> bool {
     if !path.starts_with('/') || path.chars().any(|c| c.is_whitespace()) {
         return false;
@@ -173,7 +178,12 @@ pub fn allowed_path(path: &str) -> bool {
         return true;
     }
     match path.strip_prefix("/control/") {
-        Some(tail) => !tail.is_empty() && tail.chars().all(|c| c.is_ascii_lowercase()),
+        Some(tail) => {
+            !tail.is_empty()
+                && tail.split('/').all(|segment| {
+                    !segment.is_empty() && segment.chars().all(|c| c.is_ascii_lowercase())
+                })
+        }
         None => false,
     }
 }
