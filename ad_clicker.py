@@ -11,6 +11,7 @@ import hooks
 from clicklogs_db import ClickLogsDB
 from config_reader import config
 from engine.log import get_logger
+from engine.profile_apply import current_profile, resolve_user_agent
 from engine.worker import proxy_from_environ
 from logger import update_log_formats
 from proxy import get_proxies
@@ -131,7 +132,12 @@ def run_scenario(
 
     domains = get_domains()
 
-    user_agent = get_random_user_agent_string()
+    # UA назначённого профиля главнее случайного; без профиля (и с пустым
+    # полем) фолбэк ровно тот же, что и раньше — get_random_user_agent_string.
+    profile = current_profile()
+    user_agent = resolve_user_agent(profile, get_random_user_agent_string())
+    if profile is not None:
+        log.debug("browser", "Profile applied", fields={"profile_id": profile["id"]})
 
     plugin_folder_name = "".join(random.choices(string.ascii_lowercase, k=5))
 

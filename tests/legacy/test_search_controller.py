@@ -5,12 +5,16 @@ SearchController создаётся с фальшивым драйвером (н
 ссылок - покрывается именно логика, а не заглушки.
 """
 
+import json
 from datetime import datetime
+from pathlib import Path
 
 import pytest
 
+import search_controller
 from clicklogs_db import ClickLogsDB
 from conftest import FakeDriver, FakeElement
+from engine.profile_apply import load_profile_cookies, profile_cookies_path
 from search_controller import SearchController
 from stats import SearchStats
 
@@ -664,3 +668,310 @@ def test_wait_time_should_be_able_to_reach_configured_maximum(
     monkeypatch.setattr("random.choice", lambda population: list(population)[-1])
 
     assert controller._get_wait_time(True) == 11
+
+
+# --- cookies: профильный набор против общего cookies.txt ----------------------
+
+PROFILE_COOKIE = {"name": "sid", "value": "profile-secret", "sameSite": "lax"}
+
+
+class ProfileCookieDriver(FakeDriver):
+    """Драйвер для cookies-логики: удаление, добавление и выгрузка."""
+
+    def __init__(self, browser_cookies=None):
+        super().__init__()
+        self.added = []
+        self.browser_cookies = [dict(cookie) for cookie in browser_cookies or []]
+
+    def add_cookie(self, cookie):
+        self.added.append(dict(cookie))
+
+    def get_cookies(self):
+        return [dict(cookie) for cookie in self.browser_cookies]
+
+
+class StopBeforeSearch(Exception):
+    """Обрыв сразу после cookies: порядок действий search_for_ads."""
+
+
+class LogRecorder:
+    """Логгер-заглушка: пишет вызовы в список, в БД ничего не уходит."""
+
+    def __init__(self):
+        self.records = []
+
+    def _record(self, level, category, message, **kwargs):
+        self.records.append((level, category, message, kwargs.get("fields") or {}))
+
+    def debug(self, category, message, **kwargs):
+        self._record("DEBUG", category, message, **kwargs)
+
+    def info(self, category, message, **kwargs):
+        self._record("INFO", category, message, **kwargs)
+
+    def warning(self, category, message, **kwargs):
+        self._record("WARNING", category, message, **kwargs)
+
+    def error(self, category, message, **kwargs):
+        self._record("ERROR", category, message, **kwargs)
+
+    @property
+    def warnings(self):
+        return [record for record in self.records if record[0] == "WARNING"]
+
+    @property
+    def text(self):
+        return str(self.records)
+
+
+@pytest.fixture
+def record_log(monkeypatch):
+    """Логгер-заглушка для обеих точек пишущего кода.
+
+    В проде ``search_controller.log`` и ``engine.profile_apply.log`` — один и
+    тот же ``get_logger()``-инстанс, поэтому здесь оба атрибута подменяются
+    на один recorder: иначе запись про битый cookies-файл (её делает
+    profile_apply) не попала бы в проверку.
+    """
+
+    recorder = LogRecorder()
+    monkeypatch.setattr(search_controller, "log", recorder)
+    # В профиле логгер ленивый (см. engine.profile_apply._log), поэтому
+    # подменяется фабрика, а не атрибут.
+    monkeypatch.setattr("engine.profile_apply.get_logger", lambda: recorder)
+    return recorder
+
+
+@pytest.fixture
+def assign_profile(tmp_path, monkeypatch):
+    """Профиль, назначенный процессу, и каталог для его cookies."""
+
+    from engine.db import migrations
+    from engine.profile_apply import PROFILE_DATA_DIR_ENV, PROFILE_ID_ENV
+    from engine.profile_pool import ProfilePool
+
+    db = tmp_path / "profiles.db"
+    migrations.migrate(db)
+    monkeypatch.setenv("ADCLICKER_DB", str(db))
+    monkeypatch.setenv(PROFILE_DATA_DIR_ENV, str(tmp_path / "profile_data"))
+    pool = ProfilePool(db)
+
+    def _assign(cookies=None, **fields):
+        pool.add_profiles([{"name": "acc", **fields}])
+        row = pool.list_profiles()[-1]
+        monkeypatch.setenv(PROFILE_ID_ENV, str(row["id"]))
+        if cookies is not None:
+            path = profile_cookies_path(row["id"])
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps(cookies), encoding="utf-8")
+        return row["id"]
+
+    return _assign
+
+
+class TestProfileCookies:
+    """Правило применения: профильный набор всегда, без профиля — флаг.
+
+    ``custom_cookies`` остаётся «применять cookies вообще» только для
+    legacy-пути; с назначенным профилем его значение не спрашивается.
+    """
+
+    def test_profile_set_is_applied_even_when_the_flag_is_off(
+        self, make_search_controller, assign_profile, behavior
+    ):
+        assert behavior.custom_cookies is False, "флаг в песочнице выключен"
+        assign_profile(cookies=[PROFILE_COOKIE])
+        driver = ProfileCookieDriver()
+        controller = make_search_controller(driver=driver)
+
+        controller._apply_cookies()
+
+        assert driver.cookies_deleted == 1, "чужие cookies должны удаляться"
+        assert driver.added == [
+            {"name": "sid", "value": "profile-secret", "sameSite": "Lax"}
+        ]
+
+    def test_flag_without_a_profile_uses_the_global_cookies_txt(
+        self, make_search_controller, monkeypatch, behavior, isolated_cwd
+    ):
+        # isolated_cwd кладёт в cwd четыре cookies из песочницы — ровно то,
+        # что читает legacy utils.add_cookies.
+        monkeypatch.setattr(behavior, "custom_cookies", True)
+        driver = ProfileCookieDriver()
+        controller = make_search_controller(driver=driver)
+
+        controller._apply_cookies()
+
+        assert driver.cookies_deleted == 1
+        assert [cookie["name"] for cookie in driver.added] == [
+            "strict_one",
+            "lax_one",
+            "none_secure",
+            "none_insecure",
+        ]
+
+    def test_no_profile_and_no_flag_applies_nothing(self, make_search_controller):
+        driver = ProfileCookieDriver()
+        controller = make_search_controller(driver=driver)
+
+        controller._apply_cookies()
+
+        assert driver.cookies_deleted == 0
+        assert driver.added == []
+
+    def test_profile_file_wins_over_the_global_cookies_txt(
+        self, make_search_controller, assign_profile, monkeypatch, behavior
+    ):
+        monkeypatch.setattr(behavior, "custom_cookies", True)
+        assign_profile(cookies=[PROFILE_COOKIE])
+        driver = ProfileCookieDriver()
+        controller = make_search_controller(driver=driver)
+
+        controller._apply_cookies()
+
+        assert [cookie["name"] for cookie in driver.added] == ["sid"], (
+            "общий cookies.txt не должен подмешиваться к профильному набору"
+        )
+
+    def test_missing_profile_file_starts_the_profile_clean(
+        self, make_search_controller, assign_profile
+    ):
+        assign_profile()  # без файла: первый запуск профиля
+        driver = ProfileCookieDriver()
+        controller = make_search_controller(driver=driver)
+
+        controller._apply_cookies()
+
+        assert driver.cookies_deleted == 1
+        assert driver.added == []
+
+    def test_broken_profile_file_is_reported_and_does_not_stop_the_run(
+        self, make_search_controller, assign_profile, record_log
+    ):
+        profile_id = assign_profile()
+        path = profile_cookies_path(profile_id)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("{ это не json", encoding="utf-8")
+        driver = ProfileCookieDriver()
+        controller = make_search_controller(driver=driver)
+
+        controller._apply_cookies()
+
+        assert driver.cookies_deleted == 1, "прогон продолжается с пустым набором"
+        assert driver.added == []
+        assert record_log.warnings, "порча файла должна быть видна в логе"
+
+    def test_search_for_ads_applies_cookies_before_any_page_work(
+        self, make_search_controller, assign_profile, monkeypatch, behavior
+    ):
+        monkeypatch.setattr(behavior, "custom_cookies", True)
+        assign_profile(cookies=[PROFILE_COOKIE])
+        driver = ProfileCookieDriver()
+        controller = make_search_controller(driver=driver)
+        calls = []
+
+        def stop():
+            calls.append("cookies")
+            raise StopBeforeSearch()
+
+        # raising=False: в состоянии до фичи метода ещё нет, и именно это
+        # и есть причина упасть — search_for_ads обязан звать его первым.
+        monkeypatch.setattr(controller, "_apply_cookies", stop, raising=False)
+
+        with pytest.raises(StopBeforeSearch):
+            controller.search_for_ads(non_ad_domains=[])
+
+        assert calls == ["cookies"], "cookies применяются до первой работы со страницей"
+
+    def test_cookie_values_never_reach_the_log(
+        self, make_search_controller, assign_profile, record_log
+    ):
+        assign_profile(cookies=[PROFILE_COOKIE])
+        driver = ProfileCookieDriver()
+        controller = make_search_controller(driver=driver)
+
+        controller._apply_cookies()
+
+        assert "profile-secret" not in record_log.text, (
+            "значения cookies — сессионные креды, в логи не попадают"
+        )
+
+    def test_profile_cookies_are_applied_in_seleniumbase_mode_too(
+        self, make_search_controller, assign_profile, monkeypatch, config
+    ):
+        """Хук cookies живёт в самом контроллере, а не в UC-драйвере."""
+        monkeypatch.setattr(config.webdriver, "use_seleniumbase", True)
+        assign_profile(cookies=[PROFILE_COOKIE])
+        driver = ProfileCookieDriver()
+        driver.uc_open_with_reconnect = lambda url, reconnect_time: driver.visited.append(url)
+        controller = make_search_controller(driver=driver)
+
+        controller._apply_cookies()
+
+        assert driver.cookies_deleted == 1
+        assert [cookie["name"] for cookie in driver.added] == ["sid"]
+
+
+class TestProfileCookiesSave:
+    """Выгрузка cookies браузера в файл профиля на выходе из сценария."""
+
+    def test_end_search_saves_cookies_before_teardown(
+        self, make_search_controller, assign_profile
+    ):
+        profile_id = assign_profile()
+        driver = ProfileCookieDriver(
+            browser_cookies=[{"name": "live", "value": "session-secret", "sameSite": "Lax"}]
+        )
+        controller = make_search_controller(driver=driver)
+
+        controller.end_search()
+
+        assert load_profile_cookies(profile_id) == [
+            {"name": "live", "value": "session-secret", "sameSite": "Lax"}
+        ]
+        # Порядок важен: сохранение до удаления, teardown не тронут.
+        assert driver.cookies_deleted == 1
+        assert "quit" in driver.visited
+        assert controller._driver is None
+
+    def test_end_search_survives_a_failure_to_read_cookies(
+        self, make_search_controller, assign_profile, record_log, monkeypatch
+    ):
+        profile_id = assign_profile()
+        driver = ProfileCookieDriver()
+        monkeypatch.setattr(driver, "get_cookies", lambda: (_ for _ in ()).throw(
+            RuntimeError("драйвер уже умер")
+        ))
+        controller = make_search_controller(driver=driver)
+
+        controller.end_search()
+
+        assert driver.cookies_deleted == 1, "teardown обязан дойти до конца"
+        assert "quit" in driver.visited
+        assert load_profile_cookies(profile_id) == []
+        assert record_log.warnings, "причина должна попасть в лог"
+        assert record_log.warnings[0][1] == "browser"
+
+    def test_unserializable_cookies_do_not_break_teardown(
+        self, make_search_controller, assign_profile, record_log
+    ):
+        assign_profile()
+        driver = ProfileCookieDriver(browser_cookies=[{"name": "x", "value": object()}])
+        controller = make_search_controller(driver=driver)
+
+        controller.end_search()
+
+        assert driver.cookies_deleted == 1
+        assert "quit" in driver.visited
+        assert record_log.warnings, "отказ записи — это WARNING, а не падение"
+
+    def test_without_a_profile_no_cookie_file_is_created(self, make_search_controller):
+        driver = ProfileCookieDriver(browser_cookies=[{"name": "live", "value": "42"}])
+        controller = make_search_controller(driver=driver)
+
+        controller.end_search()
+
+        assert "quit" in driver.visited
+        assert not Path("profile_data").exists(), (
+            "без профиля файл cookies профиля не появляется"
+        )

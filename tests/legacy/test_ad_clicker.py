@@ -1,8 +1,10 @@
-"""Тесты ad_clicker: CLI-контракт и выбор query/proxy для прогона.
+"""Тесты ad_clicker: CLI-контракт, выбор query/proxy и User-Agent прогона.
 
-Сам ``run_scenario`` требует браузера, поэтому не проверяется: покрыты
-чистые функции выбора запроса и прокси и диспетчеризация ``main()``,
-которые и есть поведение, перенесённое в воркер.
+Сам ``run_scenario`` требует браузера, поэтому целиком не проверяется:
+покрыты чистые функции выбора запроса/прокси/User-Agent и диспетчеризация
+``main()``, которые и есть поведение, перенесённое в воркер. Прогона с
+назначенным профилем касается только строка UA — она проверяется на
+подменённой точке создания драйвера, до Chrome и сети.
 """
 
 import contextlib
@@ -217,3 +219,94 @@ class TestMainDispatch:
             ad_clicker.main()
 
         assert calls == [], "отчёт не должен запускать сценарий"
+
+
+# --- User-Agent прогона: профиль против случайного ---------------------------
+
+
+class StopBeforeBrowser(Exception):
+    """create_webdriver перехвачен: прогон обрывается до запуска Chrome."""
+
+
+@pytest.fixture
+def capture_user_agent(monkeypatch):
+    """create_webdriver вместо браузера: запомнить UA и оборвать прогон."""
+
+    captured = {}
+
+    def fake_create_webdriver(proxy, user_agent, plugin_folder_name):
+        captured["user_agent"] = user_agent
+        raise StopBeforeBrowser()
+
+    monkeypatch.setattr(ad_clicker, "create_webdriver", fake_create_webdriver)
+    return captured
+
+
+@pytest.fixture
+def assign_profile(tmp_path, monkeypatch):
+    """Профиль в своей БД, назначенный процессу через env супервизора."""
+
+    from engine.db import migrations
+    from engine.profile_apply import PROFILE_ID_ENV
+    from engine.profile_pool import ProfilePool
+
+    db = tmp_path / "profiles.db"
+    migrations.migrate(db)
+    monkeypatch.setenv("ADCLICKER_DB", str(db))
+    pool = ProfilePool(db)
+
+    def _assign(**fields):
+        pool.add_profiles([{"name": "acc", **fields}])
+        row = pool.list_profiles()[-1]
+        monkeypatch.setenv(PROFILE_ID_ENV, str(row["id"]))
+        return row["id"]
+
+    return _assign
+
+
+class TestProfileUserAgent:
+    """UA прогона: назначенный профиль главнее случайного user-agent."""
+
+    def test_profile_user_agent_wins_over_the_random_one(
+        self, assign_profile, capture_user_agent, monkeypatch
+    ):
+        assign_profile(user_agent="UA/Profile")
+        monkeypatch.setattr(ad_clicker, "get_random_user_agent_string", lambda: "UA/Random")
+
+        with pytest.raises(StopBeforeBrowser):
+            ad_clicker.run_scenario(query="usb hub")
+
+        assert capture_user_agent["user_agent"] == "UA/Profile"
+
+    def test_without_a_profile_the_random_user_agent_is_used(
+        self, capture_user_agent, monkeypatch
+    ):
+        monkeypatch.delenv("ADCLICKER_PROFILE_ID", raising=False)
+        monkeypatch.setattr(ad_clicker, "get_random_user_agent_string", lambda: "UA/Random")
+
+        with pytest.raises(StopBeforeBrowser):
+            ad_clicker.run_scenario(query="usb hub")
+
+        assert capture_user_agent["user_agent"] == "UA/Random"
+
+    def test_empty_profile_user_agent_falls_back_to_the_random_one(
+        self, assign_profile, capture_user_agent, monkeypatch
+    ):
+        assign_profile(user_agent="   ")
+        monkeypatch.setattr(ad_clicker, "get_random_user_agent_string", lambda: "UA/Random")
+
+        with pytest.raises(StopBeforeBrowser):
+            ad_clicker.run_scenario(query="usb hub")
+
+        assert capture_user_agent["user_agent"] == "UA/Random"
+
+    def test_profile_without_a_user_agent_keeps_the_random_one(
+        self, assign_profile, capture_user_agent, monkeypatch
+    ):
+        assign_profile(locale="de-DE")
+        monkeypatch.setattr(ad_clicker, "get_random_user_agent_string", lambda: "UA/Random")
+
+        with pytest.raises(StopBeforeBrowser):
+            ad_clicker.run_scenario(query="usb hub")
+
+        assert capture_user_agent["user_agent"] == "UA/Random"

@@ -179,3 +179,7 @@ ui/gen/
 engine/logs/
 engine/screenshots/
 engine/profiles/
+
+# Персистентные cookies профилей (фаза 6): внутри — сессионные креды
+# аккаунтов, поэтому каталог локальных данных, а не часть репозитория
+profile_data/

@@ -13,9 +13,11 @@
 Что здесь живёт, а что нет:
 
 * **живёт** — цикл, окно запуска, пауза, очередь запросов, устойчивость к
-  сбоям конфига и сценария и heartbeat в БД (фоновым потоком: воркер стучит
+  сбоям конфига и сценария, heartbeat в БД (фоновым потоком: воркер стучит
   сам, супервизор только наблюдает и по отсутствию роста помечает его
-  зависшим);
+  зависшим) и статусы профиля вокруг сценария (``assigned → active`` на
+  старте, возврат в ``assigned`` на выходе — политика в
+  :meth:`WorkerRunner._profile_finished`);
 * **не живёт** — надзор за процессом. Падение самого воркера разбирает
   супервизор (backoff, circuit breaker), а не этот модуль.
 
@@ -38,6 +40,8 @@ from typing import Any, Callable, Mapping, Protocol, Sequence
 from engine.control_plane.state import StateStore
 from engine.db import migrations
 from engine.log import StructuredLogger
+from engine.profile_apply import profile_id_from_environ
+from engine.profile_pool import ProfilePool
 from engine.scheduler import (
     OUTSIDE_INTERVAL_WAIT_SECONDS,
     IntervalError,
@@ -278,6 +282,7 @@ class WorkerRunner:
         pause_poll_seconds: float = PAUSE_POLL_SECONDS,
         outside_wait_seconds: float = OUTSIDE_INTERVAL_WAIT_SECONDS,
         pool_size: int | None = None,
+        profile_pool: ProfilePool | None = None,
     ):
         self._browser_id = browser_id
         self._store = store
@@ -288,6 +293,11 @@ class WorkerRunner:
         self._pause_poll_seconds = pause_poll_seconds
         self._outside_wait_seconds = outside_wait_seconds
         self._pool_size = pool_size
+        # Пул профилей — явный аргумент, как store/source/logger: зависимость
+        # видна в сигнатуре, а тесты подставляют свой экземпляр на настоящей
+        # SQLite без демона. None = статусы не ведём, ровно поведение до этой
+        # фичи; в main() пул строится на том же db_path, что и миграции.
+        self._profile_pool = profile_pool
         # Последняя причина ожидания. None — воркер работал; по ней видно,
         # сколько раз и из-за чего простой повторялся.
         self._wait_reason: WaitReason | None = None
@@ -437,6 +447,12 @@ class WorkerRunner:
         return devices[(worker_index - 1) % len(devices)]
 
     def _run_scenario(self, request: ScenarioRequest, round_index: int) -> None:
+        # Профиль живёт ровно столько, сколько сценарий: mark_active до
+        # передачи управления legacy и mark_done после — обязательно после,
+        # иначе упавший прогон оставил бы профиль в active навсегда.
+        profile_id = profile_id_from_environ()
+        self._profile_started(profile_id)
+
         # Исключение и «звершено с ошибкой» — два разных способа сказать одно
         # и то же: legacy run_scenario глотает исключения сам (иначе упал бы
         # весь прогон, как было в ad_clicker.main), поэтому возвращаемый флаг
@@ -466,6 +482,68 @@ class WorkerRunner:
             self._log("INFO", "browser", "scenario finished", fields)
         else:
             self._log("ERROR", "browser", "scenario failed", fields)
+
+        self._profile_finished(profile_id)
+
+    # --- статусы профиля -------------------------------------------------------
+
+    def _profile_started(self, profile_id: int | None) -> None:
+        """``assigned → active`` в момент старта сценария. Best-effort.
+
+        Переход обязан пережить любую причину отказа: профиль мог снять
+        оператор, строку могли удалить, БД — не открываться. Сценарий от
+        статусов не зависит, поэтому отказ — это ``WARNING``, а не выход из
+        метода.
+        """
+
+        if profile_id is None or self._profile_pool is None:
+            return
+        try:
+            self._profile_pool.mark_active(profile_id)
+        except Exception as exc:  # noqa: BLE001 - статус не должен валить прогон
+            self._log(
+                "WARNING",
+                "browser",
+                "profile status was not marked active",
+                {
+                    "profile_id": profile_id,
+                    "error": str(exc),
+                    "error_type": type(exc).__name__,
+                },
+            )
+
+    def _profile_finished(self, profile_id: int | None) -> None:
+        """Возврат в ``assigned`` + ``last_used_at``. Best-effort.
+
+        Политика ошибок: падение сценария НЕ переводит профиль в ``error``.
+
+        Мотивация: ``error`` — это решение оператора, а не автоматика
+        воркера. Причинами падений чаще оказываются временные вещи (обрыв
+        сети, капча, пустая выдача, упавший прокси), а цена ложного ``error``
+        высока: профиль выпадает из ротации до ручного возврата в ``free``,
+        то есть оператор обязан разобраться с каждым единичным сбоем сам.
+        Настоящая поломка аккаунта видна и без автоматики — по повторяющимся
+        ``scenario failed`` в логах и в ``runs``; когда таких прогонов
+        накопится, пометить профиль ``error`` вручную будет точнее, чем
+        по первому же сбою. Отсюда ``ok=True`` здесь всегда: и успех, и
+        ошибка возвращают назначение и обновляют ``last_used_at``.
+        """
+
+        if profile_id is None or self._profile_pool is None:
+            return
+        try:
+            self._profile_pool.mark_done(profile_id, ok=True)
+        except Exception as exc:  # noqa: BLE001 - статус не должен валить прогон
+            self._log(
+                "WARNING",
+                "browser",
+                "profile status was not marked done",
+                {
+                    "profile_id": profile_id,
+                    "error": str(exc),
+                    "error_type": type(exc).__name__,
+                },
+            )
 
     # --- ожидание ---------------------------------------------------------
 
@@ -822,6 +900,9 @@ def main(
             logger=logger,
             stop_event=stop,
             pool_size=pool_size_from_environ(),
+            # Та же БД, что у store и у миграций: статусы профиля, выданный
+            # супервизором env и legacy-настройки обязаны смотреть в одну базу.
+            profile_pool=ProfilePool(db_path),
         )
         return runner.run()
     finally:

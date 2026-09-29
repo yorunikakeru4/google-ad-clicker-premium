@@ -22,6 +22,8 @@ import pytest
 from engine.control_plane.state import StateStore
 from engine.db import migrations
 from engine.log import StructuredLogger
+from engine.profile_apply import PROFILE_ID_ENV
+from engine.profile_pool import ProfilePool
 from engine.store import StoreWriter
 from engine.worker import (
     EXIT_CONFIG_ERROR,
@@ -418,6 +420,171 @@ def test_legacy_system_exit_from_scenario_is_contained(store, logger, stop_event
     code = make_runner(source, store, logger, stop_event).run()
 
     assert code == EXIT_OK
+
+
+# --- статусы профиля вокруг сценария ------------------------------------------
+
+
+def assign_profile(db_path, browser_id="br-1"):
+    """Профиль, назначенный воркеру так же, как это делает пул при спавне."""
+
+    pool = ProfilePool(db_path)
+    result = pool.add_profiles([{"name": "acc-1"}])
+    assert result["added"] == 1, result
+    profile = pool.take_for_worker(browser_id)
+    assert profile is not None, "свободный профиль должен выдаться воркеру"
+    return profile
+
+
+def profile_row(db_path, profile_id):
+    """Сырая строка профиля: проверяем БД, а не собственные методы пула."""
+
+    import sqlite3
+
+    with sqlite3.connect(db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        row = conn.execute(
+            "SELECT status, last_used_at FROM profiles WHERE id = ?", (profile_id,)
+        ).fetchone()
+    return dict(row) if row is not None else None
+
+
+class TestProfileStatuses:
+    """Статусы: ``assigned → active`` на старте, возврат в ``assigned`` на выходе.
+
+    Политика ошибок зафиксирована в ``WorkerRunner._profile_finished`` и
+    проверяется здесь же: падение сценария НЕ уводит профиль в ``error``.
+    """
+
+    def test_profile_is_active_during_the_scenario_and_assigned_after_it(
+        self, store, logger, stop_event, db_path, monkeypatch
+    ):
+        profile = assign_profile(db_path)
+        monkeypatch.setenv(PROFILE_ID_ENV, str(profile["id"]))
+        seen = []
+
+        def during(request):
+            seen.append(profile_row(db_path, profile["id"])["status"])
+            stop_event.set()
+
+        source = FakeSource()
+        source.on_scenario = during
+
+        make_runner(
+            source, store, logger, stop_event, profile_pool=ProfilePool(db_path)
+        ).run()
+
+        assert seen == ["active"], "на время сценария профиль обязан быть активным"
+        row = profile_row(db_path, profile["id"])
+        assert row["status"] == "assigned", "штатный выход возвращает назначение"
+        assert row["last_used_at"] is not None, "last_used_at пишется на выходе"
+
+    def test_failed_scenario_keeps_the_profile_assigned(
+        self, store, logger, stop_event, db_path, monkeypatch
+    ):
+        """Политика: единичное падение сценария — не ошибка профиля.
+
+        ``error`` выбросил бы профиль из ротации до ручного решения
+        оператора, а причины падений (обрыв сети, капча, пустая выдача)
+        чаще временные. Видимость остаётся в логах ``scenario failed`` и в
+        ``runs`` — оператору и так видно, что прогон не удался.
+        """
+        profile = assign_profile(db_path)
+        monkeypatch.setenv(PROFILE_ID_ENV, str(profile["id"]))
+        source = FakeSource()
+        source.scenario_ok = False
+        source.on_scenario = lambda request: stop_event.set()
+
+        make_runner(
+            source, store, logger, stop_event, profile_pool=ProfilePool(db_path)
+        ).run()
+
+        row = profile_row(db_path, profile["id"])
+        assert row["status"] == "assigned"
+        assert row["last_used_at"] is not None
+
+    def test_scenario_exception_also_returns_the_profile_to_assigned(
+        self, store, logger, stop_event, db_path, monkeypatch
+    ):
+        profile = assign_profile(db_path)
+        monkeypatch.setenv(PROFILE_ID_ENV, str(profile["id"]))
+        source = FakeSource()
+        source.scenario_error = RuntimeError("chrome упал")
+        source.on_scenario = lambda request: stop_event.set()
+
+        make_runner(
+            source, store, logger, stop_event, profile_pool=ProfilePool(db_path)
+        ).run()
+
+        assert profile_row(db_path, profile["id"])["status"] == "assigned"
+
+    def test_without_the_env_no_status_is_touched(
+        self, store, logger, stop_event, db_path, monkeypatch
+    ):
+        profile = assign_profile(db_path)
+        monkeypatch.delenv(PROFILE_ID_ENV, raising=False)
+        source = FakeSource()
+        source.on_scenario = lambda request: stop_event.set()
+
+        make_runner(
+            source, store, logger, stop_event, profile_pool=ProfilePool(db_path)
+        ).run()
+
+        row = profile_row(db_path, profile["id"])
+        assert row["status"] == "assigned", "назначение не двигается без env профиля"
+        assert row["last_used_at"] is None, "никаких отметок работы без профиля"
+
+    def test_status_transition_failure_is_logged_but_does_not_stop_the_scenario(
+        self, store, logger, stop_event, db_path, monkeypatch, writer
+    ):
+        """Оператор снял профиль с воркера во время прогона: WARNING и дальше."""
+        profile = assign_profile(db_path)
+        assert ProfilePool(db_path).release(profile["id"]) is True
+        monkeypatch.setenv(PROFILE_ID_ENV, str(profile["id"]))
+        source = FakeSource()
+        source.on_scenario = lambda request: stop_event.set()
+
+        make_runner(
+            source, store, logger, stop_event, profile_pool=ProfilePool(db_path)
+        ).run()
+        writer.flush()
+
+        assert len(source.requests) == 1, "сценарий обязан отработать"
+        warnings = [
+            row
+            for row in read_logs(db_path)
+            if row["level"] == "WARNING" and "profile status was not" in row["message"]
+        ]
+        assert warnings, "отказ перехода статуса обязан быть виден в логе"
+
+    def test_main_wires_the_pool_so_statuses_work_end_to_end(
+        self, tmp_path, monkeypatch
+    ):
+        import threading
+
+        db = tmp_path / "main.db"
+        migrations.migrate(db)
+        pool = ProfilePool(db)
+        pool.add_profiles([{"name": "acc-1"}])
+        # Назначение делает супервизор до спавна — здесь та же операция.
+        profile = pool.take_for_worker("br-7")
+        assert profile is not None
+        monkeypatch.setenv(PROFILE_ID_ENV, str(profile["id"]))
+
+        stop = threading.Event()
+        source = FakeSource()
+        source.on_scenario = lambda request: stop.set()
+
+        code = main(
+            ["--browser-id", "br-7", "--db", str(db)],
+            source_factory=lambda: source,
+            stop_event=stop,
+        )
+
+        assert code == EXIT_OK
+        row = profile_row(db, profile["id"])
+        assert row["status"] == "assigned"
+        assert row["last_used_at"] is not None
 
 
 # --- распределение работы -------------------------------------------------
