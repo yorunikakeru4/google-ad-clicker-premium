@@ -334,3 +334,47 @@ def test_read_parameters_can_be_repeated_on_same_reader(make_config, base_config
     assert reader.paths is not first_paths
     assert reader.paths.query_file == first_paths.query_file
     assert reader.behavior is not None
+
+
+def test_log_settings_default_when_the_keys_are_absent(make_config, base_config):
+    """Старый config.json без ключей хранения логов обязан читаться."""
+
+    assert "log_retention_days" not in base_config["behavior"]
+    assert "log_file_level" not in base_config["behavior"]
+    assert "db_size_limit_mb" not in base_config["behavior"]
+
+    reader = make_config(base_config)
+
+    assert reader.behavior.log_retention_days == 30
+    assert reader.behavior.log_file_level == "INFO"
+    assert reader.behavior.db_size_limit_mb == 0
+
+
+def test_log_settings_are_read_when_present(make_config, base_config):
+    base_config["behavior"]["log_retention_days"] = 7
+    base_config["behavior"]["log_file_level"] = "DEBUG"
+    base_config["behavior"]["db_size_limit_mb"] = 512
+
+    reader = make_config(base_config)
+
+    assert reader.behavior.log_retention_days == 7
+    assert reader.behavior.log_file_level == "DEBUG"
+    assert reader.behavior.db_size_limit_mb == 512
+
+
+def test_log_settings_defaults_match_the_control_plane_schema(make_config, base_config):
+    """Второго места правды для дефолтов быть не должно.
+
+    config_reader читает config.json, control plane валидирует тот же файл по
+    _SCHEMA: разъехались бы дефолты — старый конфиг читал бы «30», а демон
+    после сохранения из UI — «0».
+    """
+
+    from engine.control_plane.config import default_config
+
+    reader = make_config(base_config)
+    schema = default_config()["behavior"]
+
+    assert reader.behavior.log_retention_days == schema["log_retention_days"]
+    assert reader.behavior.log_file_level == schema["log_file_level"]
+    assert reader.behavior.db_size_limit_mb == schema["db_size_limit_mb"]
