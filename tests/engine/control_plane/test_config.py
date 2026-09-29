@@ -14,8 +14,9 @@ from pathlib import Path
 
 import pytest
 
+from engine.captcha_policy import CAPTCHA_POLICIES, DEFAULT_CAPTCHA_POLICY
 from engine.control_plane import config as config_module
-from engine.control_plane.config import Config, ConfigError
+from engine.control_plane.config import Config, ConfigError, validate_settings
 from engine.proxy_auth import DEFAULT_PROXY_TRANSPORT, PROXY_TRANSPORTS
 
 SECRET_MASK = config_module.SECRET_MASK
@@ -541,6 +542,72 @@ class TestProxyTransport:
 
         assert patched.get("webdriver.proxy_transport") == "direct"
         assert cfg.get("webdriver.proxy_transport") == "cdp_auth"
+
+
+class TestCaptchaPolicy:
+    """``behavior.captcha_policy``: enum из ``engine.captcha_policy``.
+
+    Дефолт ``stop`` — план §5, фаза 8: при наличии ключа legacy раньше решал
+    сам, теперь остановка ждёт оператора, а авто-решение включается явно.
+    """
+
+    @pytest.mark.parametrize("value", ["stop", "solve", "both"])
+    def test_accepts_every_known_policy(self, value):
+        cfg = Config.from_dict(_raw(behavior__captcha_policy=value))
+
+        assert cfg.get("behavior.captcha_policy") == value
+
+    def test_default_is_stop(self):
+        assert config_module.default_config()["behavior"]["captcha_policy"] == "stop"
+        assert Config.from_dict(_raw()).get("behavior.captcha_policy") == "stop"
+        assert DEFAULT_CAPTCHA_POLICY == "stop"
+
+    def test_config_without_the_key_keeps_working(self):
+        """Конфиг старой версии: ключа нет, но демон стартует на дефолте."""
+
+        raw = _raw()
+        del raw["behavior"]["captcha_policy"]
+
+        assert Config.from_dict(raw).get("behavior.captcha_policy") == "stop"
+
+    def test_unknown_policy_is_a_readable_problem(self):
+        raw = _raw(behavior__captcha_policy="wait")
+
+        with pytest.raises(ConfigError) as excinfo:
+            Config.from_dict(raw)
+
+        problems = excinfo.value.problems
+        assert [problem["field"] for problem in problems] == ["behavior.captcha_policy"]
+        message = problems[0]["message"]
+        assert "ожидается одно из" in message
+        for value in CAPTCHA_POLICIES:
+            assert value in message
+
+    def test_non_string_policy_reports_the_expected_type(self):
+        with pytest.raises(ConfigError) as excinfo:
+            Config.from_dict(_raw(behavior__captcha_policy=42))
+
+        problems = excinfo.value.problems
+        assert problems[0]["field"] == "behavior.captcha_policy"
+        assert "str" in problems[0]["message"]
+
+    def test_allowed_values_are_exactly_the_captcha_policy_set(self):
+        """Страховка от второго места правды для словаря значений."""
+
+        assert config_module._ENUM_FIELDS["behavior.captcha_policy"] == CAPTCHA_POLICIES
+
+    def test_validate_settings_reports_unknown_policy(self):
+        problems = validate_settings(_raw(behavior__captcha_policy="hold"))
+
+        assert [problem["field"] for problem in problems] == ["behavior.captcha_policy"]
+
+    def test_patch_can_change_the_policy(self):
+        cfg = Config.from_dict(_raw())
+
+        patched = cfg.patch({"behavior": {"captcha_policy": "solve"}})
+
+        assert patched.get("behavior.captcha_policy") == "solve"
+        assert cfg.get("behavior.captcha_policy") == "stop"
 
 
 class TestImportHasNoSideEffects:

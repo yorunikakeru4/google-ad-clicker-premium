@@ -568,6 +568,109 @@ class TestRecordDiagnostic:
             writer.close()
 
 
+class TestRecordCaptchaEvent:
+    """Событие CAPTCHA: немедленная запись, все колонки контракта (план §2)."""
+
+    def test_writes_every_column_without_an_explicit_flush(self, db_path):
+        writer = StoreWriter(db_path, batch_size=100, flush_interval=60.0)
+        try:
+            with sqlite3.connect(db_path) as conn:
+                cursor = conn.execute(
+                    "INSERT INTO proxies (host, port) VALUES ('10.0.0.1', 8080)"
+                )
+                proxy_id = cursor.lastrowid
+                conn.commit()
+
+            writer.record_captcha_event(
+                browser_id="br-1",
+                ts=1700000001.5,
+                proxy_id=proxy_id,
+                page_url="https://www.google.com/search?q=wireless+keyboard",
+                sitekey="6L-sitekey",
+                screenshot_path="/tmp/engine/screenshots/br-1_1700000001.png",
+                solved=True,
+                solver="2captcha",
+                elapsed_ms=4200,
+            )
+
+            rows = _read(db_path, "SELECT * FROM captcha_events")
+        finally:
+            writer.close()
+
+        assert len(rows) == 1, "событие должно попасть в БД сразу, без flush"
+        row = rows[0]
+        assert row["ts"] == 1700000001.5
+        assert row["browser_id"] == "br-1"
+        assert row["proxy_id"] == proxy_id
+        assert row["page_url"] == "https://www.google.com/search?q=wireless+keyboard"
+        assert row["sitekey"] == "6L-sitekey"
+        assert row["screenshot_path"] == "/tmp/engine/screenshots/br-1_1700000001.png"
+        assert row["solved"] == 1
+        assert row["solver"] == "2captcha"
+        assert row["elapsed_ms"] == 4200
+
+    def test_optional_fields_are_null_and_unsolved_is_zero(self, db_path):
+        writer = StoreWriter(db_path, batch_size=100, flush_interval=60.0)
+        try:
+            writer.record_captcha_event(browser_id="br-2", ts=1700000002.0, solved=False)
+
+            rows = _read(db_path, "SELECT * FROM captcha_events")
+        finally:
+            writer.close()
+
+        row = rows[0]
+        assert row["proxy_id"] is None
+        assert row["page_url"] is None
+        assert row["sitekey"] is None
+        assert row["screenshot_path"] is None
+        assert row["solved"] == 0
+        assert row["solver"] is None
+        assert row["elapsed_ms"] is None
+
+    @pytest.mark.parametrize("browser_id", [None, "omitted"])
+    def test_event_without_browser_id_still_writes_a_row(self, db_path, browser_id):
+        """CLI-прогон без --id: событие не теряется, строка уходит с NULL.
+
+        В отличие от снимка диагностики (там browser_id обязателен) событие
+        CAPTCHA ценно само по себе: страница, sitekey и исход решения
+        разбираются и без привязки к воркеру, поэтому аргумент опционален.
+        """
+
+        writer = StoreWriter(db_path, batch_size=100, flush_interval=60.0)
+        try:
+            if browser_id == "omitted":
+                writer.record_captcha_event(ts=1700000003.0, solved=False)
+            else:
+                writer.record_captcha_event(browser_id=browser_id, ts=1700000003.0, solved=False)
+
+            rows = _read(db_path, "SELECT browser_id, solved FROM captcha_events")
+        finally:
+            writer.close()
+
+        assert [(row["browser_id"], row["solved"]) for row in rows] == [(None, 0)]
+
+    def test_closed_writer_counts_loss_and_never_raises(self, db_path):
+        writer = StoreWriter(db_path, batch_size=100, flush_interval=60.0)
+        writer.close()
+
+        writer.record_captcha_event(browser_id="br-1", page_url="https://x.test/", solved=False)
+
+        assert writer.dropped >= 1
+        assert writer.last_error is not None
+
+    def test_broken_connection_counts_loss_and_never_raises(self, db_path):
+        writer = StoreWriter(db_path, batch_size=100, flush_interval=60.0)
+        try:
+            writer._conn.close()
+
+            writer.record_captcha_event(browser_id="br-1", solved=False)
+
+            assert writer.dropped >= 1
+            assert writer.last_error is not None
+        finally:
+            writer.close()
+
+
 class TestConstructor:
     def test_rejects_non_positive_batch_size(self, db_path):
         with pytest.raises(ValueError):

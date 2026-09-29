@@ -84,6 +84,9 @@ class _BrokenStore(StoreWriter):
     def record_diagnostic(self, **kwargs: Any) -> None:
         raise RuntimeError("disk full")
 
+    def record_captcha_event(self, **kwargs: Any) -> None:
+        raise RuntimeError("disk full")
+
 
 class TestRowShape:
     def test_info_writes_exact_row(self, writer, db_path):
@@ -480,4 +483,93 @@ class TestRecordDiagnostic:
         writer.flush()
 
         assert [r["ip"] for r in _diagnostics(db_path)] == ["203.0.113.7"]
+        assert [r for r in caplog.records if r.name == legacy.__name__] == []
+
+
+def _captcha_events(db_path):
+    with sqlite3.connect(db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        return conn.execute(
+            "SELECT browser_id, page_url, sitekey, screenshot_path, solved, solver, "
+            "elapsed_ms FROM captcha_events ORDER BY id"
+        ).fetchall()
+
+
+class TestRecordCaptchaEvent:
+    """Событие CAPTCHA через логгер: биндинг и политика ошибок.
+
+    Путь воркера такой же, что у снимка диагностики: общий логгер процесса
+    уже привязан к воркеру, поэтому событие не требует отдельного соединения.
+    """
+
+    def test_uses_bound_browser_id_and_writes_a_row(self, writer, db_path):
+        logger = StructuredLogger(writer, browser_id="br-1")
+
+        logger.record_captcha_event(
+            page_url="https://www.google.com/search?q=x",
+            sitekey="6L-sitekey",
+            screenshot_path="/shots/br-1_1.png",
+            solved=True,
+            solver="2captcha",
+            elapsed_ms=1500,
+        )
+
+        rows = _captcha_events(db_path)
+        assert [(r["browser_id"], r["sitekey"], r["solved"]) for r in rows] == [
+            ("br-1", "6L-sitekey", 1)
+        ]
+        assert rows[0]["solver"] == "2captcha"
+        assert rows[0]["elapsed_ms"] == 1500
+
+    def test_explicit_browser_id_overrides_bound_one(self, writer, db_path):
+        logger = StructuredLogger(writer, browser_id="br-1")
+
+        logger.record_captcha_event(browser_id="br-2", solved=False)
+
+        assert [r["browser_id"] for r in _captcha_events(db_path)] == ["br-2"]
+
+    def test_without_browser_id_writes_a_null_row_and_does_not_raise(self, writer, db_path):
+        """CLI-прогон без --id: событие пишется с NULL, а не теряется."""
+
+        logger = StructuredLogger(writer)
+
+        logger.record_captcha_event(page_url="https://x.test/", solved=False)
+
+        rows = _captcha_events(db_path)
+        assert [(r["browser_id"], r["page_url"]) for r in rows] == [
+            (None, "https://x.test/")
+        ]
+        assert logger.dropped == 0
+        assert logger.last_error is None
+
+    def test_broken_store_counts_loss_and_never_raises(self):
+        logger = StructuredLogger(_BrokenStore(), browser_id="br-1")
+
+        logger.record_captcha_event(solved=False)
+
+        assert logger.dropped == 1
+        assert logger.last_error is not None
+
+    def test_unavailable_store_explains_itself_in_last_error(self):
+        from engine.log import _UnavailableStore
+
+        logger = StructuredLogger(_UnavailableStore("хранилище недоступно"), browser_id="br-1")
+
+        logger.record_captcha_event(solved=False)
+
+        assert logger.dropped == 1
+        assert logger.last_error is not None
+        assert "хранилище недоступно" in logger.last_error
+
+    def test_event_row_does_not_mirror_into_legacy_log(self, writer, db_path, caplog):
+        """Событие живёт в ``captcha_events``, а не дублируется в файловый лог."""
+
+        legacy = __import__("logger")
+        logger = StructuredLogger(writer, browser_id="br-1", mirror=legacy_mirror)
+
+        with caplog.at_level(logging.DEBUG, logger=legacy.__name__):
+            logger.record_captcha_event(solved=False)
+        writer.flush()
+
+        assert len(_captcha_events(db_path)) == 1
         assert [r for r in caplog.records if r.name == legacy.__name__] == []

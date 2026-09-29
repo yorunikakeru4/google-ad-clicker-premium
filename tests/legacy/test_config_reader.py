@@ -97,6 +97,7 @@ def test_read_parameters_maps_every_behavior_option(make_config, base_config):
         "telegram_enabled": True,
         "send_to_android": True,
         "request_boost": True,
+        "captcha_policy": "solve",
     }
 
     behavior = make_config(base_config).behavior
@@ -122,6 +123,29 @@ def test_read_parameters_maps_every_behavior_option(make_config, base_config):
     assert behavior.telegram_enabled is True
     assert behavior.send_to_android is True
     assert behavior.request_boost is True
+    assert behavior.captcha_policy == "solve"
+
+
+def test_captcha_policy_defaults_to_stop_when_the_key_is_absent(make_config, base_config):
+    """Старый config.json без ключа обязан читаться, дефолт — stop.
+
+    Дефолт по плану (§5, фаза 8): остановка ждёт оператора, авто-решение
+    включается только явным ``solve``/``both``.
+    """
+
+    assert "captcha_policy" not in base_config["behavior"]
+
+    assert make_config(base_config).behavior.captcha_policy == "stop"
+
+
+def test_captcha_policy_default_is_the_constant_from_captcha_policy(
+    make_config, base_config
+):
+    """Дефолт legacy-чтения не должен разъезжаться с engine.captcha_policy."""
+
+    from engine.captcha_policy import DEFAULT_CAPTCHA_POLICY
+
+    assert make_config(base_config).behavior.captcha_policy == DEFAULT_CAPTCHA_POLICY
 
 
 def test_twocaptcha_key_is_read_from_numeric_prefixed_json_key(make_config, base_config):

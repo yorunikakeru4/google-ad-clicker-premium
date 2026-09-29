@@ -28,6 +28,7 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
+from engine.captcha_policy import CAPTCHA_POLICIES, DEFAULT_CAPTCHA_POLICY
 from engine.proxy_transport import DEFAULT_PROXY_TRANSPORT, PROXY_TRANSPORTS
 
 # Значение, которым секрет заменяется в любом JSON наружу.
@@ -81,18 +82,26 @@ _SCHEMA: dict[str, dict[str, tuple[type | tuple[type, ...], Any]]] = {
         "telegram_enabled": (bool, False),
         "send_to_android": (bool, False),
         "request_boost": (bool, False),
+        # Что делать при обнаружении CAPTCHA (план §5, фаза 8):
+        # stop (дефолт — ждать оператора) | solve | both. Значения и дефолт
+        # приходят из engine.captcha_policy, где их же читает сама политика.
+        "captcha_policy": (str, DEFAULT_CAPTCHA_POLICY),
     },
 }
 
 # Секреты: наружу уходят замаскированными, в patch маска значит «не менять».
 _SECRET_FIELDS = frozenset({"behavior.2captcha_apikey", "webdriver.proxy"})
 
-# Поля-перечисления: путь поля -> допустимые значения. Словаря значений здесь
-# нет намеренно: он живёт в engine.proxy_transport, а нормализует его
-# resolve_proxy_transport из engine.proxy_auth, и второе место правды для него
-# недопустимо. Проверка выполняется только после проверки типа, поэтому к
-# этому месту доходит строка.
-_ENUM_FIELDS: dict[str, frozenset[str]] = {"webdriver.proxy_transport": PROXY_TRANSPORTS}
+# Поля-перечисления: путь поля -> допустимые значения. Своих словарей значений
+# здесь нет намеренно: каждый живёт рядом со своим потребителем
+# (engine.proxy_transport для транспорта, engine.captcha_policy для политики
+# CAPTCHA), а транспорт дополнительно нормализует resolve_proxy_transport из
+# engine.proxy_auth — второе место правды недопустимо. Проверка выполняется
+# только после проверки типа, поэтому к этому месту доходит строка.
+_ENUM_FIELDS: dict[str, frozenset[str]] = {
+    "webdriver.proxy_transport": PROXY_TRANSPORTS,
+    "behavior.captcha_policy": CAPTCHA_POLICIES,
+}
 
 # browser_count: legacy трактует 0 как "столько, сколько ядер". Демон держит
 # ту же договорённость, иначе конфиг из старой установки молча сменит смысл.

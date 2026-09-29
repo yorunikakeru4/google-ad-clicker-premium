@@ -432,6 +432,31 @@ class StateStore:
             ).fetchone()
         return int(row["id"]) if row is not None else None
 
+    def active_run_id(self, browser_id: str) -> int | None:
+        """Id незавершённого запуска воркера с таким ``browser_id``.
+
+        Нужен счётчикам, которые пишет сам воркер (``captcha_seen``): в
+        процессе известен только ``browser_id``, а строка ``runs`` адресуется
+        ``worker_id``. В отличие от :meth:`latest_run_id` завершённые запуски
+        не возвращаются — счётчик попал бы в чужой, уже закрытый прогон.
+
+        Если недоконченных строк несколько (краш до закрытия супервизором),
+        берётся самая свежая — как и в ``latest_run_id``. None означает, что
+        писать некуда: воркер запущен не супервизором (CLI) или запись
+        запуска не удалась.
+        """
+        with self._connect() as conn:
+            row = conn.execute(
+                """
+                SELECT r.id FROM runs r
+                JOIN workers w ON w.id = r.worker_id
+                WHERE w.browser_id = ? AND r.ended_at IS NULL
+                ORDER BY r.id DESC LIMIT 1
+                """,
+                (browser_id,),
+            ).fetchone()
+        return int(row["id"]) if row is not None else None
+
     # --- логи ------------------------------------------------------------
 
     def log(
