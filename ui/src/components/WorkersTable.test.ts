@@ -26,8 +26,11 @@ async function render(
 function textOf(html: string, test: string, closeTag = "</td>"): string {
   const at = html.indexOf(`data-test="${test}"`);
   if (at === -1) return "";
-  const end = html.indexOf(closeTag, at);
-  const chunk = end === -1 ? html.slice(at) : html.slice(at, end + closeTag.length);
+  const open = html.indexOf(">", at);
+  if (open === -1) return "";
+  const start = open + 1;
+  const end = html.indexOf(closeTag, start);
+  const chunk = end === -1 ? html.slice(start) : html.slice(start, end);
   return chunk
     .replace(/<[^>]*>/g, " ")
     .replace(/\s+/g, " ")
