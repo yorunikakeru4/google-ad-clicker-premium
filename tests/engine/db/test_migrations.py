@@ -565,14 +565,15 @@ def _logs_columns(db_path) -> dict[str, dict]:
 
 @pytest.fixture
 def fixed_timezone():
-    """Перевести процесс на фиксированную зону и корректно вернуть обратно.
+    """Перевести процесс на UTC-12 и корректно вернуть обратно.
 
     Нужен, чтобы различать локальную дату и UTC: бэкалф обязан считать по
-    localtime, а не по UTC. tzset() зовётся и при входе, и при выходе — libc
+    localtime, а не по UTC. Зона Etc/GMT+12 — это UTC-12: знак в имени
+    зон tzatabase инвертирован к POSIX. tzset() зовётся и при входе, и при выходе — libc
     кэширует зону, и без сброса последующие тесты увидели бы чужую.
     """
     original = os.environ.get("TZ")
-    os.environ["TZ"] = "Etc/GMT-12"
+    os.environ["TZ"] = "Etc/GMT+12"
     time.tzset()
     yield
     if original is None:
@@ -634,10 +635,10 @@ class TestLogsDayMigration:
         assert _log_days(db_path) == ["2024-03-31", "2024-04-01"]
 
     def test_incremental_backfill_uses_local_date_not_utc(self, db_path, fixed_timezone):
-        """С зоной UTC-12 запись в 00:30 UTC уходит в предыдущий локальный день."""
+        """С зоной UTC-12 (Etc/GMT+12) запись в 00:30 UTC уходит в предыдущий день."""
         instant = datetime(2024, 7, 1, 0, 30, tzinfo=timezone.utc).timestamp()
-        if time.strftime("%Y-%m-%dT%H", instant) != "2024-06-30T12":
-            pytest.skip("зона Etc/GMT-12 недоступна в этом окружении")
+        if time.strftime("%Y-%m-%dT%H", time.localtime(instant)) != "2024-06-30T12":
+            pytest.skip("зона Etc/GMT+12 недоступна в этом окружении")
         _make_v2_database(db_path)
         _insert_logs(db_path, [instant])
 
