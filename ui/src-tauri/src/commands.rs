@@ -9,7 +9,9 @@ use std::sync::{Mutex, MutexGuard};
 
 use tauri::State;
 
-use crate::db::{DbError, DbReader, LogEntry, LogFilters, LogPageEntry, ProfileRow, ProxyRow};
+use crate::db::{
+    DbError, DbReader, DiagnosticRow, LogEntry, LogFilters, LogPageEntry, ProfileRow, ProxyRow,
+};
 use crate::metrics::{ActiveWorker, HourlyClicks, RequestsLastHour, RunsSummary};
 
 /// Имя переменной окружения с путём к БД — зеркало `DB_ENV_VAR` из
@@ -264,6 +266,16 @@ pub fn list_proxies(state: State<'_, DbState>) -> Result<Vec<ProxyRow>, DbError>
 #[tauri::command]
 pub fn list_profiles(state: State<'_, DbState>) -> Result<Vec<ProfileRow>, DbError> {
     with_reader(&state.0, |reader| reader.list_profiles())
+}
+
+/// Последний снимок диагностики на каждый воркер — экран Diagnostics.
+///
+/// Команда только читает: сбор снимка идёт через control API демона
+/// (`POST /control/diagnostics/collect`), а в БД строка появляется
+/// асинхронно — экран поллит этот список и показывает свежее.
+#[tauri::command]
+pub fn list_diagnostics(state: State<'_, DbState>) -> Result<Vec<DiagnosticRow>, DbError> {
+    with_reader(&state.0, |reader| reader.list_diagnostics())
 }
 
 #[cfg(test)]

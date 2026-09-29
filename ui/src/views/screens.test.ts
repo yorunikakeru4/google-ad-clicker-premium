@@ -16,6 +16,7 @@ import FilterBar from "../components/data/FilterBar.vue";
 import MetricCard from "../components/data/MetricCard.vue";
 import SettingField from "../components/forms/SettingField.vue";
 import DashboardView from "./DashboardView.vue";
+import DiagnosticsView from "./DiagnosticsView.vue";
 import LogsView from "./LogsView.vue";
 import ProfilesView from "./ProfilesView.vue";
 import ProxiesView from "./ProxiesView.vue";
@@ -243,6 +244,21 @@ describe("экраны на шаблоне", () => {
     expect(html).not.toContain("profiles-unassign-dialog");
     // без данных таблица не показывает статусы и прочерки строк
     expect(html).not.toContain("profiles-status-free");
+  });
+
+  it("Diagnostics: тулбар со сбором, пустое состояние без снимков", async () => {
+    const html = await render(DiagnosticsView);
+
+    expect(html).toContain("Diagnostics");
+    for (const hook of ["diagnostics-collect-all", "diagnostics-empty"]) {
+      expect(html).toContain(`data-test="${hook}"`);
+    }
+
+    // снимков нет: ни карточек, ни ошибок, ни итогов сбора
+    expect(html).not.toContain("diagnostics-card-");
+    expect(html).not.toContain("diagnostics-read-error");
+    expect(html).not.toContain("diagnostics-action-error");
+    expect(html).not.toContain("diagnostics-collect-result");
   });
 
   it("Settings: тулбар, три секции и поля из схемы без ошибок", async () => {

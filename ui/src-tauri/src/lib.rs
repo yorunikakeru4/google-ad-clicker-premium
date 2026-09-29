@@ -7,8 +7,9 @@ pub mod metrics;
 use tauri::Manager;
 
 use commands::{
-    active_workers, captcha_share, clicks_per_hour, count_logs, db_open, list_logs, list_logs_page,
-    list_profiles, list_proxies, requests_last_hour, runs_summary, DbState,
+    active_workers, captcha_share, clicks_per_hour, count_logs, db_open, list_diagnostics,
+    list_logs, list_logs_page, list_profiles, list_proxies, requests_last_hour, runs_summary,
+    DbState,
 };
 use daemon::{DaemonSpec, DaemonStatus, DaemonSupervisor, SupervisorOptions};
 
@@ -56,6 +57,7 @@ pub fn run() {
             active_workers,
             list_proxies,
             list_profiles,
+            list_diagnostics,
             daemon_status,
         ])
         .build(tauri::generate_context!())

@@ -6,6 +6,7 @@
 // {kind, message}, dbErrorMessage превращает его в текст для UI.
 
 import { invoke } from "@tauri-apps/api/core";
+import type { DiagnosticSnapshot } from "./diagnostics";
 import type { LogQueryFilters } from "./logFilters";
 import type { LogCursor, LogRow } from "./logMerge";
 
@@ -67,6 +68,8 @@ export interface DbApi {
   requestsLastHour(now: number): Promise<RequestsLastHour>;
   captchaShare(since: number): Promise<number | null>;
   activeWorkers(now: number, thresholdSecs: number): Promise<ActiveWorker[]>;
+  /** Последний снимок диагностики на каждый воркер — экран Diagnostics. */
+  listDiagnostics(): Promise<DiagnosticSnapshot[]>;
 }
 
 /** Поле из `message`-объекта сериализованного DbError. */
@@ -150,6 +153,9 @@ export function createDbApi(call: DbInvoke = invoke): DbApi {
 
     activeWorkers: (now, thresholdSecs) =>
       call("active_workers", { now, thresholdSecs }) as Promise<ActiveWorker[]>,
+
+    listDiagnostics: () =>
+      call("list_diagnostics", {}) as Promise<DiagnosticSnapshot[]>,
   };
 }
 

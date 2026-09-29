@@ -84,6 +84,68 @@ export function proxiesRequest(action: ProxiesAction): ProxiesRequest {
   }
 }
 
+/** Действия API диагностики (контракт /control/diagnostics/collect). */
+export type DiagnosticsAction =
+  | { kind: "collect"; browserId: string }
+  | { kind: "collectAll" };
+
+export interface DiagnosticsRequest {
+  method: "POST";
+  path: string;
+  body: string;
+}
+
+/**
+ * Билдер запросов сбора диагностики.
+ *
+ * Тот же принцип, что у [`proxiesRequest`]: контракт (`{"browser_id": ...}`
+ * либо `{"all": true}`) живёт здесь, а не в вызывающем коде, — тесты видят
+ * ровно то, что уйдёт в control_request.
+ */
+export function diagnosticsRequest(action: DiagnosticsAction): DiagnosticsRequest {
+  switch (action.kind) {
+    case "collect":
+      return {
+        method: "POST",
+        path: "/control/diagnostics/collect",
+        body: JSON.stringify({ browser_id: action.browserId }),
+      };
+    case "collectAll":
+      return {
+        method: "POST",
+        path: "/control/diagnostics/collect",
+        body: JSON.stringify({ all: true }),
+      };
+  }
+}
+
+/**
+ * Разбор ответа демона вида `{"error": {"code", "message"}}`.
+ *
+ * Стороны ошибки независимы: `code` может прийти без `message` (тогда вызывающий
+ * код подставляет свой текст по коду), `message` — без `code`. Не-JSON тело и
+ * любой иной формат — `null`: вызывающий падает на [`apiErrorMessage`].
+ */
+export function errorPayload(
+  body: string,
+): { code: string | null; message: string | null } | null {
+  try {
+    const parsed: unknown = JSON.parse(body);
+    if (typeof parsed !== "object" || parsed === null) return null;
+    const error = (parsed as { error?: unknown }).error;
+    if (typeof error !== "object" || error === null) return null;
+    const code = (error as { code?: unknown }).code;
+    const message = (error as { message?: unknown }).message;
+    return {
+      code: typeof code === "string" ? code : null,
+      message:
+        typeof message === "string" && message.trim() !== "" ? message : null,
+    };
+  } catch {
+    return null;
+  }
+}
+
 /** Новый профиль для POST /control/profiles: только name обязателен. */
 export interface NewProfile {
   name: string;
