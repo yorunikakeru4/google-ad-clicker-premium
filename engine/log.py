@@ -11,7 +11,9 @@
 полей, запись в store), а не misuse API. После того как аргументы прошли
 проверку словаря, ничто внутри — ни ядовитые значения в fields, ни упавший
 store, ни сломанное зеркало — наружу не выходит: счётчик ``dropped`` +
-``last_error`` + fallback.
+``last_error`` + fallback. То же правило действует на
+:meth:`StructuredLogger.record_network_request`: запись метрики в
+``network_requests`` из CDP-потока не может уронить воркер.
 
 Dual-write
 ----------
@@ -212,6 +214,9 @@ class _UnavailableStore:
     def log(self, **kwargs: Any) -> None:
         raise RuntimeError(self._error)
 
+    def record_network_request(self, **kwargs: Any) -> None:
+        raise RuntimeError(self._error)
+
     def flush(self) -> None:
         raise RuntimeError(self._error)
 
@@ -268,6 +273,40 @@ class StructuredLogger:
             self._store.flush()
         except Exception as exc:
             with self._lock:
+                self._last_error = str(exc)
+
+    def record_network_request(
+        self,
+        method: str,
+        url: str,
+        resource_type: str | None = None,
+        status: int | None = None,
+        browser_id: str | None = None,
+        ts: float | None = None,
+    ) -> None:
+        """Записать строку ``network_requests`` в store процесса.
+
+        Метрика, а не логовое событие: ``browser_id`` берётся из биндинга
+        логгера (``browser_id=`` в вызове перебивает), в legacy-зеркало не
+        дублируется — полный URL с query в файловый лог не попадает. Ошибки
+        гасятся так же, как у :meth:`log`: счётчик ``dropped`` +
+        ``last_error``, исключение наружу не выходит.
+        """
+
+        with self._lock:
+            target = self._browser_id if browser_id is None else browser_id
+        try:
+            self._store.record_network_request(
+                method=method,
+                url=url,
+                resource_type=resource_type,
+                status=status,
+                browser_id=target,
+                ts=ts,
+            )
+        except Exception as exc:
+            with self._lock:
+                self._dropped += 1
                 self._last_error = str(exc)
 
     def log(

@@ -2,7 +2,8 @@
 
 Контракт, который здесь зафиксирован:
 
-- логи и клики буферизуются и уходят в БД батчами: по размеру или по таймеру;
+- логи, клики и сетевые запросы буферизуются и уходят в БД батчами: по размеру
+  или по таймеру (разделяют один общий размер батча);
 - конкурентная запись из потоков ничего не теряет, порядок внутри воркера kept;
 - close() сбрасывает остаток и безопасен повторно;
 - ошибка записи не роняет вызывающего: счётчик потерь + последняя ошибка,
@@ -346,3 +347,183 @@ class TestConstructor:
     def test_rejects_non_positive_flush_interval(self, db_path):
         with pytest.raises(ValueError):
             StoreWriter(db_path, batch_size=10, flush_interval=0)
+
+
+class TestNetworkRequests:
+    """Записи network_requests: тот же буфер/батч/таймер и та же политика ошибок."""
+
+    def test_record_round_trip(self, db_path):
+        writer = StoreWriter(db_path, batch_size=100, flush_interval=60.0)
+        try:
+            writer.record_network_request(
+                method="GET",
+                url="https://site.test/a?x=1",
+                resource_type="Document",
+                status=200,
+                browser_id="br-1",
+                ts=1700000010.0,
+            )
+            writer.flush()
+
+            rows = _read(
+                db_path,
+                "SELECT ts, browser_id, method, url, resource_type, status FROM network_requests",
+            )
+            assert [
+                (r["ts"], r["browser_id"], r["method"], r["url"], r["resource_type"], r["status"])
+                for r in rows
+            ] == [(1700000010.0, "br-1", "GET", "https://site.test/a?x=1", "Document", 200)]
+        finally:
+            writer.close()
+
+    def test_optional_fields_and_default_ts(self, db_path):
+        writer = StoreWriter(db_path, batch_size=100, flush_interval=60.0)
+        try:
+            writer.record_network_request(method="GET", url="https://site.test/bare")
+            writer.flush()
+
+            rows = _read(db_path, "SELECT ts, browser_id, resource_type, status FROM network_requests")
+            assert len(rows) == 1
+            assert rows[0]["ts"] > 0
+            assert rows[0]["browser_id"] is None
+            assert rows[0]["resource_type"] is None
+            assert rows[0]["status"] is None
+        finally:
+            writer.close()
+
+    def test_records_share_the_batch_with_logs_and_clicks(self, db_path):
+        writer = StoreWriter(db_path, batch_size=3, flush_interval=60.0)
+        try:
+            writer.log(level="INFO", category="click", message="m1", browser_id="br-1")
+            writer.record_click(url="https://site.test/c", browser_id="br-1")
+            writer.record_network_request(
+                method="GET", url="https://site.test/n", browser_id="br-1"
+            )
+
+            # Явного flush нет: третья запись добила общий батч.
+            assert _read(db_path, "SELECT COUNT(*) AS n FROM logs")[0]["n"] == 1
+            assert _read(db_path, "SELECT COUNT(*) AS n FROM clicks")[0]["n"] == 1
+            assert _read(db_path, "SELECT COUNT(*) AS n FROM network_requests")[0]["n"] == 1
+        finally:
+            writer.close()
+
+    def test_timer_flush_includes_network_buffer(self, db_path):
+        writer = StoreWriter(db_path, batch_size=1000, flush_interval=0.05)
+        try:
+            writer.record_network_request(
+                method="GET", url="https://site.test/tick", browser_id="br-1"
+            )
+
+            assert _wait_for(lambda: len(_read(db_path, "SELECT * FROM network_requests")) == 1), (
+                "таймер не сбросил буфер network_requests"
+            )
+        finally:
+            writer.close()
+
+    def test_close_flushes_network_remainder(self, db_path):
+        writer = StoreWriter(db_path, batch_size=100, flush_interval=60.0)
+        writer.record_network_request(
+            method="GET", url="https://site.test/last", browser_id="br-1"
+        )
+
+        writer.close()
+
+        assert _read(db_path, "SELECT COUNT(*) AS n FROM network_requests")[0]["n"] == 1
+
+    def test_write_after_close_counts_dropped_and_never_raises(self, db_path):
+        writer = StoreWriter(db_path, batch_size=100, flush_interval=60.0)
+        writer.close()
+
+        writer.record_network_request(method="GET", url="https://site.test/late")
+
+        assert writer.dropped == 1
+        assert writer.last_error is not None
+        assert _read(db_path, "SELECT COUNT(*) AS n FROM network_requests")[0]["n"] == 0
+
+    def test_write_error_does_not_raise_and_counts_losses(self, db_path):
+        writer = StoreWriter(db_path, batch_size=100, flush_interval=60.0)
+        try:
+            # Ломаем соединение из-под writer'а: имитация закрытой/битой БД.
+            writer._conn.close()
+
+            writer.record_network_request(method="GET", url="https://site.test/x")
+            writer.flush()
+
+            assert writer.dropped == 1
+            assert writer.last_error is not None
+        finally:
+            writer.close()
+
+
+class TestCountNetworkRequests:
+    """Скользящее окно: границы включительно, фильтр по browser_id, ноль в пустом окне."""
+
+    @pytest.fixture
+    def populated(self, db_path):
+        writer = StoreWriter(db_path, batch_size=100, flush_interval=60.0)
+        rows = [
+            ("GET", "https://a.test/1", "Document", 200, "br-1", 100.0),
+            ("POST", "https://a.test/2", "XHR", 500, "br-1", 105.0),
+            ("GET", "https://a.test/3", "Image", 304, "br-2", 110.0),
+        ]
+        for method, url, resource_type, status, browser_id, ts in rows:
+            writer.record_network_request(
+                method=method,
+                url=url,
+                resource_type=resource_type,
+                status=status,
+                browser_id=browser_id,
+                ts=ts,
+            )
+        writer.flush()
+        yield writer
+        writer.close()
+
+    def test_window_bounds_are_inclusive(self, populated):
+        assert populated.count_network_requests(100.0, until=110.0) == 3
+        assert populated.count_network_requests(100.0, until=109.9) == 2
+        assert populated.count_network_requests(105.0, until=110.0) == 2
+        assert populated.count_network_requests(101.0, until=109.0) == 1
+
+    def test_filters_by_browser_id(self, populated):
+        assert populated.count_network_requests(100.0, until=110.0, browser_id="br-1") == 2
+        assert populated.count_network_requests(100.0, until=110.0, browser_id="br-2") == 1
+        assert populated.count_network_requests(100.0, until=110.0, browser_id="br-9") == 0
+
+    def test_empty_window_is_zero(self, populated):
+        assert populated.count_network_requests(1000.0) == 0
+        assert populated.count_network_requests(0.0, until=99.0) == 0
+
+    def test_open_ended_window_counts_everything_from_since(self, populated):
+        assert populated.count_network_requests(105.0) == 2
+        assert populated.count_network_requests(0.0) == 3
+
+    def test_count_sees_buffered_rows_without_explicit_flush(self, db_path):
+        writer = StoreWriter(db_path, batch_size=100, flush_interval=60.0)
+        try:
+            writer.record_network_request(
+                method="GET", url="https://a.test/buffered", browser_id="br-1", ts=50.0
+            )
+
+            assert writer.count_network_requests(0.0) == 1
+        finally:
+            writer.close()
+
+    def test_count_on_closed_writer_returns_zero_and_never_raises(self, db_path):
+        writer = StoreWriter(db_path, batch_size=100, flush_interval=60.0)
+        writer.close()
+
+        assert writer.count_network_requests(0.0) == 0
+        assert writer.last_error is not None
+
+    def test_count_on_broken_connection_returns_zero_and_never_raises(self, db_path):
+        writer = StoreWriter(db_path, batch_size=100, flush_interval=60.0)
+        try:
+            writer.record_network_request(method="GET", url="https://a.test/x", ts=10.0)
+            writer.flush()
+            writer._conn.close()
+
+            assert writer.count_network_requests(0.0) == 0
+            assert writer.last_error is not None
+        finally:
+            writer.close()

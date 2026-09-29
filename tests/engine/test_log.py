@@ -5,6 +5,8 @@
 - категории и уровни — закрытый словарь, неизвестная категория/уровень —
   ошибка программирования (ValueError);
 - fields уходят в БД JSON-строкой, несериализуемое превращается в repr;
+- запись метрики ``network_requests`` идёт через тот же store и биндинг
+  ``browser_id``, ошибки гасятся так же, а в зеркало не дублируется;
 - путь логгирования никогда не бросает исключений: сломанный store под
   логгером — счётчик + последняя ошибка, воркер продолжает работать.
 """
@@ -12,13 +14,14 @@
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 from typing import Any
 
 import pytest
 
 from engine.db import migrations
-from engine.log import CATEGORIES, LEVELS, StructuredLogger
+from engine.log import CATEGORIES, LEVELS, StructuredLogger, legacy_mirror
 from engine.store import StoreWriter
 
 
@@ -42,6 +45,14 @@ def _logs(db_path):
         return conn.execute("SELECT ts, level, browser_id, category, message, fields FROM logs").fetchall()
 
 
+def _network(db_path):
+    with sqlite3.connect(db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        return conn.execute(
+            "SELECT ts, browser_id, method, url, resource_type, status FROM network_requests"
+        ).fetchall()
+
+
 class _BrokenStore(StoreWriter):
     """Store, у которого путь записи всегда падает."""
 
@@ -55,6 +66,17 @@ class _BrokenStore(StoreWriter):
         message: str = "",
         browser_id: str | None = None,
         fields: str | dict[str, Any] | None = None,
+        ts: float | None = None,
+    ) -> None:
+        raise RuntimeError("disk full")
+
+    def record_network_request(
+        self,
+        method: str,
+        url: str,
+        resource_type: str | None = None,
+        status: int | None = None,
+        browser_id: str | None = None,
         ts: float | None = None,
     ) -> None:
         raise RuntimeError("disk full")
@@ -234,3 +256,69 @@ class TestNeverRaises:
 
         assert logger.dropped == 0
         assert len(_logs(db_path)) == 1
+
+
+class TestNetworkRecords:
+    """Запись метрики через логгер: browser_id берётся из биндинга, ошибки гасятся."""
+
+    def test_record_network_request_uses_bound_browser_id(self, writer, db_path):
+        logger = StructuredLogger(writer, browser_id="br-1")
+
+        logger.record_network_request(
+            method="GET",
+            url="https://site.test/a",
+            resource_type="Document",
+            status=200,
+            ts=1700000020.0,
+        )
+        writer.flush()
+
+        rows = _network(db_path)
+        assert [
+            (r["browser_id"], r["method"], r["url"], r["resource_type"], r["status"], r["ts"])
+            for r in rows
+        ] == [("br-1", "GET", "https://site.test/a", "Document", 200, 1700000020.0)]
+
+    def test_explicit_browser_id_overrides_bound_one(self, writer, db_path):
+        logger = StructuredLogger(writer, browser_id="br-1")
+
+        logger.record_network_request(
+            method="GET", url="https://site.test/a", browser_id="br-2"
+        )
+        writer.flush()
+
+        assert [r["browser_id"] for r in _network(db_path)] == ["br-2"]
+
+    def test_broken_store_counts_loss_and_never_raises(self):
+        logger = StructuredLogger(_BrokenStore(), browser_id="br-1")
+
+        logger.record_network_request(method="GET", url="https://site.test/a")
+
+        assert logger.dropped == 1
+        assert logger.last_error is not None
+        assert "disk full" in logger.last_error
+
+    def test_worker_keeps_recording_after_store_failure(self):
+        logger = StructuredLogger(_BrokenStore(), browser_id="br-1")
+
+        logger.record_network_request(method="GET", url="https://site.test/a")
+        logger.record_network_request(method="POST", url="https://site.test/b")
+
+        assert logger.dropped == 2
+
+    def test_metric_row_does_not_mirror_into_legacy_log(self, writer, db_path, caplog):
+        """Метрика живёт в таблице, а не в логах: полный URL в логи не уходит."""
+
+        legacy = __import__("logger")
+        logger = StructuredLogger(writer, browser_id="br-1", mirror=legacy_mirror)
+
+        with caplog.at_level(logging.DEBUG, logger=legacy.__name__):
+            logger.record_network_request(
+                method="GET", url="https://site.test/p?token=SECRET123"
+            )
+        writer.flush()
+
+        rows = _network(db_path)
+        assert [r["url"] for r in rows] == ["https://site.test/p?token=SECRET123"]
+        assert [r for r in caplog.records if r.name == legacy.__name__] == []
+        assert "SECRET123" not in caplog.text

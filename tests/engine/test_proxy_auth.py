@@ -3,18 +3,25 @@
 Chrome не запускается: все события CDP подаются через FakeWs из test_cdp,
 либо напрямую в ProxyAuthManager.handle_event. Каждый тест задаёт конкретный
 вход и конкретное ожидаемое тело исходящего CDP-сообщения.
+
+Помимо авторизации, менеджер включает метрику запросов: ``Network.enable``
+на старте и на каждой новой сессии таргета, пары событий Network.* →
+записи в ``network_requests`` через общий логгер процесса.
 """
 
 from __future__ import annotations
 
 import json
 import logging
+import os
+import sqlite3
 import threading
 import time
 
 import pytest
 
 from engine.cdp import CdpClient
+from engine.log import get_logger
 from engine.proxy_auth import (
     DEFAULT_PROXY_TRANSPORT,
     PROXY_TRANSPORT_CDP_AUTH,
@@ -33,6 +40,9 @@ from tests.engine.test_cdp import FakeWs, _make_client, _wait_until
 USERNAME = "spyuser9"
 PASSWORD = "Sup3rS3cret!"
 
+# Сколько команд уходит на старте: auto-attach + Fetch.enable + Network.enable.
+START_COMMANDS = 3
+
 
 def _auth_event(request_id: str, source: str = "Proxy", scheme: str = "Basic") -> dict:
     return {
@@ -44,12 +54,56 @@ def _auth_event(request_id: str, source: str = "Proxy", scheme: str = "Basic") -
     }
 
 
+def _network_request(
+    request_id: str,
+    url: str = "https://site.test/page",
+    method: str = "GET",
+    resource_type: str = "Document",
+    session: str | None = None,
+) -> dict:
+    message: dict = {
+        "method": "Network.requestWillBeSent",
+        "params": {
+            "requestId": request_id,
+            "request": {"method": method, "url": url},
+            "type": resource_type,
+        },
+    }
+    if session is not None:
+        message["sessionId"] = session
+    return message
+
+
+def _network_response(
+    request_id: str, status: int = 200, session: str | None = None
+) -> dict:
+    message: dict = {
+        "method": "Network.responseReceived",
+        "params": {"requestId": request_id, "response": {"status": status}},
+    }
+    if session is not None:
+        message["sessionId"] = session
+    return message
+
+
+def _network_rows(browser_id: str) -> list[sqlite3.Row]:
+    """Строки network_requests в БД процесса (ADCLICKER_DB из conftest)."""
+
+    with sqlite3.connect(os.environ["ADCLICKER_DB"]) as conn:
+        conn.row_factory = sqlite3.Row
+        return conn.execute(
+            "SELECT ts, browser_id, method, url, resource_type, status "
+            "FROM network_requests WHERE browser_id = ? ORDER BY id",
+            (browser_id,),
+        ).fetchall()
+
+
 def _started_manager(ws: FakeWs, **kwargs) -> ProxyAuthManager:
     client = _make_client(ws)
     client.start(timeout=2.0)
     manager = ProxyAuthManager(client, USERNAME, PASSWORD, **kwargs)
     manager.start()
-    assert _wait_until(lambda: len(ws.sent_json()) == 2), ws.sent_json()
+    assert _wait_until(lambda: len(ws.sent_json()) == START_COMMANDS), ws.sent_json()
     ws.sent.clear()
     return manager
 
@@ -99,20 +153,24 @@ def test_resolve_proxy_transport() -> None:
         resolve_proxy_transport("socks")
 
 
-# --- старт: auto-attach + Fetch.enable без patterns ---
+# --- старт: auto-attach + Fetch.enable без patterns + Network.enable ---
 
 
-def test_start_sends_auto_attach_and_enable_without_patterns() -> None:
+def test_start_sends_auto_attach_fetch_and_network_enable() -> None:
     ws = FakeWs()
     client = _make_client(ws)
     client.start(timeout=2.0)
     manager = ProxyAuthManager(client, USERNAME, PASSWORD)
     try:
         manager.start()
-        assert _wait_until(lambda: len(ws.sent_json()) == 2), ws.sent_json()
+        assert _wait_until(lambda: len(ws.sent_json()) == START_COMMANDS), ws.sent_json()
         bodies = ws.sent_json()
-        assert [b["method"] for b in bodies] == ["Target.setAutoAttach", "Fetch.enable"]
-        assert [b["id"] for b in bodies] == [1, 2]
+        assert [b["method"] for b in bodies] == [
+            "Target.setAutoAttach",
+            "Fetch.enable",
+            "Network.enable",
+        ]
+        assert [b["id"] for b in bodies] == [1, 2, 3]
         assert bodies[0]["params"] == {
             "autoAttach": True,
             "waitForDebuggerOnStart": False,
@@ -121,6 +179,10 @@ def test_start_sends_auto_attach_and_enable_without_patterns() -> None:
         assert bodies[1]["params"] == {"handleAuthRequests": True}
         assert "patterns" not in bodies[1]["params"]
         assert "sessionId" not in bodies[0]
+        assert "sessionId" not in bodies[1]
+        # Network.enable — отдельная команда рядом с Fetch, параметры не нужны.
+        assert bodies[2].get("params", {}) == {}
+        assert "sessionId" not in bodies[2]
     finally:
         manager.stop()
 
@@ -133,6 +195,196 @@ def test_manager_registers_auth_handler() -> None:
         assert _wait_until(lambda: len(_sent_methods(ws, "Fetch.continueWithAuth")) == 1)
     finally:
         manager.stop()
+
+
+# --- Network.enable на каждой новой сессии ---
+
+
+def test_attached_session_gets_fetch_and_network_enable() -> None:
+    """Новая вкладка = новая сессия: Fetch (без patterns) и Network уходят вместе."""
+    ws = FakeWs()
+    manager = _started_manager(ws)
+    try:
+        ws.incoming.put(
+            json.dumps(
+                {
+                    "method": "Target.attachedToTarget",
+                    "params": {"sessionId": "S-7", "targetInfo": {"type": "page"}},
+                }
+            )
+        )
+        assert _wait_until(lambda: len(ws.sent_json()) == 2), ws.sent_json()
+
+        fetch, network = ws.sent_json()
+        assert fetch["method"] == "Fetch.enable"
+        assert fetch["params"] == {"handleAuthRequests": True}
+        assert "patterns" not in fetch["params"]
+        assert fetch["sessionId"] == "S-7"
+        assert network["method"] == "Network.enable"
+        assert network.get("params", {}) == {}
+        assert network["sessionId"] == "S-7"
+    finally:
+        manager.stop()
+
+
+def test_attached_session_without_id_is_ignored() -> None:
+    ws = FakeWs()
+    manager = _started_manager(ws)
+    try:
+        ws.incoming.put(json.dumps({"method": "Target.attachedToTarget", "params": {}}))
+        ws.incoming.put(json.dumps({"method": "Target.attachedToTarget", "params": None}))
+        time.sleep(0.2)
+
+        assert ws.sent_json() == []
+        assert manager.fail_count == 0
+    finally:
+        manager.stop()
+
+
+def test_detached_session_drops_pending_requests() -> None:
+    ws = FakeWs()
+    manager = _started_manager(ws)
+    try:
+        ws.incoming.put(json.dumps(_network_request("N-1", session="S-1")))
+        assert _wait_until(lambda: manager.recorder.pending == 1)
+
+        ws.incoming.put(
+            json.dumps({"method": "Target.detachedFromTarget", "params": {"sessionId": "S-1"}})
+        )
+        assert _wait_until(lambda: manager.recorder.pending == 0)
+        assert manager.recorder.evicted == 1
+
+        # Запоздавший ответ не создаёт запись и не роняет обработчик.
+        ws.incoming.put(json.dumps(_network_response("N-1", session="S-1")))
+        assert _wait_until(lambda: manager.recorder.unmatched_responses == 1)
+        assert manager.recorder.emitted == 0
+    finally:
+        manager.stop()
+
+
+# --- метрика: пары событий уходят в network_requests ---
+
+
+def test_network_pair_is_written_to_network_requests() -> None:
+    ws = FakeWs()
+    worker_log = get_logger(browser_id="br-net-1")
+    client = _make_client(ws)
+    client.start(timeout=2.0)
+    manager = ProxyAuthManager(client, USERNAME, PASSWORD)
+    try:
+        manager.start()
+        assert _wait_until(lambda: len(ws.sent_json()) == START_COMMANDS), ws.sent_json()
+
+        ws.incoming.put(json.dumps(_network_request("N-1")))
+        ws.incoming.put(json.dumps(_network_response("N-1", status=204)))
+
+        def row_ready() -> bool:
+            worker_log.flush()
+            return len(_network_rows("br-net-1")) == 1
+
+        assert _wait_until(row_ready, timeout=3.0), _network_rows("br-net-1")
+        row = _network_rows("br-net-1")[0]
+        assert (
+            row["browser_id"],
+            row["method"],
+            row["url"],
+            row["resource_type"],
+            row["status"],
+        ) == ("br-net-1", "GET", "https://site.test/page", "Document", 204)
+        assert row["ts"] > 0
+        assert worker_log.dropped == 0
+    finally:
+        manager.stop()
+        client.stop()
+        worker_log.bind(None)
+
+
+def test_garbage_network_events_do_not_break_worker() -> None:
+    ws = FakeWs()
+    manager = _started_manager(ws)
+    try:
+        for junk in (
+            {"method": "Network.requestWillBeSent"},
+            {"method": "Network.requestWillBeSent", "params": {"requestId": 3}},
+            {
+                "method": "Network.responseReceived",
+                "params": {"requestId": "ghost", "response": {"status": 200}},
+            },
+        ):
+            ws.incoming.put(json.dumps(junk))
+        assert _wait_until(
+            lambda: manager.recorder.malformed == 2
+            and manager.recorder.unmatched_responses == 1
+        ), (manager.recorder.malformed, manager.recorder.unmatched_responses)
+
+        # Обработка мусора не сломала ни корректную пару, ни авторизацию.
+        ws.incoming.put(json.dumps(_network_request("N-1")))
+        ws.incoming.put(json.dumps(_network_response("N-1")))
+        assert _wait_until(lambda: manager.recorder.emitted == 1)
+
+        ws.incoming.put(json.dumps(_auth_event("REQ-1")))
+        assert _wait_until(lambda: len(_sent_methods(ws, "Fetch.continueWithAuth")) == 1)
+    finally:
+        manager.stop()
+
+
+def test_dropped_network_event_is_logged_without_url(caplog: pytest.LogCaptureFixture) -> None:
+    ws = FakeWs()
+    manager = _started_manager(ws)
+    try:
+        with caplog.at_level(logging.DEBUG, logger="logger"):
+            ws.incoming.put(
+                json.dumps(
+                    {
+                        "method": "Network.requestWillBeSent",
+                        "params": {
+                            "requestId": 5,
+                            "request": {
+                                "method": "GET",
+                                "url": "https://site.test/p?token=SECRET9",
+                            },
+                        },
+                    }
+                )
+            )
+            assert _wait_until(lambda: manager.recorder.malformed == 1)
+        mirrored = [record for record in caplog.records if record.name == "logger"]
+        dropped = [
+            record
+            for record in mirrored
+            if isinstance(getattr(record, "fields", None), dict)
+            and record.fields.get("malformed")
+        ]
+        assert dropped, "отброшенное событие должно попасть в debug-лог со счётчиком"
+        assert "SECRET9" not in caplog.text
+    finally:
+        manager.stop()
+
+
+def test_full_url_with_query_stays_out_of_logs(caplog: pytest.LogCaptureFixture) -> None:
+    """URL целиком живёт в таблице; в логи он не попадает — это метрика."""
+    ws = FakeWs()
+    worker_log = get_logger(browser_id="br-net-2")
+    manager = _started_manager(ws)
+    try:
+        with caplog.at_level(logging.DEBUG, logger="logger"):
+            ws.incoming.put(
+                json.dumps(_network_request("N-9", url="https://site.test/p?token=SECRET123"))
+            )
+            ws.incoming.put(json.dumps(_network_response("N-9")))
+
+            def row_ready() -> bool:
+                worker_log.flush()
+                return len(_network_rows("br-net-2")) == 1
+
+            assert _wait_until(row_ready, timeout=3.0)
+        assert [r["url"] for r in _network_rows("br-net-2")] == [
+            "https://site.test/p?token=SECRET123"
+        ]
+        assert "SECRET123" not in caplog.text
+    finally:
+        manager.stop()
+        worker_log.bind(None)
 
 
 # --- Fetch.authRequired ---
@@ -282,7 +534,7 @@ def test_create_proxy_auth_resolves_port_over_real_http() -> None:
         )
         try:
             assert seen_urls == [f"ws://127.0.0.1:{port}/devtools/browser/z"]
-            assert _wait_until(lambda: len(ws.sent_json()) == 2)
+            assert _wait_until(lambda: len(ws.sent_json()) == START_COMMANDS)
         finally:
             manager.stop()
     finally:
@@ -295,7 +547,7 @@ def test_stop_unsubscribes_and_closes_owned_client() -> None:
     client.start(timeout=2.0)
     manager = ProxyAuthManager(client, USERNAME, PASSWORD, owns_client=True)
     manager.start()
-    assert _wait_until(lambda: len(ws.sent_json()) == 2)
+    assert _wait_until(lambda: len(ws.sent_json()) == START_COMMANDS)
     manager.stop()
     assert ws.closed
     assert not client.connected
@@ -381,7 +633,7 @@ def test_start_twice_sends_commands_once() -> None:
         manager.start()
         manager.start()
         time.sleep(0.2)
-        assert len(ws.sent_json()) == 2
+        assert len(ws.sent_json()) == START_COMMANDS
     finally:
         manager.stop()
 
@@ -395,7 +647,7 @@ def test_stop_then_start_resubscribes() -> None:
         manager.start()
         manager.stop()
         manager.start()
-        assert _wait_until(lambda: len(ws.sent_json()) == 4), ws.sent_json()
+        assert _wait_until(lambda: len(ws.sent_json()) == 2 * START_COMMANDS), ws.sent_json()
         ws.incoming.put(json.dumps(_auth_event("REQ-R")))
         assert _wait_until(lambda: len(_sent_methods(ws, "Fetch.continueWithAuth")) == 1)
     finally:
@@ -485,7 +737,7 @@ def test_create_proxy_auth_full_wiring(tmp_path) -> None:
     )
     try:
         assert seen_urls == ["ws://127.0.0.1:19311/devtools/browser/wired"]
-        assert _wait_until(lambda: len(ws.sent_json()) == 2)
+        assert _wait_until(lambda: len(ws.sent_json()) == START_COMMANDS)
         ws.sent.clear()
 
         answered = 0
@@ -554,7 +806,7 @@ def test_create_proxy_auth_forwards_max_failures() -> None:
         client_factory=fake_client,
     )
     try:
-        assert _wait_until(lambda: len(ws.sent_json()) == 2)
+        assert _wait_until(lambda: len(ws.sent_json()) == START_COMMANDS)
         ws.incoming.put(json.dumps(_auth_event("F-1")))
         ws.incoming.put(json.dumps(_auth_event("F-1")))
         assert _wait_until(lambda: manager.dead is True, timeout=3.0)
@@ -570,7 +822,7 @@ def test_manager_default_does_not_own_client() -> None:
     manager = ProxyAuthManager(client, USERNAME, PASSWORD)
     try:
         manager.start()
-        assert _wait_until(lambda: len(ws.sent_json()) == 2)
+        assert _wait_until(lambda: len(ws.sent_json()) == START_COMMANDS)
         manager.stop()
         assert not ws.closed
         assert client.connected
