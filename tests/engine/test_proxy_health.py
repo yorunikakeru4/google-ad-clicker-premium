@@ -68,6 +68,9 @@ class LoopbackProxy:
         self._listen.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         self._listen.bind(("127.0.0.1", 0))
         self._listen.listen(16)
+        # accept() с таймаутом: иначе close() из другого потока не разбудит
+        # ожидающий accept, и teardown каждой пробы вис бы до секундного лимита.
+        self._listen.settimeout(0.2)
         self.host, self.port = self._listen.getsockname()
         self._handlers = []
         self._thread = threading.Thread(target=self._serve, daemon=True)
@@ -82,6 +85,8 @@ class LoopbackProxy:
         while not self._stop.is_set():
             try:
                 conn, _ = self._listen.accept()
+            except socket.timeout:
+                continue
             except OSError:
                 return
             handler = threading.Thread(target=self._handle, args=(conn,), daemon=True)
@@ -150,11 +155,6 @@ class LoopbackProxy:
         self._thread.join(timeout=2)
         for handler in self._handlers:
             handler.join(timeout=2)
-
-
-class SilentProxy(LoopbackProxy):
-    def __init__(self):
-        super().__init__(silent=True)
 
 
 @pytest.fixture
@@ -421,22 +421,24 @@ class TestRunCheck:
         finally:
             worker.join(timeout=5)
 
-    def test_concurrent_check_of_hanging_proxies_finishes(self, pool, db_path):
-        """8 зависших прокси при 8 потоках: один таймаут, а не восемь подряд."""
-        for _ in range(8):
-            add_proxy(pool, "127.0.0.1", closed_port())
-        silent = SilentProxy()
-        try:
-            started = time.monotonic()
-            summary = run_check(pool, target=LOOPBACK_TARGET, timeout=0.4, threads=CHECK_THREADS)
-            elapsed = time.monotonic() - started
-        finally:
-            silent.close()
+    def test_concurrent_check_of_hanging_proxies_finishes(self, pool, db_path, servers):
+        """8 зависших прокси при 8 потоках: один таймаут, а не восемь подряд.
 
-        assert summary["checked"] == 8
-        assert summary["dead"] == 8
+        Последовательный вариант занял бы 8 × 0.4 с = 3.2 с; граница в 1.6 с
+        отделяет параллельную проверку от последовательной с большим запасом.
+        """
+        for server in [servers(silent=True) for _ in range(8)]:
+            add_proxy(pool, "127.0.0.1", server.port)
+
+        started = time.monotonic()
+        summary = run_check(pool, target=LOOPBACK_TARGET, timeout=0.4, threads=CHECK_THREADS)
+        elapsed = time.monotonic() - started
+
+        assert summary == {"checked": 8, "alive": 0, "dead": 8}
         assert elapsed < 1.6, f"проверка шла {elapsed:.2f}s — потоки не работают параллельно"
-        assert all(row["last_checked_at"] for row in rows(db_path))
+        stored = rows(db_path)
+        assert all(row["last_checked_at"] for row in stored)
+        assert all("таймаут" in row["last_error"] for row in stored)
 
     def test_results_update_only_the_checked_row(self, pool, db_path, servers):
         """Проверка не должна переписывать чужие колонки соседних строк."""
