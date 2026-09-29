@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { useThemeToggle } from "../composables/useThemeToggle";
+import { useThemeToggle } from "../../composables/useThemeToggle";
 
 const { isDark, toggleTheme } = useThemeToggle();
 </script>
@@ -8,8 +8,8 @@ const { isDark, toggleTheme } = useThemeToggle();
   <v-btn
     :icon="isDark ? 'mdi-weather-sunny' : 'mdi-weather-night'"
     variant="text"
-    :aria-label="isDark ? 'Switch to light theme' : 'Switch to dark theme'"
-    :title="isDark ? 'Light theme' : 'Dark theme'"
+    :aria-label="isDark ? 'Включить светлую тему' : 'Включить тёмную тему'"
+    :title="isDark ? 'Светлая тема' : 'Тёмная тема'"
     data-test="theme-toggle"
     @click="toggleTheme"
   />
