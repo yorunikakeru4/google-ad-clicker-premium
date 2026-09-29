@@ -1,4 +1,8 @@
 pub mod db;
+pub mod metrics;
+
+#[cfg(test)]
+mod test_support;
 
 // Learn more about Tauri commands at https://tauri.app/develop/calling-rust/
 #[tauri::command]
