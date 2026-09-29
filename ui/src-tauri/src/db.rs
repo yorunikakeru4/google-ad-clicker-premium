@@ -126,6 +126,37 @@ pub struct ProxyRow {
     pub usage_count: i64,
 }
 
+/// Строка списка профилей — экран Profiles (контракт GET /control/profiles).
+///
+/// Два поля выходят за колонки самой таблицы: `assigned_browser_id` — воркер,
+/// сидящий на профиле (`workers.profile_id`), `proxy_label`/`proxy_address` —
+/// прокси профиля через LEFT JOIN: у профиля может не быть прокси, и тогда все
+/// три поля NULL, а не пустые строки.
+///
+/// `fields` остаётся сырой JSON-строкой: колонка появляется миграцией
+/// `engine/db/migrations/002_profile_fields.sql`, поэтому читалка проверяет её
+/// наличие и до миграции читает NULL. Разбор JSON — на стороне фронтенда.
+///
+/// Креды (`username`, `password`) прокси в выборку не входят: полей нет в
+/// [`ProfileRow`], поэтому в JSON для UI их не может быть по построению.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct ProfileRow {
+    pub id: i64,
+    pub name: String,
+    pub key_ref: Option<String>,
+    pub proxy_id: Option<i64>,
+    pub user_agent: Option<String>,
+    pub locale: Option<String>,
+    pub timezone: Option<String>,
+    pub status: String,
+    pub last_used_at: Option<f64>,
+    pub fields: Option<String>,
+    pub assigned_browser_id: Option<String>,
+    pub proxy_label: Option<String>,
+    /// `host:port` прокси либо NULL, если у профиля прокси нет.
+    pub proxy_address: Option<String>,
+}
+
 /// Читатель боевой БД: одно соединение, строго на чтение.
 ///
 /// Соединение не разделяется между потоками (`SQLITE_OPEN_NO_MUTEX`):
@@ -282,6 +313,71 @@ impl DbReader {
         rows.map(|row| row.map_err(read_failed)).collect()
     }
 
+    /// Список профилей для экрана Profiles: строки `profiles` плюс назначенный
+    /// воркер, прокси и сырые `fields`. Порядок — по `id`, как у
+    /// [`Self::list_proxies`]: стабильный и совпадает с порядком вставки.
+    ///
+    /// Назначение — подзапросом, а не JOIN: два воркера на одном профиле
+    /// размножили бы строку, а экрану нужен ровно один профиль на строку. При
+    /// нескольких воркерах отдаётся первый `browser_id` по алфавиту — выбор
+    /// детерминирован, а не зависит от порядка в таблице.
+    ///
+    /// Прокси — LEFT JOIN: профиль может быть без прокси, и в этом случае
+    /// `proxy_id`/`proxy_label`/`proxy_address` остаются NULL.
+    ///
+    /// Колонки `fields` в схеме ещё нет (миграция 002 параллельной ветки):
+    /// читалка спрашивает `pragma_table_info` и до миграции отдаёт NULL, а не
+    /// падает с «no such column». Это терпимо для read-only читалки, потому что
+    /// сама БД остаётся старой — ошибка возникла бы на каждом вызове.
+    pub fn list_profiles(&self) -> Result<Vec<ProfileRow>, DbError> {
+        let has_fields = self
+            .conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('profiles') WHERE name = 'fields'",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .map_err(read_failed)?
+            > 0;
+        let fields_column = if has_fields { "p.fields" } else { "NULL" };
+
+        let sql = format!(
+            "SELECT p.id, p.name, p.key_ref, p.proxy_id, p.user_agent, p.locale, \
+                    p.timezone, p.status, p.last_used_at, {fields_column}, \
+                    (SELECT w.browser_id FROM workers w \
+                      WHERE w.profile_id = p.id \
+                      ORDER BY w.browser_id LIMIT 1) AS assigned_browser_id, \
+                    x.label AS proxy_label, \
+                    CASE WHEN x.id IS NULL THEN NULL \
+                         ELSE x.host || ':' || x.port END AS proxy_address \
+               FROM profiles p \
+               LEFT JOIN proxies x ON x.id = p.proxy_id \
+              ORDER BY p.id"
+        );
+
+        let mut stmt = self.conn.prepare(&sql).map_err(read_failed)?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(ProfileRow {
+                    id: row.get(0)?,
+                    name: row.get(1)?,
+                    key_ref: row.get(2)?,
+                    proxy_id: row.get(3)?,
+                    user_agent: row.get(4)?,
+                    locale: row.get(5)?,
+                    timezone: row.get(6)?,
+                    status: row.get(7)?,
+                    last_used_at: row.get(8)?,
+                    fields: row.get(9)?,
+                    assigned_browser_id: row.get(10)?,
+                    proxy_label: row.get(11)?,
+                    proxy_address: row.get(12)?,
+                })
+            })
+            .map_err(read_failed)?;
+
+        rows.map(|row| row.map_err(read_failed)).collect()
+    }
     /// Общий путь запросов логов: одна страница в порядке `ts DESC, id DESC`.
     fn fetch_log_page(
         &self,
@@ -1637,9 +1733,7 @@ mod tests {
         let reader = DbReader::open(&path).expect("БД открывается");
 
         assert_eq!(
-            reader
-                .list_profiles()
-                .expect("пустая БД — пустой список"),
+            reader.list_profiles().expect("пустая БД — пустой список"),
             vec![] as Vec<ProfileRow>,
             "отсутствие профилей — не ошибка чтения"
         );
