@@ -1993,6 +1993,8 @@ class TestForcedRotation:
         pool.add_lines(["alice:s3cr3t@10.0.0.1:8080"])
         supervisor = make_supervisor(store, registry, clock, settings)
         supervisor.start(1)
+        supervisor.tick()
+        assert store.get_worker("br-1")["status"] == WorkerStatus.RUNNING.value
 
         rotated = supervisor.rotate_all(reason="captcha_threshold")
 

@@ -419,10 +419,13 @@ class TestJobEndToEnd:
         daemon.supervisor.start(1)
         daemon.start()
         try:
-            assert wait_until(lambda: daemon.store.is_pause_requested(), timeout=5), (
-                "pause обязан поставить kv-флаг"
-            )
-            assert daemon.store.get_run_state() == "paused"
+            # Ждём ОБЕ записи: request_pause() и set_run_state() идут двумя
+            # транзакциями, и тик между ними читал бы флаг со старым run_state.
+            assert wait_until(
+                lambda: daemon.store.is_pause_requested()
+                and daemon.store.get_run_state() == "paused",
+                timeout=5,
+            ), "pause обязан поставить kv-флаг и состояние paused"
             assert registry.created[0].poll() is None, "пауза не убивает процессы"
             assert len(captcha_logs(db_path, level="WARNING")) == 1, (
                 "edge: пауза запрашивается один раз, а не на каждом тике"

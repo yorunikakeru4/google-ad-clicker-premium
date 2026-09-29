@@ -26,13 +26,13 @@
 from __future__ import annotations
 
 import time
+from collections.abc import Callable
 from typing import TYPE_CHECKING, Protocol
 
 from engine.db import migrations
 
 if TYPE_CHECKING:
     from pathlib import Path
-    from typing import Any
 
     from engine.control_plane.state import StateStore
 
@@ -133,8 +133,8 @@ class CaptchaThresholdPolicy:
         store: StateStore,
         supervisor: ThresholdActions,
         *,
-        share_fn: Any = captcha_share,
-        clock: Any = time.time,
+        share_fn: Callable[[str | Path, float], float | None] = captcha_share,
+        clock: Callable[[], float] = time.time,
         window: float = CAPTCHA_SHARE_WINDOW_SECONDS,
     ):
         self.store = store
