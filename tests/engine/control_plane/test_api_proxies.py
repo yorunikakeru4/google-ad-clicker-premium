@@ -227,8 +227,9 @@ class TestProxyListContract:
         assert status == 200
         assert body == {"proxies": []}
 
-    def test_post_is_not_allowed(self, server):
-        status, body, _ = call(server, "/control/proxies", method="POST", body={"lines": []})
+    def test_put_is_not_allowed(self, server):
+        """Маршрут списка знает только GET и POST — остальное 405 с Allow."""
+        status, body, _ = call(server, "/control/proxies", method="PUT", body={})
 
         assert status == 405
         assert body["error"]["code"] == "method_not_allowed"
