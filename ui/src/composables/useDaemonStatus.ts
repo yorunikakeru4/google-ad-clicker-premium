@@ -87,6 +87,9 @@ export function createDaemonStatus(
     try {
       await api.control(action);
       controlError.value = null;
+      // Состояние после команды свежее: тик уходит сразу, не дожидаясь
+      // интервала — кнопки и таблица отражают результат немедленно.
+      void tick();
       return true;
     } catch (error) {
       controlError.value = errorMessage(error);

@@ -237,7 +237,7 @@ describe("createDaemonStatus: интервал", () => {
 });
 
 describe("createDaemonStatus: control", () => {
-  it("успешная команда чистит прошлую ошибку", async () => {
+  it("успешная команда чистит прошлую ошибку и обновляет состояние", async () => {
     const fake = fakeApi();
     const status = createDaemonStatus({ api: fake.api });
     status.controlError.value = "старая ошибка";
@@ -246,6 +246,8 @@ describe("createDaemonStatus: control", () => {
 
     expect(fake.api.control).toHaveBeenCalledWith("start");
     expect(status.controlError.value).toBeNull();
+    // состояние после команды свежее: тик ушёл сразу, не дожидаясь интервала
+    expect(fake.calls).toEqual(["/health", "/state"]);
 
     status.stop();
   });
