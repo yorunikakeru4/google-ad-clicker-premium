@@ -10,10 +10,11 @@ seleniumbase, подмена Selenium), живёт в ``tests/legacy/conftest.py
 
 Есть, однако, настройка, которая общая по определению: тесты не должны
 трогать ``adclicker.db`` разработчика. Модули, переведённые на
-``engine.log.get_logger()``, открывают хранилище в ``ADCLICKER_DB`` уже при
-импорте, то есть во время сборки, — раньше, чем запускается первая фикстура.
-Поэтому переменная выставляется в ``pytest_configure``: до импорта любого
-тестового модуля и на всю сессию.
+``engine.log.get_logger()``, открывают хранилище в ``ADCLICKER_DB`` при
+импорте, а ``tests/legacy/conftest.py`` импортирует legacy-модули прямо в
+своём ``pytest_configure`` — то есть раньше, чем доходит дело до фикстур.
+Поэтому переменная выставляется на этапе импорта этого conftest'а: он лежит
+выше ``tests/legacy/`` и загружается первым.
 """
 
 import os
@@ -21,19 +22,10 @@ import shutil
 import tempfile
 from pathlib import Path
 
-# Каталог тестовой БД; None — либо уже задано извне, либо настройка снята.
+# Каталог тестовой БД; None — либо путь задан извне, либо настройка снята.
 _test_db_dir: Path | None = None
 
-
-def pytest_configure(config) -> None:
-    """Увести запись логов в отдельный каталог на время тестовой сессии."""
-
-    global _test_db_dir
-
-    if os.environ.get("ADCLICKER_DB"):
-        # Запуск с явным путём (например, отладка одной фичи) — не перетираем.
-        return
-
+if not os.environ.get("ADCLICKER_DB"):
     _test_db_dir = Path(tempfile.mkdtemp(prefix="adclicker-tests-"))
     os.environ["ADCLICKER_DB"] = str(_test_db_dir / "adclicker.db")
 

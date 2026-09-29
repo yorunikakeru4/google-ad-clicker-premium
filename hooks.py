@@ -10,7 +10,10 @@ except ImportError:
 
     import undetected_chromedriver
 
-from logger import logger
+from engine.log import get_logger
+
+
+log = get_logger()
 
 
 def before_search_hook(driver: undetected_chromedriver.Chrome) -> None:
@@ -25,10 +28,14 @@ def before_search_hook(driver: undetected_chromedriver.Chrome) -> None:
     """
 
     try:
-        logger.info("Executing before search hook...")
+        log.info("scheduler", "Executing before search hook...")
 
     except Exception as exp:
-        logger.error(exp)
+        log.error(
+            "scheduler",
+            "Hook failed",
+            fields={"hook": "before_search", "error": str(exp)},
+        )
 
 
 def captcha_seen_hook(driver: undetected_chromedriver.Chrome) -> None:
@@ -41,10 +48,14 @@ def captcha_seen_hook(driver: undetected_chromedriver.Chrome) -> None:
     """
 
     try:
-        logger.info("Executing captcha seen hook...")
+        log.info("captcha", "Executing captcha seen hook...")
 
     except Exception as exp:
-        logger.error(exp)
+        log.error(
+            "captcha",
+            "Hook failed",
+            fields={"hook": "captcha_seen", "error": str(exp)},
+        )
 
 
 def after_query_sent_hook(driver: undetected_chromedriver.Chrome, search_query: str) -> None:
@@ -60,10 +71,14 @@ def after_query_sent_hook(driver: undetected_chromedriver.Chrome, search_query: 
     """
 
     try:
-        logger.info("Executing after query sent hook...")
+        log.info("scheduler", "Executing after query sent hook...")
 
     except Exception as exp:
-        logger.error(exp)
+        log.error(
+            "scheduler",
+            "Hook failed",
+            fields={"hook": "after_query_sent", "error": str(exp)},
+        )
 
 
 def results_ready_hook(driver: undetected_chromedriver.Chrome) -> None:
@@ -77,10 +92,14 @@ def results_ready_hook(driver: undetected_chromedriver.Chrome) -> None:
     """
 
     try:
-        logger.info("Executing search results ready hook...")
+        log.info("scheduler", "Executing search results ready hook...")
 
     except Exception as exp:
-        logger.error(exp)
+        log.error(
+            "scheduler",
+            "Hook failed",
+            fields={"hook": "results_ready", "error": str(exp)},
+        )
 
 
 def after_search_hook(driver: undetected_chromedriver.Chrome) -> None:
@@ -95,10 +114,14 @@ def after_search_hook(driver: undetected_chromedriver.Chrome) -> None:
     """
 
     try:
-        logger.info("Executing after search hook...")
+        log.info("scheduler", "Executing after search hook...")
 
     except Exception as exp:
-        logger.error(exp)
+        log.error(
+            "scheduler",
+            "Hook failed",
+            fields={"hook": "after_search", "error": str(exp)},
+        )
 
 
 def before_ad_click_hook(driver: undetected_chromedriver.Chrome) -> None:
@@ -112,10 +135,14 @@ def before_ad_click_hook(driver: undetected_chromedriver.Chrome) -> None:
     """
 
     try:
-        logger.info("Executing before ad click hook...")
+        log.info("click", "Executing before ad click hook...")
 
     except Exception as exp:
-        logger.error(exp)
+        log.error(
+            "click",
+            "Hook failed",
+            fields={"hook": "before_ad_click", "error": str(exp)},
+        )
 
 
 def after_ad_click_hook(driver: undetected_chromedriver.Chrome) -> None:
@@ -129,10 +156,14 @@ def after_ad_click_hook(driver: undetected_chromedriver.Chrome) -> None:
     """
 
     try:
-        logger.info("Executing after ad click hook...")
+        log.info("click", "Executing after ad click hook...")
 
     except Exception as exp:
-        logger.error(exp)
+        log.error(
+            "click",
+            "Hook failed",
+            fields={"hook": "after_ad_click", "error": str(exp)},
+        )
 
 
 def after_clicks_hook(driver: undetected_chromedriver.Chrome) -> None:
@@ -145,10 +176,14 @@ def after_clicks_hook(driver: undetected_chromedriver.Chrome) -> None:
     """
 
     try:
-        logger.info("Executing after clicks hook...")
+        log.info("click", "Executing after clicks hook...")
 
     except Exception as exp:
-        logger.error(exp)
+        log.error(
+            "click",
+            "Hook failed",
+            fields={"hook": "after_clicks", "error": str(exp)},
+        )
 
 
 def exception_hook(driver: undetected_chromedriver.Chrome) -> None:
@@ -162,10 +197,14 @@ def exception_hook(driver: undetected_chromedriver.Chrome) -> None:
     """
 
     try:
-        logger.info("Executing exception hook...")
+        log.info("scheduler", "Executing exception hook...")
 
     except Exception as exp:
-        logger.error(exp)
+        log.error(
+            "scheduler",
+            "Hook failed",
+            fields={"hook": "exception", "error": str(exp)},
+        )
 
 
 def before_browser_close_hook(driver: undetected_chromedriver.Chrome) -> None:
@@ -179,10 +218,14 @@ def before_browser_close_hook(driver: undetected_chromedriver.Chrome) -> None:
     """
 
     try:
-        logger.info("Executing before browser close hook...")
+        log.info("browser", "Executing before browser close hook...")
 
     except Exception as exp:
-        logger.error(exp)
+        log.error(
+            "browser",
+            "Hook failed",
+            fields={"hook": "before_browser_close", "error": str(exp)},
+        )
 
 
 def after_browser_close_hook(driver: undetected_chromedriver.Chrome) -> None:
@@ -195,7 +238,11 @@ def after_browser_close_hook(driver: undetected_chromedriver.Chrome) -> None:
     """
 
     try:
-        logger.info("Executing after browser close hook...")
+        log.info("browser", "Executing after browser close hook...")
 
     except Exception as exp:
-        logger.error(exp)
+        log.error(
+            "browser",
+            "Hook failed",
+            fields={"hook": "after_browser_close", "error": str(exp)},
+        )
