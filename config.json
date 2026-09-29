@@ -39,6 +39,8 @@
         "hooks_enabled": false,
         "telegram_enabled": false,
         "send_to_android": false,
-        "request_boost": false
+        "request_boost": false,
+        "captcha_threshold_percent": 5.0,
+        "captcha_threshold_action": "warn"
     }
 }

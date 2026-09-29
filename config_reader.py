@@ -3,6 +3,10 @@ import multiprocessing
 from dataclasses import dataclass
 from typing import Optional
 
+from engine.captcha_threshold import (
+    DEFAULT_CAPTCHA_THRESHOLD_ACTION,
+    DEFAULT_CAPTCHA_THRESHOLD_PERCENT,
+)
 from engine.proxy_transport import DEFAULT_PROXY_TRANSPORT
 from logger import logger
 
@@ -57,6 +61,11 @@ class BehaviorParams:
     telegram_enabled: Optional[bool] = False
     send_to_android: Optional[bool] = False
     request_boost: Optional[bool] = False
+    # Порог CAPTCHA: проценты и действие (warn | pause | rotate). Дефолты
+    # берутся из engine.captcha_threshold, а не дублируются строкой: там же
+    # их читает политика и проверяет конфиг демона.
+    captcha_threshold_percent: Optional[float] = DEFAULT_CAPTCHA_THRESHOLD_PERCENT
+    captcha_threshold_action: Optional[str] = DEFAULT_CAPTCHA_THRESHOLD_ACTION
 
 
 class _ConfigSection(dict):
@@ -169,6 +178,14 @@ class ConfigReader:
             telegram_enabled=config["behavior"]["telegram_enabled"],
             send_to_android=config["behavior"]["send_to_android"],
             request_boost=config["behavior"]["request_boost"],
+            # .get, а не []: config.json прошлой версии без ключей обязан
+            # читаться, дефолты приходят из engine.captcha_threshold.
+            captcha_threshold_percent=config["behavior"].get(
+                "captcha_threshold_percent", DEFAULT_CAPTCHA_THRESHOLD_PERCENT
+            ),
+            captcha_threshold_action=config["behavior"].get(
+                "captcha_threshold_action", DEFAULT_CAPTCHA_THRESHOLD_ACTION
+            ),
         )
 
 

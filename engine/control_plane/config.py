@@ -28,6 +28,11 @@ import tempfile
 from pathlib import Path
 from typing import Any
 
+from engine.captcha_threshold import (
+    CAPTCHA_THRESHOLD_ACTIONS,
+    DEFAULT_CAPTCHA_THRESHOLD_ACTION,
+    DEFAULT_CAPTCHA_THRESHOLD_PERCENT,
+)
 from engine.proxy_transport import DEFAULT_PROXY_TRANSPORT, PROXY_TRANSPORTS
 
 # Значение, которым секрет заменяется в любом JSON наружу.
@@ -81,18 +86,30 @@ _SCHEMA: dict[str, dict[str, tuple[type | tuple[type, ...], Any]]] = {
         "telegram_enabled": (bool, False),
         "send_to_android": (bool, False),
         "request_boost": (bool, False),
+        # Политика по доле CAPTCHA (план §5, фаза 8). Процент — доля за
+        # скользящий час в процентах, 0..100 (0 — срабатывать при любой доле,
+        # как только появятся запросы); действие — warn | pause | rotate.
+        # Значения и дефолты приходят из engine.captcha_threshold, где их же
+        # читает политика.
+        "captcha_threshold_percent": (float, DEFAULT_CAPTCHA_THRESHOLD_PERCENT),
+        "captcha_threshold_action": (str, DEFAULT_CAPTCHA_THRESHOLD_ACTION),
     },
 }
 
 # Секреты: наружу уходят замаскированными, в patch маска значит «не менять».
 _SECRET_FIELDS = frozenset({"behavior.2captcha_apikey", "webdriver.proxy"})
 
-# Поля-перечисления: путь поля -> допустимые значения. Словаря значений здесь
-# нет намеренно: он живёт в engine.proxy_transport, а нормализует его
-# resolve_proxy_transport из engine.proxy_auth, и второе место правды для него
+# Поля-перечисления: путь поля -> допустимые значения. Своих словарей значений
+# здесь нет намеренно: каждый живёт рядом со своим потребителем
+# (engine.proxy_transport для транспорта, engine.captcha_threshold для
+# действий политики порога), а транспорт дополнительно нормализует
+# resolve_proxy_transport из engine.proxy_auth — второе место правды
 # недопустимо. Проверка выполняется только после проверки типа, поэтому к
 # этому месту доходит строка.
-_ENUM_FIELDS: dict[str, frozenset[str]] = {"webdriver.proxy_transport": PROXY_TRANSPORTS}
+_ENUM_FIELDS: dict[str, frozenset[str]] = {
+    "webdriver.proxy_transport": PROXY_TRANSPORTS,
+    "behavior.captcha_threshold_action": CAPTCHA_THRESHOLD_ACTIONS,
+}
 
 # browser_count: legacy трактует 0 как "столько, сколько ядер". Демон держит
 # ту же договорённость, иначе конфиг из старой установки молча сменит смысл.
@@ -109,6 +126,10 @@ _MAX_WAIT_SECONDS = 3600
 _MAX_LOOP_WAIT_SECONDS = 86_400
 _MAX_CLICK_ORDER = 1000
 _MAX_WAIT_FACTOR = 100.0
+
+# Порог доли CAPTCHA — проценты: 0 допустим (срабатывать при любой доле),
+# больше 100 смысла нет — доля по построению не превышает единицу.
+_MAX_CAPTCHA_THRESHOLD_PERCENT = 100.0
 
 
 class ConfigError(ValueError):
@@ -218,6 +239,7 @@ def _numeric_limits(field_path: str) -> tuple[float, float] | None:
         "behavior.loop_wait_time": (0, _MAX_LOOP_WAIT_SECONDS),
         "behavior.wait_factor": (0.01, _MAX_WAIT_FACTOR),
         "behavior.max_scroll_limit": (0, _MAX_WAIT_SECONDS),
+        "behavior.captcha_threshold_percent": (0.0, _MAX_CAPTCHA_THRESHOLD_PERCENT),
     }
     return limits.get(field_path)
 
