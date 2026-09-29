@@ -1,5 +1,6 @@
 import { describe, expect, it } from "vitest";
 import {
+  MAX_HOURLY_BUCKETS,
   alignCounts,
   buildHourlyBuckets,
   countByHour,
@@ -25,6 +26,13 @@ describe("buildHourlyBuckets", () => {
   it("обратный диапазон — пусто, а не ошибка", () => {
     expect(buildHourlyBuckets(7200, 0)).toEqual([]);
     expect(buildHourlyBuckets(3600, 3599)).toEqual([]);
+  });
+
+  it("гигантское окно усекается до свежих часов, а не подвешивает цикл", () => {
+    const buckets = buildHourlyBuckets(0, 3600 * 5000);
+
+    expect(buckets).toHaveLength(MAX_HOURLY_BUCKETS);
+    expect(buckets.at(-1)).toBe(3600 * 5000, "самый свежий час сохраняется");
   });
 });
 
