@@ -220,6 +220,9 @@ class _UnavailableStore:
     def mark_degraded(self, **kwargs: Any) -> None:
         raise RuntimeError(self._error)
 
+    def record_diagnostic(self, **kwargs: Any) -> None:
+        raise RuntimeError(self._error)
+
     def flush(self) -> None:
         raise RuntimeError(self._error)
 
@@ -331,6 +334,26 @@ class StructuredLogger:
             return
         try:
             self._store.mark_degraded(browser_id=target, reason=reason)
+        except Exception as exc:
+            with self._lock:
+                self._dropped += 1
+                self._last_error = str(exc)
+
+    def record_diagnostic(self, browser_id: str | None = None, **fields: Any) -> None:
+        """Записать снимок диагностики в ``diagnostics``.
+
+        Тот же контракт, что у :meth:`mark_degraded`: ``browser_id`` берётся
+        из биндинга (явный аргумент перебивает), запись немедленная и не
+        зеркалируется в legacy-лог — снимок живёт в своей таблице, а не в
+        ``logs``. Ошибки хранения гасятся счётчиком ``dropped`` и текстом в
+        ``last_error``, исключение наружу не выходит.
+        """
+        with self._lock:
+            target = self._browser_id if browser_id is None else browser_id
+        if target is None:
+            return
+        try:
+            self._store.record_diagnostic(browser_id=target, **fields)
         except Exception as exc:
             with self._lock:
                 self._dropped += 1

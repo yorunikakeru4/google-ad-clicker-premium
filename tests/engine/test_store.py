@@ -436,10 +436,18 @@ class TestRecordDiagnostic:
     def test_writes_every_column_without_an_explicit_flush(self, db_path):
         writer = StoreWriter(db_path, batch_size=100, flush_interval=60.0)
         try:
+            # proxy_id — внешний ключ: строка прокси должна существовать.
+            with sqlite3.connect(db_path) as conn:
+                cursor = conn.execute(
+                    "INSERT INTO proxies (host, port) VALUES ('10.0.0.1', 8080)"
+                )
+                proxy_id = cursor.lastrowid
+                conn.commit()
+
             writer.record_diagnostic(
                 browser_id="br-1",
                 ts=1700000000.25,
-                proxy_id=3,
+                proxy_id=proxy_id,
                 ip="203.0.113.7",
                 country="DE",
                 user_agent="UA/1.0",
@@ -463,7 +471,7 @@ class TestRecordDiagnostic:
         row = rows[0]
         assert row["ts"] == 1700000000.25
         assert row["browser_id"] == "br-1"
-        assert row["proxy_id"] == 3
+        assert row["proxy_id"] == proxy_id
         assert row["ip"] == "203.0.113.7"
         assert row["country"] == "DE"
         assert row["user_agent"] == "UA/1.0"

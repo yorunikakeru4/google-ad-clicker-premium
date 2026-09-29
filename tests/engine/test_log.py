@@ -81,6 +81,9 @@ class _BrokenStore(StoreWriter):
     ) -> None:
         raise RuntimeError("disk full")
 
+    def record_diagnostic(self, **kwargs: Any) -> None:
+        raise RuntimeError("disk full")
+
 
 class TestRowShape:
     def test_info_writes_exact_row(self, writer, db_path):
