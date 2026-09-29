@@ -13,7 +13,9 @@
 Что здесь живёт, а что нет:
 
 * **живёт** — цикл, окно запуска, пауза, очередь запросов, устойчивость к
-  сбоям конфига и сценария;
+  сбоям конфига и сценария и heartbeat в БД (фоновым потоком: воркер стучит
+  сам, супервизор только наблюдает и по отсутствию роста помечает его
+  зависшим);
 * **не живёт** — надзор за процессом. Падение самого воркера разбирает
   супервизор (backoff, circuit breaker), а не этот модуль.
 
@@ -56,6 +58,22 @@ EXIT_CONFIG_ERROR = 2
 # resume быстро, но не превращать ожидание в опрос в SQLite сотню раз в секунду.
 PAUSE_POLL_SECONDS = 0.5
 
+# Как часто воркер сам пишет heartbeat в БД (StoreWriter.heartbeat, upsert).
+# Своя константа, а НЕ настройка супервизора: тот тянет пул прокси и решает
+# за демон, а воркеру важно только подтверждать, что его цикл работает.
+# Контракт с противоположной стороны: супервизор объявляет воркера зависшим
+# через stale_after = 3 x 5 с, поэтому интервал обязан быть заметно меньше
+# порога — иначе живой воркер погиб бы от ложного срабатывания.
+# Пишет отдельный поток, а не цикл: сценарий может минутами висеть в
+# браузере, и heartbeat обязан идти всё это время — иначе длинный, но
+# здоровый прогон выглядел бы зависанием.
+WORKER_HEARTBEAT_INTERVAL_SECONDS = 5.0
+
+# Сколько ждать завершения heartbeat-потока при остановке. Нужен только на
+# случай, если запись уже идёт (sqlite busy_timeout — 5 с): обычный стоп
+# мгновенный, потому что поток спит в Event.wait и просыпается по флагу.
+HEARTBEAT_STOP_GRACE_SECONDS = 10.0
+
 # Переменные окружения, которые супервизор передаёт воркеру.
 BROWSER_ID_ENV = "ADCLICKER_BROWSER_ID"
 DB_ENV = "ADCLICKER_DB"
@@ -81,9 +99,11 @@ __all__ = [
     "PAUSE_POLL_SECONDS",
     "POOL_SIZE_ENV",
     "PROXY_ENV",
+    "HeartbeatSender",
     "ScenarioRequest",
     "ScheduleSettings",
     "SourceError",
+    "WORKER_HEARTBEAT_INTERVAL_SECONDS",
     "WorkSource",
     "WorkerRunner",
     "legacy_source",
@@ -157,10 +177,92 @@ class WorkSource(Protocol):
 WaitReason = tuple[str, str]
 
 
+# --- heartbeat воркера ------------------------------------------------------
+
+
+class HeartbeatSender:
+    """Фоновая запись heartbeat от имени воркера.
+
+    Воркер — единственный, кто может подтвердить, что его цикл работает:
+    только живой процесс способен писать ``heartbeat_at`` в БД. Супервизор
+    heartbeat не пишет — он наблюдает за ростом значения и по отсутствию
+    роста помечает воркера зависшим, поэтому поток обязан переживать любую
+    долгую работу цикла. Отсюда daemon-поток, а не точка в цикле: сценарий
+    в браузере может идти дольше порога stale (15 с), и запись из цикла
+    замолчала бы ровно на время самого тяжёлого прогона.
+
+    Остановка — явный ``stop()`` из ``main()`` ПЕРЕД ``writer.close()``:
+    ``Event`` будит сон немедленно, а ``join()`` гарантирует, что записи в
+    уже закрытый writer не будет. Ошибки записи не роняют поток: контракт
+    ``StoreWriter`` — не бросать, счётчики ``dropped``/``last_error`` хранят
+    причину, а нарушение контракта уходит в ``logs`` тем же writer'ом —
+    молчаливая смерть потока выглядела бы как зависание воркера.
+    """
+
+    def __init__(
+        self,
+        writer: StoreWriter,
+        browser_id: str,
+        interval: float | None = None,
+    ):
+        if interval is not None and interval <= 0:
+            raise ValueError(f"interval должен быть положительным, получено {interval!r}")
+        self._writer = writer
+        self._browser_id = browser_id
+        self._interval = (
+            WORKER_HEARTBEAT_INTERVAL_SECONDS if interval is None else interval
+        )
+        self._halt = threading.Event()
+        self._thread: threading.Thread | None = None
+
+    @property
+    def is_running(self) -> bool:
+        thread = self._thread
+        return thread is not None and thread.is_alive()
+
+    def start(self) -> None:
+        """Запускает поток. Повторный вызов — no-op, а не второй поток."""
+        if self._thread is not None:
+            return
+        self._thread = threading.Thread(
+            target=self._run, name="worker-heartbeat", daemon=True
+        )
+        self._thread.start()
+
+    def stop(self) -> None:
+        """Гасит поток и дожидается его. Вызывается до ``writer.close()``."""
+        self._halt.set()
+        thread = self._thread
+        if thread is not None and thread is not threading.current_thread():
+            thread.join(timeout=HEARTBEAT_STOP_GRACE_SECONDS)
+
+    def _run(self) -> None:
+        # Первый heartbeat сразу, без ожидания интервала: строка воркера
+        # становится свежей в тот же момент, когда процесс начал работать.
+        while True:
+            self._beat()
+            if self._halt.wait(self._interval):
+                return
+
+    def _beat(self) -> None:
+        try:
+            self._writer.heartbeat(self._browser_id)
+        except Exception as exc:  # noqa: BLE001 - контракт writer'а: не бросает
+            self._writer.log(
+                "ERROR",
+                "scheduler",
+                "worker heartbeat write failed",
+                browser_id=self._browser_id,
+                fields={"error": str(exc), "error_type": type(exc).__name__},
+            )
+
+
 class WorkerRunner:
     """Цикл воркера.
 
-    Потокобезопасности внутри нет и не нужно: у воркера один поток, а остановка
+    Потокобезопасности внутри нет и не нужно: цикл ведёт один поток, а
+    heartbeat-поток (:class:`HeartbeatSender`) пишет только через
+    потокобезопасный ``StoreWriter`` и сюда не заглядывает. Остановка
     приходит из обработчика сигнала, который только ставит ``stop_event``.
     """
 
@@ -704,10 +806,15 @@ def main(
     writer = StoreWriter(db_path)
     logger = StructuredLogger(writer, browser_id)
     stop = stop_event if stop_event is not None else threading.Event()
+    heartbeat = HeartbeatSender(writer, browser_id)
     previous_handlers: dict[int, Any] = {}
 
     try:
         previous_handlers = _install_signal_handlers(stop)
+        # Heartbeat стартует после инициализации store/writer и до цикла:
+        # строка воркера должна стать живой сразу после старта процесса, а
+        # не после первого сценария.
+        heartbeat.start()
         runner = WorkerRunner(
             browser_id=browser_id,
             store=store,
@@ -721,6 +828,10 @@ def main(
         # Порядок важен: сначала снимаем свои обработчики, потом гасим writer —
         # иначе SIGTERM, пришедший между ними, доставил бы флаг уже никому.
         _restore_signal_handlers(previous_handlers)
+        # Heartbeat-поток останавливается и дожидается ДО close(): иначе он
+        # мог бы дописать запись уже в закрытый writer. Поздняя запись была бы
+        # отброшена счётчиком потерь, но гонку с close() лучше не устраивать.
+        heartbeat.stop()
         writer.close()
 
 
