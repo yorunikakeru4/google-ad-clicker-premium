@@ -105,6 +105,24 @@ class TestProxies:
         with pytest.raises(SourceError, match="proxy_file"):
             source.proxies()
 
+    def test_env_proxy_wins_over_every_legacy_source(
+        self, source, set_paths, sandbox_dir, config, monkeypatch
+    ):
+        """Супервизор назначает прокси через env — файл и конфиг не главнее."""
+        set_paths(proxy_file=str(sandbox_dir / "proxies.txt"))
+        monkeypatch.setattr(config.webdriver, "proxy", "10.0.0.1:8080")
+        monkeypatch.setenv("ADCLICKER_PROXY", "user:pass@10.0.0.1:9999")
+
+        assert source.proxies() == ["user:pass@10.0.0.1:9999"]
+
+    def test_empty_env_keeps_the_legacy_sources(
+        self, source, set_paths, sandbox_dir, monkeypatch
+    ):
+        set_paths(proxy_file=str(sandbox_dir / "proxies.txt"))
+        monkeypatch.setenv("ADCLICKER_PROXY", "")
+
+        assert source.proxies() == ["127.0.0.1:8080", "user:pass@10.0.0.1:3128"]
+
 
 class TestReloadSettings:
     """Перечитывание конфига: норма и отказ."""

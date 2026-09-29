@@ -531,6 +531,28 @@ def test_pool_size_is_absent_when_supervisor_did_not_set_it():
     assert pool_size_from_environ({}) is None
 
 
+@pytest.mark.parametrize(
+    "raw,expected",
+    [
+        ("user:pass@10.0.0.1:3128", "user:pass@10.0.0.1:3128"),
+        ("  10.0.0.1:3128  ", "10.0.0.1:3128"),
+        ("", None),
+        ("   ", None),
+    ],
+)
+def test_proxy_env_is_parsed_from_environment(raw, expected):
+    """Фиксированный env-контракт: ADCLICKER_PROXY читается и чистится здесь."""
+    from engine.worker import proxy_from_environ
+
+    assert proxy_from_environ({"ADCLICKER_PROXY": raw}) == expected
+
+
+def test_proxy_env_is_absent_when_supervisor_did_not_set_it():
+    from engine.worker import proxy_from_environ
+
+    assert proxy_from_environ({}) is None
+
+
 def test_main_requires_browser_id(capsys, monkeypatch):
     monkeypatch.delenv("ADCLICKER_BROWSER_ID", raising=False)
 

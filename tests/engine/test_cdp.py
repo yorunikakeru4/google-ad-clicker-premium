@@ -708,6 +708,143 @@ def test_client_recovers_after_recv_failure() -> None:
         client.stop()
 
 
+class TestConnectionLostCallback:
+    """``on_connection_lost``: обрыв CDP доходит до вызывающего кода один раз.
+
+    Воркер по этому сигналу помечает себя деградировавшим (план.md §2.1:
+    «разрыв WebSocket → воркер считается деградировавшим»), поэтому колбэк
+    обязан сработать на обрыве установленного соединения, не сработать на
+    штатном stop() и не размножиться на каждую неудачную попытку
+    переподключения.
+    """
+
+    def test_fires_once_when_established_connection_drops(self) -> None:
+        ws = _FlakyRecvWs()
+        attempts: list[str] = []
+        lost: list[str] = []
+
+        def factory(url: str, timeout: float) -> FakeWs:
+            attempts.append(url)
+            if len(attempts) == 1:
+                return ws
+            raise ConnectionError("down")
+
+        client = CdpClient(
+            "ws://127.0.0.1:1/x",
+            ws_factory=factory,
+            on_connection_lost=lambda: lost.append("lost"),
+            initial_backoff=0.01,
+            max_backoff=0.02,
+        )
+        client.start(timeout=2.0)
+        try:
+            assert client.connected
+            ws.fail = True
+
+            assert _wait_until(lambda: bool(lost), timeout=3.0), lost
+            # Переподключения падают одно за другим — сигнала на каждое не нужно.
+            time.sleep(0.3)
+            assert lost == ["lost"]
+        finally:
+            client.stop()
+
+    def test_fires_again_after_a_successful_reconnect(self) -> None:
+        first, second = _FlakyRecvWs(), _FlakyRecvWs()
+        sockets: list[FakeWs] = []
+        lost: list[str] = []
+
+        def factory(url: str, timeout: float) -> FakeWs:
+            if len(sockets) >= 2:
+                raise ConnectionError("down")
+            sockets.append(first if not sockets else second)
+            return sockets[-1]
+
+        client = CdpClient(
+            "ws://127.0.0.1:1/x",
+            ws_factory=factory,
+            on_connection_lost=lambda: lost.append("lost"),
+            initial_backoff=0.01,
+            max_backoff=0.02,
+        )
+        client.start(timeout=2.0)
+        try:
+            first.fail = True
+            assert _wait_until(lambda: len(lost) == 1, timeout=3.0), lost
+            assert _wait_until(lambda: client.connected, timeout=3.0)
+            second.fail = True
+            assert _wait_until(lambda: len(lost) == 2, timeout=3.0), lost
+        finally:
+            client.stop()
+
+    def test_stop_is_not_reported_as_a_connection_loss(self) -> None:
+        ws = FakeWs()
+        lost: list[str] = []
+
+        client = CdpClient(
+            "ws://127.0.0.1:1/x",
+            ws_factory=lambda url, timeout: ws,
+            on_connection_lost=lambda: lost.append("lost"),
+        )
+        client.start(timeout=2.0)
+
+        client.stop()
+
+        assert lost == []
+
+    def test_callback_failure_does_not_break_the_receive_loop(self) -> None:
+        ws = _FlakyRecvWs()
+        attempts: list[str] = []
+
+        def factory(url: str, timeout: float) -> FakeWs:
+            attempts.append(url)
+            if len(attempts) == 1:
+                return ws
+            raise ConnectionError("down")
+
+        def broken_callback() -> None:
+            raise RuntimeError("reporter is broken")
+
+        client = CdpClient(
+            "ws://127.0.0.1:1/x",
+            ws_factory=factory,
+            on_connection_lost=broken_callback,
+            initial_backoff=0.01,
+            max_backoff=0.02,
+        )
+        client.start(timeout=2.0)
+        try:
+            ws.fail = True
+
+            # Никакого падения потока приёма: клиент продолжает переподниматься.
+            assert _wait_until(lambda: len(attempts) >= 2, timeout=3.0), attempts
+        finally:
+            client.stop()
+
+    def test_client_without_callback_keeps_working(self) -> None:
+        ws = _FlakyRecvWs()
+        attempts: list[str] = []
+
+        def factory(url: str, timeout: float) -> FakeWs:
+            attempts.append(url)
+            if len(attempts) == 1:
+                return ws
+            raise ConnectionError("down")
+
+        client = CdpClient(
+            "ws://127.0.0.1:1/x",
+            ws_factory=factory,
+            initial_backoff=0.01,
+            max_backoff=0.02,
+        )
+        client.start(timeout=2.0)
+        try:
+            ws.fail = True
+
+            assert _wait_until(lambda: len(attempts) >= 2, timeout=3.0), attempts
+        finally:
+            client.stop()
+
+
 def test_poll_timeout_does_not_kill_loop() -> None:
     ws = FakeWs()
     client = _make_client(ws)

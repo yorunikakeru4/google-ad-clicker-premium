@@ -1,4 +1,4 @@
-"""Батчевый writer SQLite: логи, клики, сетевые запросы, запуски и heartbeat.
+"""Батчевый writer SQLite: логи, клики, сетевые запросы, запуски, heartbeat и деградация.
 
 Один writer на процесс, соединение держится открытым. Логи, клики и записи
 ``network_requests`` — частые append-операции, поэтому они буферизуются и
@@ -21,13 +21,15 @@
    покрыт тестами. Дублировать его в writer'е значило бы два места правды
    об одной таблице, поэтому writer делегирует их StateStore. Конфликта нет
    по построению: обе стороны пишут короткие транзакции под WAL.
-3. **Heartbeat — свой upsert, а не StateStore.heartbeat.** Супервизорский
+3. **Heartbeat и деградация — свои upsert'ы, а не StateStore.** Супервизорский
    heartbeat — это ``UPDATE`` существующей строки: супервизор регистрирует
    воркера до спавна. Воркер стучит со своей стороны и не может зависеть от
    того, успел ли супервизор создать строку (гонка между процессами),
    поэтому writer делает ``INSERT ... ON CONFLICT DO UPDATE`` только колонки
    ``heartbeat_at``. Существующие строки при этом не трогаются: ``status``,
    ``started_at`` и ``pid`` остаются как их поставил супервизор.
+   ``mark_degraded`` устроен так же, но пишет ``status='degraded'`` и
+   ``last_error`` — сигнал о нерабочем прокси/CDP не должен ждать батча.
 
 Политика ошибок записи: ошибка (закрытая БД, полный диск, битая схема) не
 роняет вызывающего. Незаписанный батч считается потерянным: ``dropped``
@@ -70,6 +72,16 @@ _HEARTBEAT_UPSERT = (
     "INSERT INTO workers (browser_id, status, started_at, heartbeat_at) "
     "VALUES (?, 'starting', ?, ?) "
     "ON CONFLICT (browser_id) DO UPDATE SET heartbeat_at = excluded.heartbeat_at"
+)
+# Сигнал деградации — второй немедленный upsert в workers. Как и heartbeat,
+# воркер не может ждать регистрации супервизора, поэтому строка вставляется
+# при необходимости, а из существующей меняются только status и last_error:
+# pid, started_at, restart_count и heartbeat_at остаются супервизорскими.
+_DEGRADED_UPSERT = (
+    "INSERT INTO workers (browser_id, status, started_at, last_error, heartbeat_at) "
+    "VALUES (?, 'degraded', ?, ?, ?) "
+    "ON CONFLICT (browser_id) DO UPDATE SET "
+    "status = 'degraded', last_error = excluded.last_error"
 )
 
 
@@ -264,6 +276,29 @@ class StoreWriter:
             except Exception as exc:
                 self._rollback_quietly_locked()
                 self._record_loss_locked(1, f"heartbeat {browser_id}: {exc}")
+
+    def mark_degraded(self, browser_id: str, reason: str) -> None:
+        """Пометить воркер деградировавшим: ``status='degraded'``, ``last_error``.
+
+        Немедленная запись, как у heartbeat: сигнал о нерабочем прокси/CDP не
+        должен ждать батча, иначе супервизор увидит его уже после смерти
+        воркера. Существующая строка меняется только в двух колонках — ``pid``,
+        ``started_at``, ``restart_count`` и ``heartbeat_at`` остаются как их
+        поставил супервизор: воркер не знает ни жизни процесса, ни числа
+        рестартов. Повторный вызов — не ошибка: причина заменяется на новую,
+        строка не дублируется. Политика ошибок та же, что у heartbeat.
+        """
+        stamp = time.time()
+        with self._lock:
+            if self._closed:
+                self._record_loss_locked(1, "writer закрыт: mark_degraded отброшен")
+                return
+            try:
+                self._conn.execute(_DEGRADED_UPSERT, (browser_id, stamp, reason, stamp))
+                self._conn.commit()
+            except Exception as exc:
+                self._rollback_quietly_locked()
+                self._record_loss_locked(1, f"mark_degraded {browser_id}: {exc}")
 
     # --- запуски: делегирование StateStore --------------------------------
 

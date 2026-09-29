@@ -322,3 +322,78 @@ class TestNetworkRecords:
         assert [r["url"] for r in rows] == ["https://site.test/p?token=SECRET123"]
         assert [r for r in caplog.records if r.name == legacy.__name__] == []
         assert "SECRET123" not in caplog.text
+
+
+def _workers(db_path):
+    with sqlite3.connect(db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        return conn.execute(
+            "SELECT browser_id, status, last_error FROM workers ORDER BY browser_id"
+        ).fetchall()
+
+
+class TestMarkDegraded:
+    """Деградация доходит до ``workers`` через логгер: биндинг и политика ошибок."""
+
+    def test_uses_bound_browser_id(self, writer, db_path):
+        logger = StructuredLogger(writer, browser_id="br-1")
+
+        logger.mark_degraded("cdp connection lost")
+
+        assert [(r["browser_id"], r["status"], r["last_error"]) for r in _workers(db_path)] == [
+            ("br-1", "degraded", "cdp connection lost"),
+        ]
+
+    def test_explicit_browser_id_overrides_bound_one(self, writer, db_path):
+        logger = StructuredLogger(writer, browser_id="br-1")
+
+        logger.mark_degraded("cdp connection lost", browser_id="br-2")
+
+        assert [(r["browser_id"], r["status"]) for r in _workers(db_path)] == [
+            ("br-2", "degraded"),
+        ]
+
+    def test_without_browser_id_writes_nothing_and_does_not_raise(self, writer, db_path):
+        """CLI-прогон без --id: писать некуда, но падать нельзя."""
+
+        logger = StructuredLogger(writer)
+
+        logger.mark_degraded("cdp connection lost")
+
+        assert _workers(db_path) == []
+        assert logger.dropped == 0
+        assert logger.last_error is None
+
+    def test_broken_store_counts_loss_and_never_raises(self):
+        logger = StructuredLogger(_BrokenStore(), browser_id="br-1")
+
+        logger.mark_degraded("cdp connection lost")
+
+        assert logger.dropped == 1
+        assert logger.last_error is not None
+
+    def test_unavailable_store_explains_itself_in_last_error(self):
+        from engine.log import _UnavailableStore
+
+        logger = StructuredLogger(_UnavailableStore("хранилище недоступно"), browser_id="br-1")
+
+        logger.mark_degraded("cdp connection lost")
+
+        assert logger.dropped == 1
+        assert logger.last_error is not None
+        assert "хранилище недоступно" in logger.last_error
+
+    def test_state_write_does_not_mirror_into_legacy_log(self, writer, db_path, caplog):
+        """Причина деградации живёт в ``workers``, а не дублируется в логи."""
+
+        legacy = __import__("logger")
+        logger = StructuredLogger(writer, browser_id="br-1", mirror=legacy_mirror)
+
+        with caplog.at_level(logging.DEBUG, logger=legacy.__name__):
+            logger.mark_degraded("cdp connection lost")
+        writer.flush()
+
+        assert [(r["status"], r["last_error"]) for r in _workers(db_path)] == [
+            ("degraded", "cdp connection lost"),
+        ]
+        assert [r for r in caplog.records if r.name == legacy.__name__] == []

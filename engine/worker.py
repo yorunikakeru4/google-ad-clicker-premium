@@ -31,7 +31,7 @@ import sys
 import threading
 from dataclasses import dataclass
 from datetime import datetime, time as clock_time
-from typing import Any, Callable, Protocol, Sequence
+from typing import Any, Callable, Mapping, Protocol, Sequence
 
 from engine.control_plane.state import StateStore
 from engine.db import migrations
@@ -63,6 +63,11 @@ DB_ENV = "ADCLICKER_DB"
 # воркеров, а не по behavior.browser_count: API позволяет запустить иное
 # число, и без этого два браузера брали бы один и тот же запрос.
 POOL_SIZE_ENV = "ADCLICKER_POOL_SIZE"
+# Прокси, назначенный воркеру супервизором. Формат — как в proxies.txt:
+# user:pass@host:port. Пусто/не задано = legacy-поведение (список из
+# config.paths.proxy_file). Контракт фиксированный: читают его и воркер,
+# и ad_clicker.resolve_proxy, передаёт супервизор.
+PROXY_ENV = "ADCLICKER_PROXY"
 
 # Сигналы, по которым воркер завершается. Оба превращаются в установку флага:
 # тяжёлая работа внутри обработчика сигнала недопустима.
@@ -75,6 +80,7 @@ __all__ = [
     "EXIT_OK",
     "PAUSE_POLL_SECONDS",
     "POOL_SIZE_ENV",
+    "PROXY_ENV",
     "ScenarioRequest",
     "ScheduleSettings",
     "SourceError",
@@ -83,6 +89,7 @@ __all__ = [
     "legacy_source",
     "main",
     "pool_size_from_environ",
+    "proxy_from_environ",
 ]
 
 
@@ -455,6 +462,12 @@ class _LegacySource:
         return _read_items("paths.query_file", path, _legacy_queries)
 
     def proxies(self) -> list[str]:
+        # Env-контракт супервизора главнее legacy-источников: прокси,
+        # закреплённый за воркером, не должен зависеть от файла со списком
+        # или от webdriver.proxy. Пустая переменная — прежний путь ниже.
+        assigned = proxy_from_environ()
+        if assigned is not None:
+            return [assigned]
         # Наследие legacy: список шёл из файла, одиночный прокси — из
         # webdriver.proxy. run_ad_clicker падал, если не было файла; воркер
         # в этом случае работает с одним и тем же прокси напрямую, а при
@@ -616,6 +629,20 @@ def pool_size_from_environ(environ: dict[str, str] | None = None) -> int | None:
         return None
     value = int(raw)
     return value if value >= 1 else None
+
+
+def proxy_from_environ(environ: Mapping[str, str] | None = None) -> str | None:
+    """Прокси, назначенное супервизором через ``ADCLICKER_PROXY``. None — не задано.
+
+    Пустое значение и значение из пробелов — «не назначено», а не ошибка:
+    переменная есть в окружении воркера и тогда, когда супервизор прокси не
+    выдавал, и падать на ней нельзя. Пробелы по краям срезаются — значение
+    проходит через env без кавычек. ``environ`` — параметр ради тестов, как у
+    :func:`pool_size_from_environ`.
+    """
+    source = os.environ if environ is None else environ
+    value = source.get(PROXY_ENV, "").strip()
+    return value or None
 
 
 def _install_signal_handlers(stop_event: threading.Event) -> dict[int, object]:

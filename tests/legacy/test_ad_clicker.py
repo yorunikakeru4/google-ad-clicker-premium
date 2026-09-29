@@ -149,6 +149,41 @@ class TestResolveProxy:
         assert resolve_proxy(parse([])) is None
 
 
+class TestResolveProxyEnv:
+    """Env-контракт супервизора: ``ADCLICKER_PROXY`` главнее legacy-источников.
+
+    Супервизор закрепляет прокси за воркером и передаёт его через окружение;
+    legacy-путь (файл со списком, ``random.choice``) остаётся для одиночного
+    запуска и при пустой переменной.
+    """
+
+    def test_env_proxy_wins_over_the_proxy_file(
+        self, config, set_paths, sandbox_dir, monkeypatch
+    ):
+        set_paths(proxy_file=str(sandbox_dir / "proxies.txt"))
+        monkeypatch.setenv("ADCLICKER_PROXY", "user:pass@10.0.0.1:9999")
+
+        assert resolve_proxy(parse([])) == "user:pass@10.0.0.1:9999"
+
+    def test_env_proxy_wins_over_the_cli_argument(self, monkeypatch):
+        monkeypatch.setenv("ADCLICKER_PROXY", "user:pass@10.0.0.1:9999")
+
+        assert resolve_proxy(parse(["-p", "1.2.3.4:80"])) == "user:pass@10.0.0.1:9999"
+
+    def test_env_proxy_is_trimmed(self, monkeypatch):
+        monkeypatch.setenv("ADCLICKER_PROXY", "  user:pass@10.0.0.1:9999  ")
+
+        assert resolve_proxy(parse([])) == "user:pass@10.0.0.1:9999"
+
+    def test_empty_env_keeps_the_legacy_choice(
+        self, config, set_paths, sandbox_dir, monkeypatch
+    ):
+        set_paths(proxy_file=str(sandbox_dir / "proxies.txt"))
+        monkeypatch.setenv("ADCLICKER_PROXY", "")
+
+        assert resolve_proxy(parse([])) in {"127.0.0.1:8080", "user:pass@10.0.0.1:3128"}
+
+
 class TestMainDispatch:
     """main() разбирает argv и передаёт управление в run_scenario."""
 

@@ -6,11 +6,17 @@
 """
 
 import json
+import os
+import shutil
+import subprocess
+import sys
+from pathlib import Path
 
 import pytest
 
 from engine.control_plane import config as config_module
 from engine.control_plane.config import Config, ConfigError
+from engine.proxy_auth import DEFAULT_PROXY_TRANSPORT, PROXY_TRANSPORTS
 
 SECRET_MASK = config_module.SECRET_MASK
 
@@ -371,3 +377,103 @@ class TestFileIO:
         cfg.save(path)
 
         assert sorted(p.name for p in tmp_path.iterdir()) == ["config.json"]
+
+
+class TestProxyTransport:
+    """``webdriver.proxy_transport``: enum из ``engine.proxy_auth``, не своя копия.
+
+    Значения и дефолт берутся из того же модуля, что и ``resolve_proxy_transport``:
+    два независимых словаря разъехались бы уже на четвёртом транспорте, а ошибка
+    вылезла бы только на стенде, когда Chrome молча поехал бы не туда.
+    """
+
+    @pytest.mark.parametrize("value", ["cdp_auth", "extension", "direct"])
+    def test_accepts_every_known_transport(self, value):
+        cfg = Config.from_dict(_raw(webdriver__proxy_transport=value))
+
+        assert cfg.get("webdriver.proxy_transport") == value
+
+    def test_default_is_cdp_auth(self):
+        assert config_module.default_config()["webdriver"]["proxy_transport"] == "cdp_auth"
+        assert Config.from_dict(_raw()).get("webdriver.proxy_transport") == "cdp_auth"
+
+    def test_default_matches_the_constant_from_proxy_auth(self):
+        assert config_module.default_config()["webdriver"]["proxy_transport"] == (
+            DEFAULT_PROXY_TRANSPORT
+        )
+
+    def test_config_without_the_key_keeps_working(self):
+        """Конфиг старой версии: ключа нет, но демон стартует и читает значение."""
+        raw = _raw()
+        del raw["webdriver"]["proxy_transport"]
+
+        assert Config.from_dict(raw).get("webdriver.proxy_transport") == "cdp_auth"
+
+    def test_unknown_transport_is_a_readable_problem(self):
+        raw = _raw(webdriver__proxy_transport="socks")
+
+        with pytest.raises(ConfigError) as excinfo:
+            Config.from_dict(raw)
+
+        problems = excinfo.value.problems
+        assert [problem["field"] for problem in problems] == ["webdriver.proxy_transport"]
+        message = problems[0]["message"]
+        assert "ожидается одно из" in message
+        for value in PROXY_TRANSPORTS:
+            assert value in message
+
+    def test_non_string_transport_reports_the_expected_type(self):
+        with pytest.raises(ConfigError) as excinfo:
+            Config.from_dict(_raw(webdriver__proxy_transport=42))
+
+        problems = excinfo.value.problems
+        assert [problem["field"] for problem in problems] == ["webdriver.proxy_transport"]
+        assert "str" in problems[0]["message"]
+
+    def test_allowed_values_are_exactly_the_proxy_auth_set(self):
+        """Страховка от второго места правды для словаря значений."""
+        assert config_module._ENUM_FIELDS["webdriver.proxy_transport"] == PROXY_TRANSPORTS
+
+    def test_patch_can_change_the_transport(self):
+        cfg = Config.from_dict(_raw())
+
+        patched = cfg.patch({"webdriver": {"proxy_transport": "direct"}})
+
+        assert patched.get("webdriver.proxy_transport") == "direct"
+        assert cfg.get("webdriver.proxy_transport") == "cdp_auth"
+
+
+class TestImportHasNoSideEffects:
+    """Импорт конфигурации не должен открывать БД логов.
+
+    Супервизор читает конфиг раньше, чем узнаёт, какую БД обслуживать
+    (``--db``): если сам импорт создаёт ``StoreWriter``, демон оставляет
+    ``adclicker.db`` в чужом каталоге и независимо от указанного пути. То же
+    касается ``config_reader`` — его читает legacy-код.
+    """
+
+    def test_importing_config_modules_does_not_create_the_log_db(self, tmp_path):
+        repo_root = Path(__file__).resolve().parents[3]
+        shutil.copy(repo_root / "config.json", tmp_path / "config.json")
+        env = dict(os.environ)
+        # Путь к БД указываем явно: conftest прописывает его в окружении
+        # pytest, и без переопределения файл создался бы вне tmp_path.
+        env["ADCLICKER_DB"] = str(tmp_path / "unexpected-logger-db.db")
+        env["PYTHONPATH"] = str(repo_root)
+
+        result = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                "import config_reader; import engine.control_plane.config",
+            ],
+            cwd=tmp_path,
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+
+        assert result.returncode == 0, result.stderr
+        assert not (tmp_path / "unexpected-logger-db.db").exists()
+        assert not (tmp_path / "adclicker.db").exists()

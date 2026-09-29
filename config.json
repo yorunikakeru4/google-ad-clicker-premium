@@ -14,7 +14,8 @@
         "ss_on_exception": false,
         "window_size": "",
         "shift_windows": false,
-        "use_seleniumbase": false
+        "use_seleniumbase": false,
+        "proxy_transport": "cdp_auth"
     },
     "behavior": {
         "query": "",

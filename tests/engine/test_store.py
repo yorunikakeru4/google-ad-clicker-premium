@@ -339,6 +339,96 @@ class TestRunsAndHeartbeat:
             writer.close()
 
 
+class TestMarkDegraded:
+    """Сигнал деградации: ``status='degraded'`` и ``last_error``, и ничего больше.
+
+    Колонки ``pid``/``started_at``/``restart_count``/``heartbeat_at`` —
+    супервизорские: воркер не знает, жив ли его процесс и был ли перезапуск,
+    поэтому его запись не должна их перетирать (тот же порядок, что у
+    heartbeat-upsert).
+    """
+
+    def test_marks_existing_row_without_touching_supervisor_columns(self, db_path):
+        from engine.control_plane.state import StateStore, WorkerStatus
+
+        state = StateStore(db_path)
+        state.register_worker("br-1", pid=100, now=1000.0)
+        state.set_status("br-1", WorkerStatus.RUNNING)
+        state.increment_restart_count("br-1")
+
+        writer = StoreWriter(db_path, batch_size=100, flush_interval=60.0)
+        try:
+            writer.mark_degraded("br-1", "cdp connection lost")
+
+            rows = _read(
+                db_path,
+                "SELECT status, last_error, pid, started_at, restart_count, heartbeat_at "
+                "FROM workers WHERE browser_id = 'br-1'",
+            )
+            assert len(rows) == 1
+            row = rows[0]
+            assert row["status"] == "degraded"
+            assert row["last_error"] == "cdp connection lost"
+            assert row["pid"] == 100
+            assert row["started_at"] == 1000.0
+            assert row["restart_count"] == 1
+            assert row["heartbeat_at"] == 1000.0
+        finally:
+            writer.close()
+
+    def test_creates_the_row_when_worker_was_never_registered(self, db_path):
+        writer = StoreWriter(db_path, batch_size=100, flush_interval=60.0)
+        try:
+            writer.mark_degraded("br-new", "proxy rejected credentials")
+
+            rows = _read(
+                db_path,
+                "SELECT status, last_error, pid FROM workers WHERE browser_id = 'br-new'",
+            )
+            assert [(r["status"], r["last_error"], r["pid"]) for r in rows] == [
+                ("degraded", "proxy rejected credentials", None),
+            ]
+        finally:
+            writer.close()
+
+    def test_repeated_marks_keep_one_row_and_replace_the_reason(self, db_path):
+        writer = StoreWriter(db_path, batch_size=100, flush_interval=60.0)
+        try:
+            writer.mark_degraded("br-1", "cdp connection lost")
+            writer.mark_degraded("br-1", "proxy rejected credentials")
+
+            rows = _read(
+                db_path,
+                "SELECT status, last_error FROM workers WHERE browser_id = 'br-1'",
+            )
+            assert [(r["status"], r["last_error"]) for r in rows] == [
+                ("degraded", "proxy rejected credentials"),
+            ]
+        finally:
+            writer.close()
+
+    def test_write_error_does_not_raise_and_counts_losses(self, db_path):
+        writer = StoreWriter(db_path, batch_size=100, flush_interval=60.0)
+        try:
+            writer._conn.close()
+
+            writer.mark_degraded("br-1", "cdp connection lost")
+
+            assert writer.dropped >= 1
+            assert writer.last_error is not None
+        finally:
+            writer.close()
+
+    def test_closed_writer_does_not_raise_and_counts_losses(self, db_path):
+        writer = StoreWriter(db_path, batch_size=100, flush_interval=60.0)
+        writer.close()
+
+        writer.mark_degraded("br-1", "cdp connection lost")
+
+        assert writer.dropped >= 1
+        assert writer.last_error is not None
+
+
 class TestConstructor:
     def test_rejects_non_positive_batch_size(self, db_path):
         with pytest.raises(ValueError):

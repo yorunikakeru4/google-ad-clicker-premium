@@ -102,6 +102,32 @@ class TestStructureAndTypes:
             == []
         )
 
+    @pytest.mark.parametrize("value", ["cdp_auth", "extension", "direct"])
+    def test_accepts_every_known_proxy_transport(self, tmp_path, value):
+        assert (
+            validate_settings(
+                _raw(webdriver__proxy_transport=value), base_dir=_base_dir(tmp_path)
+            )
+            == []
+        )
+
+    def test_reports_unknown_proxy_transport_as_one_of(self, tmp_path):
+        problems = validate_settings(
+            _raw(webdriver__proxy_transport="socks"), base_dir=_base_dir(tmp_path)
+        )
+
+        assert _fields(problems) == ["webdriver.proxy_transport"]
+        assert "ожидается одно из" in problems[0]["message"]
+        assert "cdp_auth" in problems[0]["message"]
+
+    def test_reports_non_string_proxy_transport(self, tmp_path):
+        problems = validate_settings(
+            _raw(webdriver__proxy_transport=True), base_dir=_base_dir(tmp_path)
+        )
+
+        assert _fields(problems) == ["webdriver.proxy_transport"]
+        assert "str" in problems[0]["message"]
+
 
 class TestExclusivity:
     """Взаимная exclusivity: каждая сторона конфликта получает своё сообщение."""
