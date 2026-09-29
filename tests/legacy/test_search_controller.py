@@ -896,6 +896,21 @@ class TestProfileCookies:
             "значения cookies — сессионные креды, в логи не попадают"
         )
 
+    def test_profile_cookies_are_applied_in_seleniumbase_mode_too(
+        self, make_search_controller, assign_profile, monkeypatch, config
+    ):
+        """Хук cookies живёт в самом контроллере, а не в UC-драйвере."""
+        monkeypatch.setattr(config.webdriver, "use_seleniumbase", True)
+        assign_profile(cookies=[PROFILE_COOKIE])
+        driver = ProfileCookieDriver()
+        driver.uc_open_with_reconnect = lambda url, reconnect_time: driver.visited.append(url)
+        controller = make_search_controller(driver=driver)
+
+        controller._apply_cookies()
+
+        assert driver.cookies_deleted == 1
+        assert [cookie["name"] for cookie in driver.added] == ["sid"]
+
 
 class TestProfileCookiesSave:
     """Выгрузка cookies браузера в файл профиля на выходе из сценария."""
