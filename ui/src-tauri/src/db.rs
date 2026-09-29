@@ -35,6 +35,10 @@ pub enum DbError {
     OpenFailed { path: String, reason: String },
     /// Соединение открыто, но запрос к базе не удался.
     ReadFailed { reason: String },
+    /// Читателя ещё нет: `db_open` не вызван или завершился ошибкой.
+    /// Отдельный вариант, а не ReadFailed: UI различает «база закрыта» и
+    /// «запрос сломался».
+    NotOpen,
 }
 
 impl fmt::Display for DbError {
@@ -49,6 +53,10 @@ impl fmt::Display for DbError {
                 write!(f, "Не удалось открыть базу {path}: {reason}")
             }
             DbError::ReadFailed { reason } => write!(f, "Ошибка чтения из базы: {reason}"),
+            DbError::NotOpen => write!(
+                f,
+                "База данных не открыта: сначала вызовите db_open с путём к файлу."
+            ),
         }
     }
 }
