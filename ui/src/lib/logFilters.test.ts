@@ -92,7 +92,7 @@ describe("sanitizeLogFilters", () => {
     });
     expect(sanitized.since).toBeNull();
     expect(sanitized.until).toBeNull();
-    expect(sanitized.level).toBe("ERROR", "остальные поля окно не трогает");
+    expect(sanitized.level, "остальные поля окно не трогает").toBe("ERROR");
   });
 
   it("отсутствующие поля значений равны пустым", () => {

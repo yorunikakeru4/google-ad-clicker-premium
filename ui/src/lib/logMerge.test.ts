@@ -84,7 +84,7 @@ describe("mergeLogRows", () => {
 
     const merged = mergeLogRows(existing, incoming, 3);
 
-    expect(merged.map((r) => r.id)).toEqual([6, 5, 4], "вытеснен id 3");
+    expect(merged.map((r) => r.id), "вытеснен id 3").toEqual([6, 5, 4]);
   });
 
   it("курсор берётся от самой старой строки", () => {
@@ -105,7 +105,7 @@ describe("fetchNewRows", () => {
     const fresh = await fetchNewRows(fetch, newestKnown, 3, 100);
 
     expect(fresh.map((r) => r.id)).toEqual([20, 19, 18, 17, 16, 15, 14, 13, 12, 11]);
-    expect(calls).toHaveLength(4, "шёл до страницы, пересекшей известные");
+    expect(calls, "шёл до страницы, пересекшей известные").toHaveLength(4);
   });
 
   it("новых строк нет — одна страница и пустой результат", async () => {
@@ -114,7 +114,7 @@ describe("fetchNewRows", () => {
     const fresh = await fetchNewRows(fetch, { ts: 20, id: 20 }, 5, 100);
 
     expect(fresh).toEqual([]);
-    expect(calls).toHaveLength(1, "пересечение найдено на первой странице");
+    expect(calls, "пересечение найдено на первой странице").toHaveLength(1);
   });
 
   it("без известных строк (первая загрузка) отдаёт одну страницу", async () => {
@@ -123,7 +123,7 @@ describe("fetchNewRows", () => {
     const fresh = await fetchNewRows(fetch, null, 4, 100);
 
     expect(fresh.map((r) => r.id)).toEqual([20, 19, 18, 17]);
-    expect(calls).toHaveLength(1, "обход вглубь не нужен");
+    expect(calls, "обход вглубь не нужен").toHaveLength(1);
   });
 
   it("короткая страница означает конец базы", async () => {
@@ -132,7 +132,7 @@ describe("fetchNewRows", () => {
     const fresh = await fetchNewRows(fetch, null, 50, 100);
 
     expect(fresh).toHaveLength(20);
-    expect(calls).toHaveLength(1, "вторая страница не запрашивается");
+    expect(calls, "вторая страница не запрашивается").toHaveLength(1);
   });
 
   it("лимит сканирования останавливает обход даже без пересечения", async () => {
@@ -140,8 +140,8 @@ describe("fetchNewRows", () => {
 
     const fresh = await fetchNewRows(fetch, { ts: 0, id: 0 }, 3, 6);
 
-    expect(fresh).toHaveLength(6, "взяты ровно строки в пределах лимита");
-    expect(calls).toHaveLength(2, "больше лимита страниц не читается");
+    expect(fresh, "взяты ровно строки в пределах лимита").toHaveLength(6);
+    expect(calls, "больше лимита страниц не читается").toHaveLength(2);
   });
 });
 
@@ -175,7 +175,7 @@ describe("collectAllRows", () => {
     const rows = await collectAllRows(countingFetch, 3, 100);
 
     expect(rows).toHaveLength(4);
-    expect(pages).toBe(2, "короткая вторая страница — стоп, без третьего запроса");
+    expect(pages, "короткая вторая страница — стоп, без третьего запроса").toBe(2);
   });
 
   it("лимит строк ограничивает выгрузку", async () => {
@@ -184,7 +184,7 @@ describe("collectAllRows", () => {
 
     const rows = await collectAllRows(fetch, 3, 4);
 
-    expect(rows.map((r) => r.id)).toEqual([10, 9, 8, 7], "свежие, не старые");
+    expect(rows.map((r) => r.id), "свежие, не старые").toEqual([10, 9, 8, 7]);
   });
 
   it("пустая база — пустой список без лишних запросов", async () => {

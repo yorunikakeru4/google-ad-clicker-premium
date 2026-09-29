@@ -32,7 +32,10 @@ describe("buildHourlyBuckets", () => {
     const buckets = buildHourlyBuckets(0, 3600 * 5000);
 
     expect(buckets).toHaveLength(MAX_HOURLY_BUCKETS);
-    expect(buckets.at(-1)).toBe(3600 * 5000, "самый свежий час сохраняется");
+    expect(
+      buckets[buckets.length - 1],
+      "самый свежий час сохраняется",
+    ).toBe(3600 * 5000);
   });
 
   it("нефинитные границы — пустое окно, а не бесконечный цикл", () => {
