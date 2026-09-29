@@ -7,7 +7,7 @@
 
 Поэтому проверка инвертирована: во всём репозитории прямые вызовы разрешены
 только в белом списке — в самом legacy-модуле ``logger.py``, в модулях, которые
-ещё не мигрируют (``config_reader.py``, ``gui.py`` — свои фичи), и в тестах,
+ещё не мигрируют (``config_reader.py`` — свои фичи), и в тестах,
 которые проверяют или подменяют логгер.
 
 Тест читает файлы по тексту, а не по AST: он должен падать с понятным
@@ -28,7 +28,7 @@ REPO_ROOT = Path(__file__).resolve().parents[1]
 DIRECT_CALL = re.compile(r"(?<!\w)logger\.(?:debug|info|warning|error)\s*\(")
 
 # Файлы, которым разрешено звать legacy-логгер напрямую.
-WHITELIST_FILES = frozenset({"logger.py", "config_reader.py", "gui.py"})
+WHITELIST_FILES = frozenset({"logger.py", "config_reader.py"})
 
 # Каталоги, которым разрешено (тесты ловят и подменяют логгер).
 WHITELIST_DIRS = frozenset({"tests"})
@@ -107,7 +107,7 @@ def test_no_direct_legacy_logger_calls_outside_whitelist() -> None:
     assert not hits, (
         "Прямые вызовы logger.debug/info/warning/error остались в коде. "
         "Перенесите запись на engine.log.get_logger() с категорией и полями; "
-        "белый список — logger.py, config_reader.py, gui.py и каталог tests/.\n"
+        "белый список — logger.py, config_reader.py и каталог tests/.\n"
         "Первое нарушение:\n  " + "\n  ".join(hits)
     )
 

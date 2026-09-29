@@ -348,7 +348,7 @@ def _validate_file_paths(data: dict[str, Any], base_dir: Path) -> list[dict[str,
 def validate_settings(data: dict[str, Any], *, base_dir: str | Path | None = None) -> list[dict[str, str]]:
     """Публичная валидация настроек для UI: список проблем, а не исключение.
 
-    Точка входа для формы (Tauri-HTTP и ``gui.py``): типы, диапазоны,
+    Точка входа для формы настроек: типы, диапазоны,
     ``min <= max`` для пауз, ``ЧЧ:ММ`` для интервалов, взаимная exclusivity
     ``proxy_file``/``proxy`` и ``query_file``/``query``, границы
     ``browser_count``, допустимые значения ``webdriver.proxy_transport``, —

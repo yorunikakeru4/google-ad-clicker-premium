@@ -20,10 +20,10 @@
 
         # Everything the engine and the test suite need, provided by nix.
         #
-        # Two legacy deps are absent from nixpkgs and are NOT provided here:
-        #   - seleniumbase  -> only needed for webdriver.use_seleniumbase mode
-        #   - customtkinter -> only needed by the legacy gui.py, which the Tauri
-        #                      UI replaces; not needed by the test suite
+        # One legacy dep is absent from nixpkgs and is NOT provided here:
+        #   - seleniumbase -> only needed for webdriver.use_seleniumbase mode
+        # The Tk GUI dependency was dropped with the Tk GUI itself: the Tauri
+        # UI replaces it, and neither the code nor the tests import it.
         pythonDeps = ps: with ps; [
           # engine runtime
           selenium

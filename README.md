@@ -98,10 +98,7 @@ See [here](https://github.com/coskundeniz/ad_clicker/wiki/Setup-for-Windows) for
 
     The daemon supervises `python -m engine.worker` processes itself; start a worker by hand only for debugging.
 * Run `python ad_clicker.py` for a single run with a single browser, outside the daemon.
-* Run `python gui.py` for opening the following ui to configure/run.
-
-    ![gui](assets/ad_clicker_gui.png)
-
+* Run the Tauri desktop UI (settings, control buttons) with `cd ui && pnpm tauri dev`.
 * Run `python ad_clicker.py --report_clicks` for generating click report.
 * Run `python ad_clicker.py --report_clicks --date` for generating click report for the given date in DD-MM-YYYY format.
 * Run `python ad_clicker.py --report_clicks --excel` for generating click report and writing results to an Excel file.
