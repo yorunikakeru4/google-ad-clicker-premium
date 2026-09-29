@@ -165,6 +165,11 @@ pub fn parse_endpoint(base_url: &str) -> Result<Endpoint, String> {
 }
 
 /// Allowlist путей: даже с чужим телом прокси не уедет на произвольный URL.
+///
+/// Хвост `/control/` — сегменты из строчных латинских букв, разделённых
+/// одинарным `/`: это открывает подпути вида `/control/proxies/import`
+/// (контракт API прокси), но не открывает обход (`..`), верхний регистр,
+/// точку, пробел, перевод строки и произвольные URL.
 pub fn allowed_path(path: &str) -> bool {
     if !path.starts_with('/') || path.chars().any(|c| c.is_whitespace()) {
         return false;
@@ -173,7 +178,12 @@ pub fn allowed_path(path: &str) -> bool {
         return true;
     }
     match path.strip_prefix("/control/") {
-        Some(tail) => !tail.is_empty() && tail.chars().all(|c| c.is_ascii_lowercase()),
+        Some(tail) => {
+            !tail.is_empty()
+                && tail.split('/').all(|segment| {
+                    !segment.is_empty() && segment.chars().all(|c| c.is_ascii_lowercase())
+                })
+        }
         None => false,
     }
 }
@@ -500,6 +510,47 @@ mod tests {
         assert!(!allowed_path("/health q"));
         assert!(!allowed_path("health"));
         assert!(!allowed_path("/health\r\nX-Injected: 1"));
+    }
+
+    #[test]
+    fn allowlist_passes_proxies_endpoints_but_not_lookalikes() {
+        // Контракт API прокси: /control/proxies и его подпути.
+        assert!(allowed_path("/control/proxies"));
+        assert!(allowed_path("/control/proxies/import"));
+        assert!(allowed_path("/control/proxies/delete"));
+        assert!(allowed_path("/control/proxies/check"));
+
+        // Строки с обходом, регистром и запросом не проходят.
+        assert!(!allowed_path("/control/proxies/"));
+        assert!(!allowed_path("/control/proxies/Import"));
+        assert!(!allowed_path("/control/proxies/../state"));
+        assert!(!allowed_path("/control/proxies/import/../../state"));
+        assert!(!allowed_path("/control/proxies?all=1"));
+        assert!(!allowed_path("/control/proxies/delete\r\nX-Injected: 1"));
+    }
+
+    #[test]
+    fn request_carries_proxies_post_with_body_through_allowlist() {
+        let (endpoint, received, handle) = serve_once(response(
+            "HTTP/1.1 200 OK",
+            r#"{"added":1,"skipped":0,"problems":[]}"#,
+        ));
+        let base_url = format!("http://{}:{}", endpoint.host, endpoint.port);
+
+        let reply = request(
+            Some(TOKEN),
+            Some(&base_url),
+            "POST",
+            "/control/proxies",
+            Some(r#"{"lines":["http://a:8080"]}"#),
+        )
+        .unwrap();
+        handle.join().unwrap();
+
+        assert_eq!(reply.status, 200);
+        let request = received.recv().unwrap();
+        assert!(request.starts_with("POST /control/proxies HTTP/1.1"));
+        assert!(request.ends_with(r#"{"lines":["http://a:8080"]}"#));
     }
 
     #[test]

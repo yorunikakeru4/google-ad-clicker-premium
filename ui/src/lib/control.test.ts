@@ -4,6 +4,7 @@ import {
   controlRequest,
   disabledReason,
   errorMessage,
+  proxiesRequest,
   toStatusView,
   type StatusView,
 } from "./control";
@@ -88,6 +89,46 @@ describe("controlRequest", () => {
       method: "POST",
       path: "/control/restart",
     });
+  });
+});
+
+describe("proxiesRequest", () => {
+  it("каждое действие прокси уходит на свой endpoint с телом контракта", () => {
+    expect(proxiesRequest({ kind: "list" })).toEqual({
+      method: "GET",
+      path: "/control/proxies",
+    });
+    expect(
+      proxiesRequest({ kind: "add", lines: ["http://a.example:8080", "b:3128"] }),
+    ).toEqual({
+      method: "POST",
+      path: "/control/proxies",
+      body: JSON.stringify({ lines: ["http://a.example:8080", "b:3128"] }),
+    });
+    expect(proxiesRequest({ kind: "import" })).toEqual({
+      method: "POST",
+      path: "/control/proxies/import",
+      body: "{}",
+    });
+    expect(proxiesRequest({ kind: "delete", id: 7 })).toEqual({
+      method: "POST",
+      path: "/control/proxies/delete",
+      body: '{"id":7}',
+    });
+    expect(proxiesRequest({ kind: "check" })).toEqual({
+      method: "POST",
+      path: "/control/proxies/check",
+      body: "{}",
+    });
+  });
+
+  it("тело собирается из payload, а не из глобального состояния", () => {
+    const first = proxiesRequest({ kind: "add", lines: ["a:1"] });
+    const second = proxiesRequest({ kind: "delete", id: 42 });
+
+    expect(first.body).toBe(JSON.stringify({ lines: ["a:1"] }));
+    expect(second.body).toBe('{"id":42}');
+    expect(JSON.parse(second.body ?? "{}")).toEqual({ id: 42 });
   });
 });
 
