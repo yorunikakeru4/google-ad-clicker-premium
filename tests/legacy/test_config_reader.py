@@ -37,6 +37,7 @@ def test_read_parameters_maps_every_webdriver_option(make_config, base_config):
         "window_size": "1280,720",
         "shift_windows": True,
         "use_seleniumbase": True,
+        "proxy_transport": "direct",
     }
 
     webdriver = make_config(base_config).webdriver
@@ -50,6 +51,25 @@ def test_read_parameters_maps_every_webdriver_option(make_config, base_config):
     assert webdriver.window_size == "1280,720"
     assert webdriver.shift_windows is True
     assert webdriver.use_seleniumbase is True
+    assert webdriver.proxy_transport == "direct"
+
+
+def test_proxy_transport_defaults_to_cdp_auth_when_the_key_is_absent(
+    make_config, base_config
+):
+    """Старый config.json без ключа обязан читаться, дефолт — cdp_auth."""
+
+    assert "proxy_transport" not in base_config["webdriver"]
+
+    assert make_config(base_config).webdriver.proxy_transport == "cdp_auth"
+
+
+def test_proxy_transport_default_is_the_constant_from_proxy_auth(make_config, base_config):
+    """Дефолт legacy-чтения не должен разъезжаться с engine.proxy_auth."""
+
+    from engine.proxy_auth import DEFAULT_PROXY_TRANSPORT
+
+    assert make_config(base_config).webdriver.proxy_transport == DEFAULT_PROXY_TRANSPORT
 
 
 def test_read_parameters_maps_every_behavior_option(make_config, base_config):
