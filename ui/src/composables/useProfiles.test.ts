@@ -7,6 +7,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createProfiles, PROFILES_POLL_MS } from "./useProfiles";
 import type { ProfilesApi, ProfileChangeResult, ProfileRow } from "../lib/profiles";
+import type { WritableProfileStatus } from "../lib/control";
 import type { ProxyRow } from "../lib/proxies";
 
 function profileRow(overrides: Partial<ProfileRow> & { id: number }): ProfileRow {
@@ -437,7 +438,8 @@ describe("createProfiles: назначение и статус", () => {
       "Недопустимый статус: доступны free, blocked, error.",
     );
 
-    const ok = await profiles.setStatus(3, "active");
+    // "active" недопустим контрактом: отправляем осознанно, чтобы поймать 400.
+    const ok = await profiles.setStatus(3, "active" as WritableProfileStatus);
 
     expect(ok).toBe(false);
     expect(profiles.actionError.value).toContain("free, blocked, error");

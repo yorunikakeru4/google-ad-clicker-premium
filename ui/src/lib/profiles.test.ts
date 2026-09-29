@@ -18,6 +18,7 @@ import {
   toProfileTableRow,
   type ProfileRow,
 } from "./profiles";
+import type { WritableProfileStatus } from "./control";
 import type { ProxyRow } from "./proxies";
 import type { Transport } from "./daemonApi";
 
@@ -57,6 +58,15 @@ function transportOf(
 
 function errorBody(code: string, message?: string): string {
   return JSON.stringify({ error: { code, message } });
+}
+
+/** Убирает ключ fields: тест проверяет ответ демона, где поля вообще нет. */
+function withoutFields(
+  source: typeof PROFILE_JSON,
+): Omit<typeof PROFILE_JSON, "fields"> {
+  const copy: Partial<typeof PROFILE_JSON> = { ...source };
+  delete copy.fields;
+  return copy as Omit<typeof PROFILE_JSON, "fields">;
 }
 
 /** Строка списка: контрактные поля по умолчанию, сверху — только нужные тесту. */
@@ -131,7 +141,7 @@ describe("createProfilesApi: список", () => {
             { ...PROFILE_JSON, id: 1, fields: '{"raw":true}' },
             { ...PROFILE_JSON, id: 2, fields: { parsed: "объектом" } },
             { ...PROFILE_JSON, id: 3, fields: null },
-            { ...PROFILE_JSON, id: 4 },
+            { ...withoutFields(PROFILE_JSON), id: 4 },
           ],
         }),
       },
@@ -394,7 +404,10 @@ describe("createProfilesApi: удаление, назначение и стат�
     });
     const api = createProfilesApi(transport);
 
-    await expect(api.setStatus(3, "active")).rejects.toThrow(/free, blocked, error/);
+    // "active" недопустим контрактом: отправляем осознанно, чтобы поймать 400.
+    await expect(
+      api.setStatus(3, "active" as WritableProfileStatus),
+    ).rejects.toThrow(/free, blocked, error/);
   });
 
   it("не-JSON тело ошибки — код и начало тела, а не [object Object]", async () => {
@@ -589,7 +602,7 @@ describe("toProfileTableRow", () => {
     );
 
     expect(row.key_ref).toBe("hooks.KEY_9");
-    expect(row.fields).toBeNull();
+    expect(row.name).toBe("alpha");
   });
 });
 
@@ -597,7 +610,7 @@ describe("filterProfiles", () => {
   const rows: ProfileRow[] = [
     profileStub({ id: 1, name: "Alpha", status: "free" }),
     profileStub({ id: 2, name: "бета", status: "assigned" }),
-    profileStub({ id: 3, name: "gamma-2", status: "blocked" }),
+    profileStub({ id: 3, name: "Гамма-2", status: "blocked" }),
   ];
 
   it("пустые фильтры возвращают весь список", () => {
