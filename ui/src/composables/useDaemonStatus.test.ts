@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createDaemonStatus } from "./useDaemonStatus";
-import type { DaemonApi } from "./daemonApi";
+import type { DaemonApi } from "../lib/daemonApi";
+import type { Health, StateSnapshot } from "../lib/types";
 
 const HEALTH_BODY = JSON.stringify({
   status: "ok",
@@ -47,13 +48,21 @@ function fakeApi() {
     health: () => {
       calls.push("/health");
       return new Promise((resolve, reject) =>
-        pending.push({ path: "/health", resolve, reject }),
+        pending.push({
+          path: "/health",
+          resolve: (payload) => resolve(payload as Health),
+          reject,
+        }),
       );
     },
     state: () => {
       calls.push("/state");
       return new Promise((resolve, reject) =>
-        pending.push({ path: "/state", resolve, reject }),
+        pending.push({
+          path: "/state",
+          resolve: (payload) => resolve(payload as StateSnapshot),
+          reject,
+        }),
       );
     },
     control: vi.fn(async () => '{"state":"running"}'),
