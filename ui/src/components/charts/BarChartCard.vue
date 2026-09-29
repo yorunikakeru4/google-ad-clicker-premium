@@ -98,7 +98,7 @@ const empty = computed(() => props.labels.length === 0);
     <v-card-subtitle v-if="hint" class="pb-1">{{ hint }}</v-card-subtitle>
 
     <v-card-text class="pt-2">
-      <p v-if="empty" class="text-medium-emphasis mb-0" data-test="chart-empty">
+      <p v-if="empty" class="text-muted mb-0" data-test="chart-empty">
         Нет данных за окно графика
       </p>
       <div v-else class="chart-box">
