@@ -13,6 +13,8 @@ import type { CaptchaEvent } from "../../lib/captcha";
 
 defineProps<{
   events: CaptchaEvent[];
+  /** Первая загрузка: индикатор вместо «событий ещё не было». */
+  loading?: boolean;
   error?: string | null;
   screenshotError?: string | null;
 }>();
@@ -54,7 +56,18 @@ const emit = defineEmits<{
         {{ screenshotError }}
       </v-alert>
 
-      <v-table v-if="events.length > 0" density="compact" data-test="captcha-events">
+      <v-progress-linear
+        v-if="loading && events.length === 0"
+        indeterminate
+        class="mb-3"
+        data-test="captcha-feed-loading"
+      />
+
+      <v-table
+        v-else-if="events.length > 0"
+        density="compact"
+        data-test="captcha-events"
+      >
         <thead>
           <tr>
             <th>время</th>

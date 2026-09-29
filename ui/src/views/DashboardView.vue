@@ -237,6 +237,7 @@ const demoWindowHint = "окно 24 часа";
       <v-col cols="12">
         <CaptchaFeedCard
           :events="feed.events.value"
+          :loading="feed.loading.value"
           :error="feed.error.value"
           :screenshot-error="feed.screenshotError.value"
           @open-screenshot="feed.openShot"
