@@ -361,7 +361,7 @@ class TestRunRetention:
         result = run_retention(db_path, "2024-04-01", 30, export_dir)
 
         assert result.deleted_rows == 0
-        assert result.deleted_files == []
+        assert result.deleted_files == ()
         assert self._days_left(db_path) == ["2024-04-01"]
 
     def test_missing_export_dir_is_not_an_error(self, db_path, tmp_path):
@@ -369,9 +369,9 @@ class TestRunRetention:
 
         result = run_retention(db_path, "2024-04-01", 30, tmp_path / "nope")
 
-        assert result.deleted_files == []
+        assert result.deleted_files == ()
 
-    def test_rows_without_day_are_not_silently_dropped(self, db_path):
+    def test_rows_without_day_are_not_silently_dropped(self, db_path, tmp_path):
         """NULL в day — баг писателя, а не повод удалять запись молча."""
         with sqlite3.connect(db_path) as conn:
             conn.execute(
@@ -380,9 +380,11 @@ class TestRunRetention:
             )
             conn.commit()
 
-        result = run_retention(db_path, "2024-04-01", 1, None)
+        result = run_retention(db_path, "2024-04-01", 1, tmp_path / "no-exports")
 
         assert result.deleted_rows == 0
+        with sqlite3.connect(db_path) as conn:
+            assert conn.execute("SELECT COUNT(*) FROM logs").fetchone()[0] == 1
 
     def test_non_positive_retention_is_rejected(self, db_path):
         with pytest.raises(ValueError):
@@ -393,8 +395,14 @@ class TestDbSizeLimit:
     """Защита от роста: старые дни логов уходят, пока БД не влезет в лимит."""
 
     def _payload_db(self, db_path, days):
-        """БД с указанными днями (~1 МБ строк на день); возвращает её размер."""
-        with sqlite3.connect(db_path) as conn:
+        """БД с указанными днями (~1 МБ строк на день); возвращает её размер.
+
+        Соединение закрывается до замера: пока оно открыто, размер включает
+        незаписанный в файл WAL, и сравнение с эталонной БД было бы не
+        сопоставимым.
+        """
+        conn = sqlite3.connect(db_path)
+        try:
             for day in days:
                 ts = time.mktime((2024, 4, 1, 12, 0, 0, 0, 0, -1))
                 conn.executemany(
@@ -403,6 +411,8 @@ class TestDbSizeLimit:
                     [(ts + i, day, "x" * 500) for i in range(2500)],
                 )
             conn.commit()
+        finally:
+            conn.close()
         return db_size_bytes(db_path)
 
     def _reference_db(self, tmp_path, name, days):

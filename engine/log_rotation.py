@@ -37,7 +37,8 @@ import os
 import re
 import sqlite3
 import time
-from datetime import datetime
+from dataclasses import dataclass
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -59,6 +60,31 @@ _UNKNOWN_LEVEL_RANK = _LEVEL_RANK["ERROR"]
 EXPORT_DIRNAME = "logs"
 
 _DAY_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+# Имя файла дневного экспорта. Только он подлежит удалению по retention:
+# adclicker.log, его ротации и чужие файлы в том же каталоге трогать нельзя.
+_EXPORT_NAME_RE = re.compile(r"^(\d{4}-\d{2}-\d{2})\.log$")
+
+
+@dataclass(frozen=True)
+class RetentionResult:
+    """Итог одного прогона retention — для лога и для тестов."""
+
+    cutoff: str
+    deleted_rows: int
+    deleted_files: tuple[Path, ...]
+
+
+@dataclass(frozen=True)
+class DbSizeResult:
+    """Итог защиты от роста БД. ``error`` — только имя типа исключения:
+    текст ошибки SQLite может содержать путь к файлу пользователя."""
+
+    fits: bool
+    limit_bytes: int
+    size_bytes: int
+    deleted_days: tuple[str, ...]
+    error: str | None = None
 
 # Пустое значение в колонках без привязки: воркер/категория могли не быть
 # заданы, и в файле это должно читаться как «нет», а не как пустая строка
@@ -214,12 +240,229 @@ def export_day(
     return path
 
 
+def _next_day(day: str) -> str:
+    """Следующие сутки тем же штампом — для «удалить файл этого дня»."""
+    return (datetime.strptime(day, "%Y-%m-%d") + timedelta(days=1)).strftime("%Y-%m-%d")
+
+
+def retention_cutoff(today: str, retention_days: int) -> str:
+    """Дата-граница retention: ``сегодня - retention_days``.
+
+    Граница строгая: строки (и файлы) с ``day < cutoff`` удаляются, дата
+    ``cutoff`` — это ровно ``retention_days`` дней назад и она **остаётся**.
+    Сравнение идёт по строкам ``YYYY-MM-DD``, где лексикографический порядок
+    совпадает с хронологическим.
+    """
+    _validate_day(today)
+    if (
+        isinstance(retention_days, bool)
+        or not isinstance(retention_days, int)
+        or retention_days < 1
+    ):
+        raise ValueError(f"retention_days обязан быть целым >= 1, получено {retention_days!r}")
+    base = datetime.strptime(today, "%Y-%m-%d")
+    return (base - timedelta(days=retention_days)).strftime("%Y-%m-%d")
+
+
+def purge_logs_before(db_path: str | Path, cutoff_day: str) -> int:
+    """Удалить строки ``logs`` строго старше отсечки. Возвращает их число.
+
+    ``day IS NULL`` не трогается: это записи без дня (баг писателя или
+    история до бэкалфа), удалять их молча — значит терять данные незаметно.
+    """
+    conn = sqlite3.connect(db_path, timeout=BUSY_TIMEOUT_MS / 1000)
+    try:
+        cursor = conn.execute("DELETE FROM logs WHERE day < ?", (cutoff_day,))
+        conn.commit()
+        return int(cursor.rowcount)
+    finally:
+        conn.close()
+
+
+def purge_export_files(export_dir: str | Path, cutoff_day: str) -> list[Path]:
+    """Удалить файлы дневного экспорта строго старше отсечки.
+
+    Касаться разрешено только файлов с именем ``YYYY-MM-DD.log``: остальное в
+    каталоге (ротационный ``adclicker.log``, случайные записи оператора)
+    остаётся нетронутым. Отсутствующий каталог — не ошибка, просто удалять
+    нечего.
+    """
+    directory = Path(export_dir)
+    if not directory.is_dir():
+        return []
+    removed: list[Path] = []
+    for path in sorted(directory.iterdir()):
+        match = _EXPORT_NAME_RE.match(path.name)
+        if match is None or match.group(1) >= cutoff_day:
+            continue
+        if not path.is_file():
+            continue
+        path.unlink()
+        removed.append(path)
+    return removed
+
+
+def run_retention(
+    db_path: str | Path,
+    today: str,
+    retention_days: int,
+    export_dir: str | Path | None = None,
+) -> RetentionResult:
+    """Удалить строки и файлы экспорта старше N полных дней.
+
+    Граница: ``day < сегодня - N`` уходит, ровно N дней назад остаётся.
+    ``export_dir=None`` — ``<cwd>/logs``, тот же каталог, куда пишет
+    :func:`export_day`.
+    """
+    cutoff = retention_cutoff(today, retention_days)
+    deleted_rows = purge_logs_before(db_path, cutoff)
+    directory = default_export_dir() if export_dir is None else Path(export_dir)
+    deleted_files = tuple(purge_export_files(directory, cutoff))
+    return RetentionResult(
+        cutoff=cutoff, deleted_rows=deleted_rows, deleted_files=deleted_files
+    )
+
+
+def db_size_bytes(db_path: str | Path) -> int:
+    """Размер БД и её ``-wal`` вместе: именно это ест место на диске.
+
+    Отсутствующий ``-wal`` (последнее соединение закрылось и его убрали)
+    даёт ноль. Другие ошибки чтения не гасятся: защита от роста должна падать
+    громко, а не считать размер БД нулём.
+    """
+    total = 0
+    for suffix in ("", "-wal"):
+        try:
+            total += Path(str(db_path) + suffix).stat().st_size
+        except FileNotFoundError:
+            continue
+    return total
+
+
+def enforce_db_size_limit(
+    db_path: str | Path,
+    limit_mb: float,
+    export_dir: str | Path | None = None,
+) -> DbSizeResult:
+    """Держать размер БД в ``limit_mb``: удалять старые дни логов, пока влезет.
+
+    Алгоритм: измерить (БД + ``-wal``) → не влезает → удалить самый старый
+    день (строки и его файл экспорта) → освободить место (checkpoint WAL +
+    ``VACUUM``) → повторить. ``DELETE`` сам по себе файл не уменьшает —
+    освободившиеся страницы остаются в файле, — поэтому без ``VACUUM`` цикл
+    выгреб бы все логи и всё равно не влез бы.
+
+    Исходы:
+
+    * ``fits=True`` — влезло (возможно, после удаления нескольких дней);
+    * ``fits=False`` + ``error`` — место освободить не удалось (например,
+      БД занята другим читателем); данные удалены только за уже выполненные
+      итерации, остальные не трогаются — лучше остаться с растущей БД, чем
+      выгрести все логи впустую;
+    * ``fits=False`` без ``error`` — строки кончились, а БД всё ещё больше
+      лимита (например, лимит меньше пустой схемы). Вызывающий код обязан
+      сказать об этом WARNING'ом и продолжить принимать записи: защита не
+      имеет права блокировать логирование.
+
+    ``limit_mb <= 0`` — ``ValueError``: нулевой лимит означал бы «удалить
+    всё», а выключенный режим — это забота вызывающего кода (он проверяет
+    ``db_size_limit_mb > 0`` до вызова).
+    """
+    if (
+        isinstance(limit_mb, bool)
+        or not isinstance(limit_mb, (int, float))
+        or limit_mb <= 0
+    ):
+        raise ValueError(f"лимит размера БД обязан быть числом МБ > 0, получено {limit_mb!r}")
+
+    limit_bytes = int(limit_mb * 1024 * 1024)
+    directory = None if export_dir is None else Path(export_dir)
+    deleted: list[str] = []
+    while True:
+        size = db_size_bytes(db_path)
+        if size <= limit_bytes:
+            return DbSizeResult(
+                fits=True, limit_bytes=limit_bytes, size_bytes=size, deleted_days=tuple(deleted)
+            )
+        day = _oldest_day(db_path)
+        if day is None:
+            return DbSizeResult(
+                fits=False, limit_bytes=limit_bytes, size_bytes=size, deleted_days=tuple(deleted)
+            )
+        _delete_day_rows(db_path, day)
+        deleted.append(day)
+        if directory is not None:
+            purge_export_files(directory, _next_day(day))
+        try:
+            _reclaim_space(db_path)
+        except Exception as exc:  # noqa: BLE001 - защита обязана сообщить, а не упасть
+            return DbSizeResult(
+                fits=False,
+                limit_bytes=limit_bytes,
+                size_bytes=db_size_bytes(db_path),
+                deleted_days=tuple(deleted),
+                error=type(exc).__name__,
+            )
+
+
+def _oldest_day(db_path: str | Path) -> str | None:
+    """Самый старый день в ``logs``; None — строк с датой не осталось."""
+    conn = sqlite3.connect(db_path, timeout=BUSY_TIMEOUT_MS / 1000)
+    try:
+        row = conn.execute("SELECT MIN(day) FROM logs").fetchone()
+    finally:
+        conn.close()
+    return None if row is None else row[0]
+
+
+def _delete_day_rows(db_path: str | Path, day: str) -> int:
+    conn = sqlite3.connect(db_path, timeout=BUSY_TIMEOUT_MS / 1000)
+    try:
+        cursor = conn.execute("DELETE FROM logs WHERE day = ?", (day,))
+        conn.commit()
+        return int(cursor.rowcount)
+    finally:
+        conn.close()
+
+
+def _reclaim_space(db_path: str | Path) -> None:
+    """Вернуть файлу освободившееся место: checkpoint WAL, затем VACUUM.
+
+    Нужен и для размера (без него файловой системе всё равно, сколько
+    страниц свободно), и для дальнейших итераций защиты. Ошибка не гасится
+    здесь: вызывающий цикл обязан остановиться, иначе следующее измерение
+    соврало бы о размере.
+
+    Checkpoint зовётся дважды: до VACUUM — чтобы работа шла по актуальной
+    картине, и после — потому что в WAL-режиме сам VACUUM пишет новый
+    образ базы в WAL. Без второго checkpoint'а главный файл продолжал бы
+    хранить старые страницы, а сумма «БД + WAL» не уменьшалась бы.
+    """
+    # isolation_level=None: VACUUM нельзя выполнять внутри транзакции.
+    conn = sqlite3.connect(db_path, isolation_level=None, timeout=BUSY_TIMEOUT_MS / 1000)
+    try:
+        conn.execute(f"PRAGMA busy_timeout = {BUSY_TIMEOUT_MS}")
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        conn.execute("VACUUM")
+        conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    finally:
+        conn.close()
+
+
 __all__ = [
     "EXPORT_DIRNAME",
     "LEVEL_ORDER",
+    "DbSizeResult",
+    "RetentionResult",
+    "db_size_bytes",
     "default_export_dir",
+    "enforce_db_size_limit",
     "export_day",
     "level_at_least",
     "level_rank",
     "local_day",
+    "purge_export_files",
+    "purge_logs_before",
+    "retention_cutoff",
+    "run_retention",
 ]
