@@ -41,6 +41,35 @@
           pytest-mock
           httpx
         ];
+
+        # Системные библиотеки для сборки Tauri-кабины (ui/src-tauri).
+        #
+        # Без них `cargo check` падает ещё до нашего кода: libdbus-sys и
+        # gtk-sys ищут .pc-файлы через pkg-config, а в системном окружении
+        # dev-пакетов нет. Список повторяет тот, что отработал в фазе 0 при
+        # сборке deb/rpm. На macOS они не нужны — там те же зависимости
+        # идут из Xcode SDK, — поэтому набор действует только на Linux.
+        # lib.optionals hostPlatform.isLinux: на macOS этих пакетов в nixpkgs нет
+        # (webkitgtk, dbus, appindicator — linux-only), и сам факт наличия их
+        # в списке роняет eval dev-shell на целевой платформе проекта.
+        tauriNativeDeps = pkgs.lib.optionals pkgs.stdenv.hostPlatform.isLinux (
+          with pkgs;
+          [
+            pkg-config
+            dbus
+            glib
+            gtk3
+            cairo
+            pango
+            gdk-pixbuf
+            at-spi2-atk
+            webkitgtk_4_1
+            libsoup_3
+            libayatana-appindicator
+            librsvg
+            openssl
+          ]
+        );
       in
       {
         devShells.default = pkgs.mkShell {
@@ -51,6 +80,9 @@
             git
             uv
           ];
+
+          nativeBuildInputs = tauriNativeDeps;
+          buildInputs = tauriNativeDeps;
 
           shellHook = ''
             export PYTHONPATH="$PWD:$PYTHONPATH"
