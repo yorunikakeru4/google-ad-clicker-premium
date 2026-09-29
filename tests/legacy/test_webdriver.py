@@ -418,6 +418,30 @@ class TestProxyTransportOptions:
         assert install_plugin_stub == []
         assert proxy_auth_stub.calls == []
 
+    def test_extension_delivers_credentials_whenever_they_are_present(
+        self,
+        isolated_tempdir,
+        fake_chrome,
+        proxy_auth_stub,
+        install_plugin_stub,
+        no_geolocation,
+        record_log,
+        transport,
+    ):
+        """Транспорт решает по наличию кредов, а не по флагу ``auth``.
+
+        ``auth=false`` со строкой ``user:pass@host:port`` — противоречивый
+        конфиг: раньше креды утекали в ``--proxy-server`` (Chrome их всё
+        равно игнорирует), теперь транспорт делает то, ради чего выбран.
+        """
+        transport("extension", auth=False)
+
+        driver, _ = webdriver.create_webdriver(PROXY, "Mozilla/5.0", "abcde")
+
+        assert install_plugin_stub, "креды есть — расширение должно быть установлено"
+        assert _proxy_args(driver) == []
+        assert PROXY not in " ".join(driver.options.arguments)
+
     def test_direct_has_neither_plugin_nor_manager(
         self,
         isolated_tempdir,

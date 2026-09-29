@@ -155,7 +155,8 @@ def is_multi_procs_enabled() -> bool:
 #   cdp_auth   — --proxy-server=host:port + ProxyAuthManager по CDP (дефолт);
 #   extension  — install_plugin (MV3-расширение), флаг --proxy-server не нужен;
 #   direct     — только --proxy-server=host:port, без кредов (whitelist-IP).
-# Значения и дефолт приходят из engine.proxy_auth: второго словаря нет.
+# Значения объявлены в engine.proxy_transport и переэкспортируются
+# engine.proxy_auth — второго словаря значений негде появиться.
 
 # Атрибут драйвера, в котором живёт поднятый ProxyAuthManager.
 PROXY_AUTH_ATTR = "_proxy_auth_manager"
