@@ -571,7 +571,7 @@ class TestProxyDegradation:
         driver.quit()
 
         stopped_logs = [
-            record for record in record_log.records if "proxy auth stop failed" in str(record)
+            record for record in record_log.records if "Proxy auth stop failed" in str(record)
         ]
         assert stopped_logs, "проглоченная остановка должна попасть в лог"
 

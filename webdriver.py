@@ -13,7 +13,18 @@ import seleniumbase
 import undetected_chromedriver
 
 from config_reader import config
+from engine.cdp import CdpClient
 from engine.log import get_logger
+from engine.proxy_auth import (
+    PROXY_TRANSPORT_CDP_AUTH,
+    PROXY_TRANSPORT_DIRECT,
+    PROXY_TRANSPORT_EXTENSION,
+    ProxyAuthManager,
+    create_proxy_auth,
+    mask_secret,
+    parse_proxy_credentials,
+    resolve_proxy_transport,
+)
 from geolocation_db import GeolocationDB
 from proxy import install_plugin
 from utils import get_location, get_locale_language, get_random_sleep
@@ -29,6 +40,11 @@ class CustomChrome(undetected_chromedriver.Chrome):
     """Modified Chrome implementation"""
 
     def quit(self):
+
+        # Остановка CDP-авторизации — первой: сокет гасится до того, как
+        # умрёт браузер, иначе приёмный поток успеет наловить ошибок чтения.
+        # Ошибка остановки не должна ронять выход (см. stop_proxy_auth).
+        stop_proxy_auth(self)
 
         try:
             os.kill(self.browser_pid, 15)
@@ -133,6 +149,155 @@ def is_multi_procs_enabled() -> bool:
     return os.environ.get(MULTI_BROWSERS_ENV) == "1"
 
 
+# --- Транспорты прокси (план.md §2.1) -----------------------------------------
+#
+# Транспорт выбирает, КАК креды доходят до Chrome:
+#   cdp_auth   — --proxy-server=host:port + ProxyAuthManager по CDP (дефолт);
+#   extension  — install_plugin (MV3-расширение), флаг --proxy-server не нужен;
+#   direct     — только --proxy-server=host:port, без кредов (whitelist-IP).
+# Значения и дефолт приходят из engine.proxy_auth: второго словаря нет.
+
+# Атрибут драйвера, в котором живёт поднятый ProxyAuthManager.
+PROXY_AUTH_ATTR = "_proxy_auth_manager"
+
+
+def _proxy_host_port(proxy: str) -> str:
+    """Адрес прокси без кредов — ровно то, что уходит в ``--proxy-server``.
+
+    Логин/пароль не должны быть видны в списке процессов Chrome: их доставляет
+    транспорт (расширение или CDP), а не аргументы запуска.
+    """
+    return proxy.rsplit("@", 1)[-1] if "@" in proxy else proxy
+
+
+def _mask_proxy(proxy: str) -> str:
+    """Прокси для лога: креды маскируются по образцу engine.proxy_auth."""
+    if "@" not in proxy:
+        return proxy
+    credentials, _, host_port = proxy.rpartition("@")
+    username, _, password = credentials.partition(":")
+    return f"{mask_secret(username)}:{mask_secret(password)}@{host_port}"
+
+
+def _proxy_credentials(proxy: str, transport: str) -> tuple[str, str] | None:
+    """``(логин, пароль)`` из строки прокси или None, если кредов нет.
+
+    ``direct`` креды не читает вовсе: это whitelist-IP, и адрес без логина для
+    него — норма, даже при ``auth=true``. Остальные транспорты при ``auth=true``
+    наследуют legacy-проверку со старым текстом ошибки: его ищут скрипты и
+    тесты, менять его нельзя. ``auth=false`` со строкой, в которой креды всё же
+    есть, разбирается по-мягкому: некорректная строка не роняет запуск, а в
+    ``--proxy-server`` креды всё равно не попадут.
+    """
+    if transport == PROXY_TRANSPORT_DIRECT:
+        return None
+    if config.webdriver.auth:
+        if "@" not in proxy or proxy.count(":") != 2:
+            raise ValueError(
+                "Invalid proxy format! Should be in 'username:password@host:port' format"
+            )
+        username, password = proxy.split("@")[0].split(":")
+        return username, password
+    if "@" not in proxy:
+        return None
+    try:
+        return parse_proxy_credentials(proxy)
+    except ValueError:
+        # Строка с "@" не разбирается — считаем, что кредов нет. Сама строка
+        # в лог не идёт: там может быть пароль.
+        log.debug("proxy", "Proxy credentials are malformed, ignoring them")
+        return None
+
+
+def _report_degraded(reason: str, proxy_host_port: str) -> None:
+    """Сигнал деградации транспорта: WARNING в лог и ``workers.status``.
+
+    В полях только ``reason`` и ``host:port`` без кредов: и лог, и
+    ``last_error`` обязаны оставаться чистыми (план.md §2.1). Реакция
+    супервизора (ротация прокси, видимость в ``/state``) — другая ветка;
+    здесь важно, что сигнал доставлен.
+    """
+    log.warning(
+        "proxy",
+        "proxy transport degraded",
+        fields={"reason": reason, "proxy": proxy_host_port},
+    )
+    log.mark_degraded(reason)
+
+
+def stop_proxy_auth(driver) -> None:
+    """Остановить CDP-авторизацию драйвера. Никогда не бросает исключений.
+
+    Вызывается и из ``CustomChrome.quit``, и из обёртки quit у SeleniumBase:
+    двойной вызов безопасен — менеджер снимается с драйвера до остановки.
+    """
+    manager = getattr(driver, PROXY_AUTH_ATTR, None)
+    if manager is None:
+        return
+    try:
+        setattr(driver, PROXY_AUTH_ATTR, None)
+        manager.stop()
+    except Exception as exc:
+        # quit() не должен роняться из-за менеджера, но и молчать нельзя:
+        # без записи в лог причина была бы недиагностируема.
+        log.debug(
+            "proxy",
+            "Proxy auth stop failed",
+            fields={"error_type": type(exc).__name__, "error": str(exc)},
+        )
+
+
+def attach_proxy_auth(driver, manager: ProxyAuthManager) -> None:
+    """Привязать менеджер к драйверу и остановить его в ``quit()``.
+
+    ``CustomChrome.quit`` зовёт :func:`stop_proxy_auth` сам, но драйвер
+    SeleniumBase — чужий класс, поэтому ``quit`` заворачивается всегда: один
+    путь остановки для обоих браузеров.
+    """
+    setattr(driver, PROXY_AUTH_ATTR, manager)
+    original_quit = driver.quit
+
+    def quit_with_proxy_auth() -> None:
+        stop_proxy_auth(driver)
+        original_quit()
+
+    driver.quit = quit_with_proxy_auth
+
+
+def _start_proxy_auth(
+    credentials: tuple[str, str],
+    user_data_dir,
+    proxy_host_port: str,
+) -> ProxyAuthManager | None:
+    """Поднять CDP-авторизацию после создания драйвера. None — не вышло.
+
+    Порт DevTools менеджер находит сам по ``user_data_dir``. Отказ не роняет
+    создание драйвера: браузер жив и доедет до первой 407, а супервизору нужен
+    сигнал, а не падение воркера — причина уходит в WARNING и в
+    ``workers.status='degraded'``. Колбэк ``on_proxy_dead`` и обрыв CDP держат
+    ту же дорогу сигнала, только с другой причиной.
+    """
+    username, password = credentials
+    try:
+        return create_proxy_auth(
+            username,
+            password,
+            user_data_dir=user_data_dir,
+            on_proxy_dead=lambda: _report_degraded(
+                "proxy rejected credentials", proxy_host_port
+            ),
+            client_factory=lambda url: CdpClient(
+                url,
+                on_connection_lost=lambda: _report_degraded(
+                    "cdp connection lost", proxy_host_port
+                ),
+            ),
+        )
+    except Exception as exc:
+        _report_degraded(f"cdp auth start failed: {type(exc).__name__}", proxy_host_port)
+        return None
+
+
 def create_webdriver(
     proxy: str, user_agent: Optional[str] = None, plugin_folder_name: Optional[str] = None
 ) -> tuple[undetected_chromedriver.Chrome, Optional[str]]:
@@ -151,6 +316,11 @@ def create_webdriver(
     if config.webdriver.use_seleniumbase:
         log.debug("browser", "Using SeleniumBase...")
         return create_seleniumbase_driver(proxy, user_agent)
+
+    # Транспорт читается до любых побочных эффектов: неверное значение — это
+    # ошибка конфигурации, и упасть она должна раньше, чем созданы каталоги
+    # профиля и запущен Chrome.
+    transport = resolve_proxy_transport(config.webdriver.proxy_transport)
 
     geolocation_db_client = GeolocationDB()
 
@@ -223,27 +393,23 @@ def create_webdriver(
         driver_exe_path = _get_driver_exe_path()
 
     if proxy:
-        if config.webdriver.auth:
-            if "@" not in proxy or proxy.count(":") != 2:
-                raise ValueError(
-                    "Invalid proxy format! Should be in 'username:password@host:port' format"
-                )
+        credentials = _proxy_credentials(proxy, transport)
+        host_port = _proxy_host_port(proxy)
+        masked_proxy = _mask_proxy(proxy)
 
-            username, password = proxy.split("@")[0].split(":")
-            host, port = proxy.split("@")[1].split(":")
+        log.info("proxy", "Using proxy", fields={"proxy": masked_proxy})
+        log.debug("proxy", "Using proxy", fields={"proxy": masked_proxy})
 
-            masked_username = username[:3] + "***" + username[-3:] if len(username) > 6 else "***"
-            masked_password = password[:3] + "***" + password[-3:] if len(password) > 6 else "***"
-            masked_proxy = f"{masked_username}:{masked_password}@{host}:{port}"
-
-            log.info("proxy", "Using proxy", fields={"proxy": masked_proxy})
-            log.debug("proxy", "Using proxy", fields={"proxy": proxy})
+        if transport == PROXY_TRANSPORT_EXTENSION and credentials is not None:
+            # extension: ровно прежнее поведение — креды уходят в расширение,
+            # поэтому отдельный --proxy-server Chrome не нужен.
+            username, password = credentials
+            host, port = host_port.split(":")
 
             install_plugin(chrome_options, host, int(port), username, password, plugin_folder_name)
             sleep(2 * config.behavior.wait_factor)
         else:
-            log.info("proxy", "Using proxy", fields={"proxy": proxy})
-            chrome_options.add_argument(f"--proxy-server={proxy}")
+            chrome_options.add_argument(f"--proxy-server={host_port}")
 
         # get location of the proxy IP
         lat, long, country_code, timezone = get_location(geolocation_db_client, proxy)
@@ -261,6 +427,13 @@ def create_webdriver(
             user_multi_procs=multi_procs_enabled,
             use_subprocess=False,
         )
+
+        if transport == PROXY_TRANSPORT_CDP_AUTH and credentials is not None:
+            # Старт после создания драйвера: порт DevTools появляется только
+            # когда Chrome поднялся. Остановка — в quit() драйвера.
+            manager = _start_proxy_auth(credentials, profile_dir, host_port)
+            if manager is not None:
+                attach_proxy_auth(driver, manager)
 
         accuracy = 95
 
@@ -285,7 +458,7 @@ def create_webdriver(
                 "browser",
                 "Timezone of",
                 fields={
-                    "proxy": proxy.split("@")[1] if config.webdriver.auth else proxy,
+                    "proxy": host_port,
                     "timezone": timezone,
                 },
             )
@@ -334,26 +507,20 @@ def create_seleniumbase_driver(
 
     geolocation_db_client = GeolocationDB()
 
+    # Как и в UC-ветке: ошибка конфигурации раньше любых побочных эффектов.
+    transport = resolve_proxy_transport(config.webdriver.proxy_transport)
+
     country_code = None
+    credentials: tuple[str, str] | None = None
+    host_port = ""
 
     if proxy:
-        if config.webdriver.auth:
-            if "@" not in proxy or proxy.count(":") != 2:
-                raise ValueError(
-                    "Invalid proxy format! Should be in 'username:password@host:port' format"
-                )
+        credentials = _proxy_credentials(proxy, transport)
+        host_port = _proxy_host_port(proxy)
+        masked_proxy = _mask_proxy(proxy)
 
-            username, password = proxy.split("@")[0].split(":")
-            host, port = proxy.split("@")[1].split(":")
-
-            masked_username = username[:3] + "***" + username[-3:] if len(username) > 6 else "***"
-            masked_password = password[:3] + "***" + password[-3:] if len(password) > 6 else "***"
-            masked_proxy = f"{masked_username}:{masked_password}@{host}:{port}"
-
-            log.info("proxy", "Using proxy", fields={"proxy": masked_proxy})
-            log.debug("proxy", "Using proxy", fields={"proxy": proxy})
-        else:
-            log.info("proxy", "Using proxy", fields={"proxy": proxy})
+        log.info("proxy", "Using proxy", fields={"proxy": masked_proxy})
+        log.debug("proxy", "Using proxy", fields={"proxy": masked_proxy})
 
         # get location of the proxy IP
         lat, long, country_code, timezone = get_location(geolocation_db_client, proxy)
@@ -365,18 +532,36 @@ def create_seleniumbase_driver(
     base_dir.mkdir(exist_ok=True)
     profile_dir = base_dir / f"profile_{random.randint(1000,9999)}"
 
+    # Креды в proxy_string не идут ни при каком транспорте, кроме extension:
+    # там строка остаётся целиком, как и до появления транспортов, а
+    # cdp_auth/direct отдают Chrome только адрес — логин/пароль в списке
+    # процессов недопустимы.
+    proxy_string = None
+    if proxy:
+        if transport == PROXY_TRANSPORT_EXTENSION and credentials is not None:
+            proxy_string = proxy
+        else:
+            proxy_string = host_port
+
     driver = seleniumbase.get_driver(
         browser_name="chrome",
         undetectable=True,
         headless2=False,
         do_not_track=True,
         user_agent=user_agent,
-        proxy_string=proxy or None,
+        proxy_string=proxy_string,
         multi_proxy=config.behavior.browser_count > 1,
         incognito=config.webdriver.incognito,
         locale_code=str(lang) if config.webdriver.language_from_proxy else None,
         user_data_dir=str(profile_dir),
     )
+
+    if proxy and transport == PROXY_TRANSPORT_CDP_AUTH and credentials is not None:
+        # Тот же механизм, что и в UC-ветке: порт DevTools берётся из
+        # user_data_dir, который только что ушёл в get_driver.
+        manager = _start_proxy_auth(credentials, profile_dir, host_port)
+        if manager is not None:
+            attach_proxy_auth(driver, manager)
 
     # set geolocation and timezone if available
     if proxy and lat and long:
@@ -399,7 +584,7 @@ def create_seleniumbase_driver(
             "browser",
             "Timezone of",
             fields={
-                "proxy": proxy.split("@")[1] if config.webdriver.auth else proxy,
+                "proxy": host_port,
                 "timezone": timezone,
             },
         )
