@@ -39,7 +39,7 @@ import os
 from pathlib import Path
 from typing import Any, Mapping, Sequence
 
-from engine.log import get_logger, resolve_db_path
+from engine.log import StructuredLogger, get_logger, resolve_db_path
 from engine.profile_pool import ProfilePool
 
 # Env-контракт супервизора (engine/control_plane/supervisor.PROFILE_ENV):
@@ -74,7 +74,18 @@ __all__ = [
     "should_apply_cookies",
 ]
 
-log = get_logger()
+
+def _log() -> StructuredLogger:
+    """Логгер процесса — берётся на каждый вызов, а не на уровне модуля.
+
+    Причина в порядке импорта: ``engine/worker.py`` импортирует этот модуль на
+    верхнем уровне, а ``get_logger()`` при первом обращении открывает
+    StoreWriter и мигрирует БД. Разбор аргументов (включая ``--help``) и
+    юнит-тесты не должны ходить в SQLite ради одного ``import``. Вызов дешёвый:
+    ``get_logger`` кэширует инстанс по пути к БД.
+    """
+
+    return get_logger()
 
 
 # --- строка профиля -----------------------------------------------------------
@@ -117,7 +128,7 @@ def current_profile() -> dict[str, Any] | None:
     try:
         row = ProfilePool(resolve_db_path()).get_profile(profile_id)
     except Exception as exc:  # noqa: BLE001 - любая причина не должна валить прогон
-        log.warning(
+        _log().warning(
             "browser",
             "profile settings were not read",
             fields={
@@ -128,7 +139,7 @@ def current_profile() -> dict[str, Any] | None:
         )
         return None
     if row is None:
-        log.warning(
+        _log().warning(
             "browser",
             "assigned profile does not exist",
             fields={"profile_id": profile_id},
@@ -288,7 +299,7 @@ def save_profile_cookies(
 
 
 def _warn_unreadable(path: Path, exc: Exception) -> None:
-    log.warning(
+    _log().warning(
         "browser",
         "profile cookies were not loaded",
         fields={"path": str(path), "error": str(exc), "error_type": type(exc).__name__},

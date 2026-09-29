@@ -736,7 +736,9 @@ def record_log(monkeypatch):
 
     recorder = LogRecorder()
     monkeypatch.setattr(search_controller, "log", recorder)
-    monkeypatch.setattr("engine.profile_apply.log", recorder)
+    # В профиле логгер ленивый (см. engine.profile_apply._log), поэтому
+    # подменяется фабрика, а не атрибут.
+    monkeypatch.setattr("engine.profile_apply.get_logger", lambda: recorder)
     return recorder
 
 

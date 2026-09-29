@@ -76,8 +76,14 @@ class LogRecorder:
 
 @pytest.fixture
 def record_log(monkeypatch):
+    """Логгер модуля: ленивый ``get_logger`` подменяется на записывающий.
+
+    ``profile_apply`` не держит модульного логгера (иначе импорт открыл бы
+    StoreWriter), поэтому подменяется сама фабрика.
+    """
+
     recorder = LogRecorder()
-    monkeypatch.setattr(profile_apply, "log", recorder)
+    monkeypatch.setattr(profile_apply, "get_logger", lambda: recorder)
     return recorder
 
 
@@ -244,6 +250,20 @@ class TestShouldApplyCookies:
 
 
 # --- чтение строки профиля ----------------------------------------------------
+
+
+class TestImportIsSideEffectFree:
+    """Импорт модуля не ходит в БД (см. ``_log`` и ``--help`` воркера)."""
+
+    def test_import_does_not_open_the_store(self, tmp_path, monkeypatch):
+        import importlib
+
+        missing = tmp_path / "never-created.db"
+        monkeypatch.setenv("ADCLICKER_DB", str(missing))
+
+        importlib.reload(profile_apply)
+
+        assert not missing.exists(), "import не должен мигрировать и создавать БД"
 
 
 class TestCurrentProfile:
