@@ -1,68 +1,64 @@
-import { createRouter, createWebHashHistory, type RouteRecordRaw } from "vue-router";
-import type { Component } from "vue";
-import DashboardView from "../views/DashboardView.vue";
-import LogsView from "../views/LogsView.vue";
-import ProfilesView from "../views/ProfilesView.vue";
-import ProxiesView from "../views/ProxiesView.vue";
-import TasksView from "../views/TasksView.vue";
-import SettingsView from "../views/SettingsView.vue";
-import DiagnosticsView from "../views/DiagnosticsView.vue";
-
-// Hash history on purpose: Tauri serves the frontend from a custom protocol
-// with no SPA fallback, so history mode breaks on reload and deep links.
-const history = createWebHashHistory();
+import {
+  createRouter,
+  createWebHashHistory,
+  type RouteRecordRaw,
+} from "vue-router";
 
 export interface NavItem {
   path: string;
   title: string;
   icon: string;
-  component: Component;
+  component: NonNullable<RouteRecordRaw["component"]>;
 }
 
-// Единственный источник для роутера и бокового меню: семь экранов из
-// плана §5 «Фаза 2», порядок — как в плане.
+// Hash history on purpose: Tauri serves the frontend from a custom protocol
+// with no SPA fallback, so history mode breaks on reload and deep links.
+const history = createWebHashHistory();
+
+// Единственный источник для роутера и бокового меню: семь экранов
+// дизайн-спецификации §3.1, порядок — как в ТЗ. Роуты ленивые.
 export const NAV_ITEMS: NavItem[] = [
   {
     path: "/",
     title: "Dashboard",
-    icon: "mdi-view-dashboard-outline",
-    component: DashboardView,
-  },
-  {
-    path: "/logs",
-    title: "Logs",
-    icon: "mdi-text-box-search-outline",
-    component: LogsView,
+    icon: "mdi-view-dashboard",
+    component: () => import("../views/DashboardView.vue"),
   },
   {
     path: "/profiles",
     title: "Profiles",
-    icon: "mdi-account-key-outline",
-    component: ProfilesView,
+    icon: "mdi-account",
+    component: () => import("../views/ProfilesView.vue"),
   },
   {
     path: "/proxies",
     title: "Proxies",
-    icon: "mdi-lan-connect",
-    component: ProxiesView,
+    icon: "mdi-earth",
+    component: () => import("../views/ProxiesView.vue"),
   },
   {
     path: "/tasks",
     title: "Tasks",
-    icon: "mdi-play-circle-outline",
-    component: TasksView,
+    icon: "mdi-format-list-checks",
+    component: () => import("../views/TasksView.vue"),
+  },
+  {
+    path: "/logs",
+    title: "Logs",
+    icon: "mdi-format-list-bulleted",
+    component: () => import("../views/LogsView.vue"),
   },
   {
     path: "/settings",
     title: "Settings",
-    icon: "mdi-cog-outline",
-    component: SettingsView,
+    icon: "mdi-cog",
+    component: () => import("../views/SettingsView.vue"),
   },
   {
     path: "/diagnostics",
     title: "Diagnostics",
-    icon: "mdi-heart-pulse",
-    component: DiagnosticsView,
+    icon: "mdi-pulse",
+    component: () => import("../views/DiagnosticsView.vue"),
   },
 ];
 
@@ -78,9 +74,6 @@ routes.push({
   redirect: { name: "dashboard" },
 });
 
-const router = createRouter({
-  history,
-  routes,
-});
+const router = createRouter({ history, routes });
 
 export default router;
