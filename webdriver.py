@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import os
 import random
 import shutil
@@ -5,12 +7,16 @@ import sys
 import tempfile
 from pathlib import Path
 from time import sleep
-from typing import Optional, Union
+from typing import TYPE_CHECKING, Optional, Union
 
 import pyautogui
 import requests
-import seleniumbase
 import undetected_chromedriver
+
+if TYPE_CHECKING:
+    # Только для аннотаций: рантайм-импорт живёт в create_seleniumbase_driver,
+    # UC-режим не должен требовать необязательный пакет на import модуля.
+    import seleniumbase
 
 from config_reader import config
 from engine.cdp import CdpClient
@@ -560,6 +566,18 @@ def create_seleniumbase_driver(
     :rtype: tuple
     :returns: (Driver, country_code) pair
     """
+
+    # Лениво и только здесь: UC-режим (use_seleniumbase=false) не должен
+    # требовать необязательный пакет — иначе сценарий падает до браузера
+    # (поймано живым e2e-прогоном: sidecar и nix не содержат seleniumbase).
+    try:
+        import seleniumbase
+    except ImportError as exc:
+        raise RuntimeError(
+            "режим use_seleniumbase требует пакет seleniumbase: "
+            "установите его (pip install seleniumbase) или отключите "
+            "webdriver.use_seleniumbase"
+        ) from exc
 
     geolocation_db_client = GeolocationDB()
 

@@ -8,6 +8,7 @@ geolocation-lookup не задействованы: драйвер создаё�
 подтверждает.
 """
 
+import sys
 import tempfile
 
 import pytest
@@ -698,7 +699,10 @@ def seleniumbase_stub(monkeypatch):
         created.append(driver)
         return driver
 
-    monkeypatch.setattr(webdriver.seleniumbase, "get_driver", fake_get_driver)
+    # seleniumbase импортируется лениво внутри create_seleniumbase_driver,
+    # атрибута у webdriver больше нет — патчим модуль в sys.modules
+    # (заглушку из conftest), ровно туда, куда придёт локальный import.
+    monkeypatch.setattr(sys.modules["seleniumbase"], "get_driver", fake_get_driver)
     return created
 
 
