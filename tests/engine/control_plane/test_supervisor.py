@@ -1338,6 +1338,29 @@ class TestWorkerEnvironment:
 
         assert supervisor._default_env("br-1")["ADCLICKER_POOL_SIZE"] == "3"
 
+    def test_db_path_is_passed_to_the_worker(self, store, registry, clock, settings):
+        """Воркер обязан писать heartbeat в ту же БД, что и демон.
+
+        Иначе воркер пишет в ``adclicker.db`` по умолчанию, супервизор
+        наблюдает свою БД, свежий stale-детект убивает здорового воркера —
+        и пул уходит в бесконечный цикл рестартов. Поймано живым
+        e2e-прогоном: супервизор убивал воркеры через 15 с.
+        """
+        supervisor = make_supervisor(store, registry, clock, settings)
+
+        env = supervisor._default_env("br-1")
+
+        assert env["ADCLICKER_DB"] == str(store.db_path)
+
+    def test_db_path_from_store_wins_over_inherited_environment(
+        self, store, registry, clock, settings, monkeypatch
+    ):
+        """``--db`` демона сильнее унаследованного ``ADCLICKER_DB`` окружения."""
+        monkeypatch.setenv("ADCLICKER_DB", "/tmp/inherited-other-db.db")
+        supervisor = make_supervisor(store, registry, clock, settings)
+
+        assert supervisor._default_env("br-1")["ADCLICKER_DB"] == str(store.db_path)
+
 
 class TestWorkerCommand:
     """Команда спавна воркера: обычный режим, frozen-бинарник, приоритет PYTHON.
