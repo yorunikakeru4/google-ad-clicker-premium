@@ -35,8 +35,6 @@ from engine.control_plane.api import TOKEN_HEADER
 from tests.engine.control_plane.test_captcha_check import FakePolicy
 from tests.engine.control_plane.test_log_jobs import make_daemon
 
-TOKEN = "config-live-apply-token"
-
 
 @pytest.fixture
 def db_path(tmp_path):
@@ -65,7 +63,7 @@ def post_config(daemon, body):
     request = urllib.request.Request(
         url, data=json.dumps(body).encode("utf-8"), method="POST"
     )
-    request.add_header(TOKEN_HEADER, TOKEN)
+    request.add_header(TOKEN_HEADER, daemon.token)
     request.add_header("Content-Type", "application/json")
     try:
         with urllib.request.urlopen(request, timeout=5) as response:
