@@ -379,15 +379,22 @@ class Daemon:
 
             # Три job'а ротации логов спят до 23:59 / до суток / до часа,
             # поэтому остановка идёт по взведённому stop_event, а не по
-            # таймеру — иначе shutdown ждал бы закрытия дня.
-            for attribute, thread in (
-                ("_day_close_thread", self._day_close_thread),
-                ("_retention_thread", self._retention_thread),
-                ("_db_size_thread", self._db_size_thread),
-            ):
-                if thread is not None:
-                    thread.join(timeout=SHUTDOWN_GRACE_SECONDS)
-                setattr(self, attribute, None)
+            # таймеру — иначе shutdown ждал бы закрытия дня. По одному блоку
+            # на нить, как у прокси и порога: видно, что именно ждём.
+            day_close_thread = self._day_close_thread
+            if day_close_thread is not None:
+                day_close_thread.join(timeout=SHUTDOWN_GRACE_SECONDS)
+            self._day_close_thread = None
+
+            retention_thread = self._retention_thread
+            if retention_thread is not None:
+                retention_thread.join(timeout=SHUTDOWN_GRACE_SECONDS)
+            self._retention_thread = None
+
+            db_size_thread = self._db_size_thread
+            if db_size_thread is not None:
+                db_size_thread.join(timeout=SHUTDOWN_GRACE_SECONDS)
+            self._db_size_thread = None
 
             thread = self._supervisor_thread
             if thread is not None:

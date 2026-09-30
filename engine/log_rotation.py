@@ -93,6 +93,7 @@ class DbSizeResult:
     deleted_days: tuple[str, ...]
     error: str | None = None
 
+
 # Пустое значение в колонках без привязки: воркер/категория могли не быть
 # заданы, и в файле это должно читаться как «нет», а не как пустая строка
 # перед двоеточием.
@@ -153,12 +154,12 @@ def _validate_day(day: str) -> None:
         raise ValueError(f"день обязан быть существующей датой YYYY-MM-DD, получено {day!r}") from exc
 
 
-def _min_level_rank(min_level: str) -> int:
+def _validate_min_level(min_level: str) -> None:
+    """Неизвестный ``min_level`` — ошибка вызывающего кода, а не «всё подряд»."""
     if not isinstance(min_level, str) or min_level not in _LEVEL_RANK:
         raise ValueError(
             f"неизвестный уровень экспорта {min_level!r}; допустимы {list(LEVEL_ORDER)}"
         )
-    return _LEVEL_RANK[min_level]
 
 
 def _one_line(text: str) -> str:
@@ -242,11 +243,11 @@ def export_day(
     что выгружать.
     """
     _validate_day(day)
-    min_rank = _min_level_rank(min_level)
+    _validate_min_level(min_level)
     lines = [
         _render_line(row)
         for row in _select_day(db_path, day)
-        if level_rank(row["level"]) >= min_rank
+        if level_at_least(row["level"], min_level)
     ]
     if not lines:
         return None
