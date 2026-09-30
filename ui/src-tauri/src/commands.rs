@@ -291,6 +291,7 @@ pub fn list_captcha_events(
 
 #[cfg(test)]
 mod tests {
+    use std::fs;
     use std::path::{Path, PathBuf};
     use std::sync::Mutex;
 
@@ -395,6 +396,30 @@ mod tests {
             err.to_string().contains("db_open"),
             "текст должен подсказывать вызов db_open: {err}"
         );
+    }
+
+    #[test]
+    fn db_size_requires_open_reader_and_then_reports_file_bytes() {
+        let state: Mutex<Option<DbReader>> = Mutex::new(None);
+
+        let err = read_db_size(&state).expect_err("без db_open размер неизвестен");
+        assert!(
+            matches!(err, DbError::NotOpen),
+            "ожидалась NotOpen, получено: {err:?}"
+        );
+
+        let tmp = TempDb::new();
+        let path = tmp.path();
+        let _writer = seed(&path);
+        let explicit = path.to_str().expect("путь валиден для OsStr");
+        open_db(&state, Some(explicit)).expect("существующая БД открывается");
+
+        let size = read_db_size(&state).expect("открытая БД отдаёт размер");
+        assert_eq!(
+            size.bytes,
+            fs::metadata(&path).expect("файл БД существует").len()
+        );
+        assert_eq!(size.path, path.display().to_string());
     }
 
     #[test]

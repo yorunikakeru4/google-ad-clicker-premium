@@ -2415,4 +2415,75 @@ mod tests {
             );
         }
     }
+
+    /// Путь `-wal` рядом с файлом БД: суффикс дописывается к имени файла,
+    /// как его создаёт SQLite (`adclicker.db-wal`).
+    fn wal_path(path: &Path) -> PathBuf {
+        let mut name = path.as_os_str().to_os_string();
+        name.push("-wal");
+        PathBuf::from(name)
+    }
+
+    #[test]
+    fn db_size_counts_main_and_wal_when_both_exist() {
+        let tmp = TempDb::new();
+        let path = tmp.path();
+        fs::write(&path, vec![0u8; 1000]).expect("файл БД пишется");
+        fs::write(wal_path(&path), vec![0u8; 300]).expect("wal пишется");
+
+        let size = db_size(&path);
+
+        assert_eq!(size.path, path.display().to_string());
+        assert_eq!(size.bytes, 1000, "основной файл целиком");
+        assert_eq!(size.wal_bytes, 300, "журнал WAL отдельно");
+    }
+
+    #[test]
+    fn db_size_without_wal_counts_main_only() {
+        let tmp = TempDb::new();
+        let path = tmp.path();
+        fs::write(&path, vec![0u8; 4096]).expect("файл БД пишется");
+
+        let size = db_size(&path);
+
+        assert_eq!(size.bytes, 4096);
+        assert_eq!(
+            size.wal_bytes, 0,
+            "отсутствующий -wal — ноль, а не ошибка: движок считает так же"
+        );
+    }
+
+    #[test]
+    fn db_size_of_missing_files_is_zero() {
+        let tmp = TempDb::new();
+        let path = tmp.path();
+
+        let size = db_size(&path);
+
+        assert_eq!(size.bytes, 0, "файла нет — ноль, а не ошибка");
+        assert_eq!(size.wal_bytes, 0);
+        assert_eq!(size.path, path.display().to_string());
+    }
+
+    #[test]
+    fn reader_size_matches_files_of_open_database() {
+        let tmp = TempDb::new();
+        let path = tmp.path();
+        let _writer = seed(&path, &[Row::new(1.0, "INFO", "строка")]);
+
+        let reader = DbReader::open(&path).expect("БД открывается");
+        let size = reader.size();
+
+        assert_eq!(
+            size.bytes,
+            fs::metadata(&path).expect("файл БД существует").len(),
+            "размер читателя — ровно размер файла на диске"
+        );
+        assert_eq!(
+            size.wal_bytes,
+            fs::metadata(wal_path(&path))
+                .expect("при живом писателе -wal существует")
+                .len()
+        );
+    }
 }
