@@ -90,8 +90,12 @@ def age_path(path: Path, seconds: float) -> None:
     os.utime(path, (stamp, stamp))
 
 
-def make_candidate(roots, category: str, name: str | None = None, age: float = OLD_SECONDS):
-    """Создать кандидата нужной категории и состарить его. Возвращает путь."""
+def make_candidate(roots, category: str, name: str | None = None, age: float | None = None):
+    """Создать кандидата нужной категории и состарить его. Возвращает путь.
+
+    Без явного ``age`` берётся возраст «кандидат на удаление»: каталоги старше
+    грейса, скриншоты старше ``log_retention_days`` (30 по умолчанию).
+    """
     temp_root, screenshots_root = roots
     if category == "uc_profile":
         path = temp_root / "uc_profiles" / (name or "profile_1234")
@@ -110,9 +114,11 @@ def make_candidate(roots, category: str, name: str | None = None, age: float = O
     elif category == "screenshot":
         path = screenshots_root / (name or "br-1_1711954800.png")
         path.write_bytes(b"PNG" * 40)
+        if age is None:
+            age = OLD_SCREENSHOT_SECONDS
     else:  # pragma: no cover - защита от опечатки в тесте
         raise AssertionError(f"неизвестная категория {category!r}")
-    age_path(path, age)
+    age_path(path, OLD_SECONDS if age is None else age)
     return path
 
 
@@ -340,7 +346,7 @@ class TestActiveExclusion:
 
     def test_dir_held_by_an_open_file_is_kept(self, store, roots, db_path):
         path = make_candidate(roots, "uc_profile")
-        held = path / "Default" / "Cookies"
+        held = path / "Default" / "History"
         handle = held.open("r+b")
         try:
             report = make_service(store, roots).run(config_with())
@@ -357,17 +363,20 @@ class TestActiveExclusion:
 
     def test_dir_named_in_a_live_process_cmdline_is_kept(self, store, roots, db_path):
         """Связь «каталог ↔ воркер»: Chrome получает --user-data-dir в argv."""
+        import psutil
+
         path = make_candidate(roots, "sb_profile")
         process = subprocess.Popen(
             [sys.executable, "-c", "import time; time.sleep(60)", f"--user-data-dir={path}"]
         )
         try:
+            watcher = psutil.Process(process.pid)
             deadline = time.monotonic() + 5.0
             while time.monotonic() < deadline:
                 try:
-                    if str(path) in " ".join(process.cmdline()):
+                    if str(path) in " ".join(watcher.cmdline()):
                         break
-                except OSError:
+                except psutil.Error:
                     pass
                 time.sleep(0.02)
             else:  # pragma: no cover - процесс обязан подняться
