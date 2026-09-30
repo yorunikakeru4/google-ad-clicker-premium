@@ -462,6 +462,47 @@ class TestStaleDetection:
         assert len(registry.created) == 2, "воркер должен быть перезапущен, а не убит снова"
 
 
+class TestHasLiveWorkers:
+    """`has_live_workers` — источник «жив ли сейчас» для импульса uptime.
+
+    Часовые метрики не опрашивают SQL на каждом тике: реестр супервизора —
+    та же двойная проверка, что и у надзора (процесс по `poll()` плюс свежий
+    heartbeat в пределах stale-окна), только наблюдаемая без побочных
+    действий (никто не убивается и не рестартится).
+    """
+
+    def test_no_pool_is_not_live(self, store, registry, clock, settings):
+        supervisor = make_supervisor(store, registry, clock, settings)
+
+        assert supervisor.has_live_workers() is False
+
+    def test_freshly_spawned_worker_is_live(self, store, registry, clock, settings):
+        supervisor = make_supervisor(store, registry, clock, settings)
+        supervisor.start(1)
+
+        assert supervisor.has_live_workers() is True
+
+    def test_heartbeat_older_than_the_stale_window_is_not_live(
+        self, store, registry, clock, settings
+    ):
+        supervisor = make_supervisor(store, registry, clock, settings)
+        supervisor.start(1)
+
+        clock.advance(settings.stale_after_seconds + 1)
+
+        assert supervisor.has_live_workers() is False
+
+    def test_dead_process_is_not_live_even_with_a_fresh_heartbeat(
+        self, store, registry, clock, settings
+    ):
+        supervisor = make_supervisor(store, registry, clock, settings)
+        supervisor.start(1)
+        worker_beats(store, clock, "br-1")
+        registry.created[0].exit(1)
+
+        assert supervisor.has_live_workers() is False
+
+
 class TestCrashDetection:
     """Обнаружение падения и запись ошибки."""
 

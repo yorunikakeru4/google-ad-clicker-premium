@@ -1471,6 +1471,30 @@ class Supervisor:
 
     # --- наблюдение ------------------------------------------------------
 
+    def has_live_workers(self) -> bool:
+        """Хотя бы один воркер сейчас жив: процесс жив и heartbeat свежий.
+
+        Двойная проверка — ровно та же, что у надзора: ``is_alive()`` (процесс
+        отвечает на ``poll()``) плюс ``last_heartbeat`` не старше
+        ``stale_after_seconds``. Первая ловит умерший процесс (heartbeat мог
+        быть написан только что), вторая — зависший браузер: жив по
+        ``poll()``, но молчит дольше stale-окна. Наблюдение, а не запись:
+        ``last_heartbeat`` двигает ``_observe_heartbeats`` из той же строки
+        ``workers.heartbeat_at``, которую пишет воркер, поэтому метод никого
+        не убивает и не рестартит — в отличие от ``tick()``.
+
+        Нужен фоновым метрикам (импульс uptime): реестр супервизора —
+        источник правды о живости в момент тика, без отдельного SQL-опроса.
+        """
+        now = self._clock.wall()
+        with self._lock:
+            return any(
+                not worker.circuit_open
+                and worker.is_alive()
+                and now - worker.last_heartbeat <= self.settings.stale_after_seconds
+                for worker in self._workers.values()
+            )
+
     def alive_browser_ids(self) -> list[str]:
         with self._lock:
             return sorted(
