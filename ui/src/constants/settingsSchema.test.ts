@@ -70,6 +70,9 @@ const ENGINE_SCHEMA: Record<string, Record<string, EngineField>> = {
     captcha_policy: { type: "str", default: "stop" },
     captcha_threshold_percent: { type: "float", default: 5.0 },
     captcha_threshold_action: { type: "str", default: "warn" },
+    log_retention_days: { type: "int", default: 30 },
+    log_file_level: { type: "str", default: "INFO" },
+    db_size_limit_mb: { type: "int", default: 0 },
   },
 };
 
@@ -88,6 +91,8 @@ const ENGINE_LIMITS: Record<string, { min: number; max: number }> = {
   "behavior.wait_factor": { min: 0.01, max: 100 },
   "behavior.max_scroll_limit": { min: 0, max: 3600 },
   "behavior.captcha_threshold_percent": { min: 0, max: 100 },
+  "behavior.log_retention_days": { min: 1, max: 3650 },
+  "behavior.db_size_limit_mb": { min: 0, max: 102400 },
 };
 
 /** Какие типы формы допустимы для типа движка (enum — тоже свой тип). */
@@ -145,11 +150,11 @@ describe("settingsSchema: секции и поля против _SCHEMA", () => 
 
   // Счётчик — смотри на сумму ключей _SCHEMA, а не на него самого: он ловит
   // потерю поля и дубль пути разом. Меняется только вместе с _SCHEMA
-  // (36 полей до политики CAPTCHA + 3 новых = 39).
-  it("в форме ровно 39 полей, без повторов пути", () => {
+  // (36 полей до политики CAPTCHA + 3 под неё + 3 про хранение логов = 42).
+  it("в форме ровно 42 поля, без повторов пути", () => {
     const paths = allFields().map((row) => row.path);
     expect(new Set(paths).size, "пути полей повторяются").toBe(paths.length);
-    expect(paths).toHaveLength(39);
+    expect(paths).toHaveLength(42);
   });
 
   it("типы формы соответствуют типам движка", () => {

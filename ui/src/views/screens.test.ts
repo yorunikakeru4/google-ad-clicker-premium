@@ -189,11 +189,12 @@ describe("экраны на шаблоне", () => {
       "filter-since",
       "filter-until",
       "load-older",
-      "export-csv",
+      "export-open",
       "live-toggle",
       "live-status",
       "logs-count",
       "logs-scroll",
+      "db-size",
     ]) {
       expect(html).toContain(`data-test="${hook}"`);
     }
@@ -205,6 +206,9 @@ describe("экраны на шаблоне", () => {
     expect(html).not.toContain("logs-table");
     expect(html).not.toContain("logs-empty");
     expect(html).toContain("0 из");
+    // диалог экспорта закрыт, лимит БД не загружен — не выдумываем значения
+    expect(html).not.toContain("export-dialog");
+    expect(html).toContain("не загружен");
   });
 
   it("Proxies: PageLayout, действия и пустое состояние без данных", async () => {
