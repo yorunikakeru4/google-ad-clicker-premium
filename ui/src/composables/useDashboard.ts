@@ -13,6 +13,7 @@ import {
   type DbApi,
   type RequestsLastHour,
   type RunsSummary,
+  type UptimeSummary,
 } from "../lib/dbApi";
 import type { LogRow } from "../lib/logMerge";
 import { collectAllRows } from "../lib/logMerge";
@@ -22,6 +23,13 @@ import { useDb } from "./useDb";
 
 /** Окно дашборда — сутки: сценарии, клики, CAPTCHA и запросы за 24 часа. */
 export const DASHBOARD_WINDOW_SECONDS = 24 * 60 * 60;
+
+/**
+ * Окно карточки Uptime — часы, а не секунды: Rust-команда строит окно по
+ * часовой сетке от текущего бакета. 24 часа — то же окно, что у соседних
+ * карточек, чтобы доли читались в одном масштабе.
+ */
+export const UPTIME_WINDOW_HOURS = DASHBOARD_WINDOW_SECONDS / 3600;
 
 /** Обновление метрик: реже опроса демона — выборка из SQLite дороже тика. */
 export const DASHBOARD_REFRESH_MS = 5000;
@@ -64,6 +72,8 @@ export interface DashboardState {
   runs: Ref<RunsSummary | null>;
   requests: Ref<RequestsLastHour | null>;
   captchaShare: Ref<number | null>;
+  /** Uptime-доля за окно UPTIME_WINDOW_HOURS; null — ещё не читалась. */
+  uptime: Ref<UptimeSummary | null>;
   workers: Ref<ActiveWorker[]>;
   series: Ref<DashboardSeries>;
   /** Текст ошибки последней выборки; null — всё прочитано. */
@@ -90,6 +100,7 @@ export function createDashboard(api: DbApi = dbApi): DashboardState {
   const runs = ref<RunsSummary | null>(null);
   const requests = ref<RequestsLastHour | null>(null);
   const captchaShare = ref<number | null>(null);
+  const uptime = ref<UptimeSummary | null>(null);
   const workers = ref<ActiveWorker[]>([]);
   const series = ref<DashboardSeries>(EMPTY_SERIES);
   const error = ref<string | null>(null);
@@ -124,7 +135,7 @@ export function createDashboard(api: DbApi = dbApi): DashboardState {
       const since = now - DASHBOARD_WINDOW_SECONDS;
       const buckets = buildHourlyBuckets(since, now);
 
-      const [summary, clicks, load, share, active, captchaRows] =
+      const [summary, clicks, load, share, active, captchaRows, uptimeSummary] =
         await Promise.all([
           api.runsSummary(since),
           api.clicksPerHour(since, buckets.length),
@@ -132,11 +143,13 @@ export function createDashboard(api: DbApi = dbApi): DashboardState {
           api.captchaShare(since),
           api.activeWorkers(now, ACTIVE_WORKER_STALE_SECS),
           loadCaptchaRows(since),
+          api.uptimeSummary(UPTIME_WINDOW_HOURS),
         ]);
 
       runs.value = summary;
       requests.value = load;
       captchaShare.value = share;
+      uptime.value = uptimeSummary;
       workers.value = active;
       series.value = {
         labels: buckets.map(hourLabel),
@@ -191,6 +204,7 @@ export function createDashboard(api: DbApi = dbApi): DashboardState {
     runs,
     requests,
     captchaShare,
+    uptime,
     workers,
     series,
     error,

@@ -13,7 +13,7 @@ use crate::db::{
     CaptchaEventRow, DbError, DbReader, DbSize, DiagnosticRow, LogEntry, LogFilters, LogPageEntry,
     ProfileRow, ProxyRow,
 };
-use crate::metrics::{ActiveWorker, HourlyClicks, RequestsLastHour, RunsSummary};
+use crate::metrics::{ActiveWorker, HourlyClicks, RequestsLastHour, RunsSummary, UptimeSummary};
 
 /// Имя переменной окружения с путём к БД — зеркало `DB_ENV_VAR` из
 /// `engine/log.py`.
@@ -251,6 +251,17 @@ pub fn active_workers(
     with_reader(&state.0, |reader| {
         reader.active_workers(now, threshold_secs)
     })
+}
+
+/// Доля времени с живым воркером за окно в `since_hours` часов — карточка
+/// Uptime. `ratio: None` — в окне нет данных (замер идёт с первого запуска
+/// демона); порог «≥99%» проверяет UI.
+#[tauri::command]
+pub fn uptime_summary(
+    state: State<'_, DbState>,
+    since_hours: u32,
+) -> Result<UptimeSummary, DbError> {
+    with_reader(&state.0, |reader| reader.uptime_summary(since_hours))
 }
 
 /// Список прокси экрана Proxies: строки таблицы + назначенный воркер и
