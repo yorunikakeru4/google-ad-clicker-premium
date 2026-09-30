@@ -34,6 +34,12 @@ from engine.captcha_threshold import (
     DEFAULT_CAPTCHA_THRESHOLD_ACTION,
     DEFAULT_CAPTCHA_THRESHOLD_PERCENT,
 )
+from engine.cleanup import (
+    DEFAULT_CLEANUP_INTERVAL_DAYS,
+    DEFAULT_CLEANUP_TIME,
+    MAX_CLEANUP_INTERVAL_DAYS,
+    MIN_CLEANUP_INTERVAL_DAYS,
+)
 from engine.log_rotation import (
     DEFAULT_DB_SIZE_LIMIT_MB,
     DEFAULT_LOG_FILE_LEVEL,
@@ -112,6 +118,12 @@ _SCHEMA: dict[str, dict[str, tuple[type | tuple[type, ...], Any]]] = {
         "log_retention_days": (int, DEFAULT_LOG_RETENTION_DAYS),
         "log_file_level": (str, DEFAULT_LOG_FILE_LEVEL),
         "db_size_limit_mb": (int, DEFAULT_DB_SIZE_LIMIT_MB),
+        # Очистка профилей (план §5, фаза 10): локальное время ежедневного
+        # прогона и период между прогонами в днях. Дефолт и границы периода —
+        # из engine.cleanup, где их же читает расписание демона: второго
+        # источника правды о поле быть не должно.
+        "cleanup_time": (str, DEFAULT_CLEANUP_TIME),
+        "cleanup_interval_days": (int, DEFAULT_CLEANUP_INTERVAL_DAYS),
     },
 }
 
@@ -142,6 +154,20 @@ _MAX_WORKERS = 8
 # Ночное окно 23:00-06:00 — норма, а не ошибка, поэтому сравнение концов
 # интервала на "start < end" не делается вовсе.
 _INTERVAL_RE = re.compile(r"^([01]\d|2[0-3]):([0-5]\d)$")
+
+# Поля формата ЧЧ:ММ: полный путь поля -> разрешено ли пустое значение.
+#
+# Список явный, а не по суффиксу имени, как было раньше
+# (``endswith(("running_interval_start", "running_interval_end"))``): прежнее
+# правило молча распространялось на любое новое поле с похожим именем и так же
+# молча его теряло. Пусто у интервалов дня означает «не задано» и остаётся
+# разрешённым, а у ``cleanup_time`` пустая строка означала бы расписание без
+# времени — там пустое значение ошибка.
+_HHMM_FIELDS: dict[str, bool] = {
+    "behavior.running_interval_start": True,
+    "behavior.running_interval_end": True,
+    "behavior.cleanup_time": False,
+}
 
 # Диапазоны, которые нельзя вывести из типа: значение осмысленное, но
 # запредельное (час ожидания вместо секунд, потолок кликов в миллион).
@@ -229,9 +255,12 @@ def _validate_field(field_path: str, value: Any, expected: type) -> list[dict[st
         )
         return problems
 
-    if isinstance(value, str) and field_path.endswith(("running_interval_start", "running_interval_end")):
-        if value != "" and not _INTERVAL_RE.match(value):
-            problems.append({"field": field_path, "message": "ожидается ЧЧ:ММ в пределах 00:00-23:59"})
+    if isinstance(value, str) and field_path in _HHMM_FIELDS:
+        empty_allowed = _HHMM_FIELDS[field_path]
+        if not (empty_allowed and value == "") and not _INTERVAL_RE.match(value):
+            problems.append(
+                {"field": field_path, "message": "ожидается ЧЧ:ММ в пределах 00:00-23:59"}
+            )
         return problems
 
     if isinstance(value, (int, float)) and not isinstance(value, bool):
@@ -273,6 +302,12 @@ def _numeric_limits(field_path: str) -> tuple[float, float] | None:
         # 0 — лимит выключен; 102400 (100 ГБ) — потолок, дальше защита уже
         # не про «не задисковить машину», а про неправильно заданный путь.
         "behavior.db_size_limit_mb": (0, _MAX_DB_SIZE_LIMIT_MB),
+        # Период между прогонами очистки: от раза в сутки до раза в месяц —
+        # дальше мусор и так копился бы дольше, чем живёт система.
+        "behavior.cleanup_interval_days": (
+            MIN_CLEANUP_INTERVAL_DAYS,
+            MAX_CLEANUP_INTERVAL_DAYS,
+        ),
     }
     return limits.get(field_path)
 
