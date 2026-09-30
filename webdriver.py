@@ -352,6 +352,47 @@ def _override_timezone(driver, timezone: object, fields: Optional[dict] = None) 
     log.debug("browser", "Timezone of", fields={"timezone": timezone, **(fields or {})})
 
 
+# Фолбэк-размер, когда maximize недоступен. Значение проверено живыми
+# прогонами: set_window_size стабилен в тех условиях, где maximize флакает.
+_MAXIMIZE_FALLBACK_SIZE = (1600, 900)
+
+
+def _maximize_with_fallback(driver) -> None:
+    """Максимизация с предсказуемым фолбэком; никогда не бросает.
+
+    На живом стеке (Wayland + Chromium 153, после CDP-команд времени
+    часового пояса) ``maximize_window`` падает с ``'Runtime.evaluate'
+    wasn't found`` примерно в двух прогонах из трёх — поймано e2e.
+    Координатным кликам (pyautogui) нужен вьюпорт, поэтому при отказе
+    ставим явный размер: ``set_window_size`` в тех же условиях отработал
+    во всех живых прогонах. Двойной отказ — только WARNING, создание
+    драйвера не роняет.
+    """
+    log.debug("browser", "Maximizing window...")
+    try:
+        driver.maximize_window()
+        return
+    except Exception as exc:
+        log.warning(
+            "browser",
+            "maximize failed, falling back to explicit window size",
+            fields={"error": str(exc)[:200], "error_type": type(exc).__name__},
+        )
+    try:
+        driver.set_window_size(*_MAXIMIZE_FALLBACK_SIZE)
+        log.debug(
+            "browser",
+            "window resized to fallback size",
+            fields={"width": _MAXIMIZE_FALLBACK_SIZE[0], "height": _MAXIMIZE_FALLBACK_SIZE[1]},
+        )
+    except Exception as exc:
+        log.warning(
+            "browser",
+            "fallback set_window_size failed as well",
+            fields={"error": str(exc)[:200], "error_type": type(exc).__name__},
+        )
+
+
 def create_webdriver(
     proxy: str, user_agent: Optional[str] = None, plugin_folder_name: Optional[str] = None
 ) -> tuple[undetected_chromedriver.Chrome, Optional[str]]:
@@ -562,8 +603,7 @@ def create_webdriver(
         log.debug("browser", "Setting window size", fields={"width": width, "height": height})
         driver.set_window_size(width, height)
     else:
-        log.debug("browser", "Maximizing window...")
-        driver.maximize_window()
+        _maximize_with_fallback(driver)
 
     if config.webdriver.shift_windows:
         width, height = (
@@ -715,8 +755,7 @@ def create_seleniumbase_driver(
         log.debug("browser", "Setting window size", fields={"width": width, "height": height})
         driver.set_window_size(int(width), int(height))
     else:
-        log.debug("browser", "Maximizing window...")
-        driver.maximize_window()
+        _maximize_with_fallback(driver)
 
     if config.webdriver.shift_windows:
         width, height = (

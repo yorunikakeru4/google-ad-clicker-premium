@@ -1144,3 +1144,49 @@ class TestProfileSettingsSeleniumBase:
             {"timezoneId": "Europe/Berlin"}
         ]
         assert driver._custom_timezone == "Europe/Berlin"
+
+
+class _MaximizeProbe:
+    """Драйвер-заглушка: фиксирует вызовы maximize/set_window_size."""
+
+    def __init__(self, fail_max: bool = False, fail_resize: bool = False) -> None:
+        self.fail_max = fail_max
+        self.fail_resize = fail_resize
+        self.calls: list[tuple] = []
+
+    def maximize_window(self) -> None:
+        self.calls.append(("maximize",))
+        if self.fail_max:
+            raise RuntimeError("unknown error: 'Runtime.evaluate' wasn't found")
+
+    def set_window_size(self, width, height) -> None:
+        self.calls.append(("resize", width, height))
+        if self.fail_resize:
+            raise RuntimeError("resize тоже недоступен")
+
+
+def test_maximize_falls_back_to_explicit_window_size():
+    """maximize на живом стеке флакает (Wayland+CDP, e2e), фолбэк обязан работать."""
+    driver = _MaximizeProbe(fail_max=True)
+
+    webdriver._maximize_with_fallback(driver)
+
+    # попытка maximize была, но вьюпорт даёт фолбэк-размер
+    assert driver.calls == [("maximize",), ("resize", 1600, 900)]
+
+
+def test_healthy_maximize_does_not_resize():
+    driver = _MaximizeProbe(fail_max=False)
+
+    webdriver._maximize_with_fallback(driver)
+
+    assert driver.calls == [("maximize",)]
+
+
+def test_double_failure_never_raises_into_the_scenario():
+    """Ни maximize, ни фолбэк не роняют создание драйвера — только WARNING."""
+    driver = _MaximizeProbe(fail_max=True, fail_resize=True)
+
+    webdriver._maximize_with_fallback(driver)  # не должен бросить
+
+    assert [c[0] for c in driver.calls] == ["maximize", "resize"]
