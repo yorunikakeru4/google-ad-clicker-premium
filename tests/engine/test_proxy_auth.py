@@ -203,6 +203,112 @@ def test_manager_registers_auth_handler() -> None:
         manager.stop()
 
 
+def _paused_event(
+    request_id: str, session_id: str | None = None, response_stage: bool = False
+) -> dict:
+    message: dict = {
+        "method": "Fetch.requestPaused",
+        "params": {"requestId": request_id, "request": {"url": "https://example.com/"}},
+    }
+    if response_stage:
+        message["params"]["responseStatusCode"] = 200
+    if session_id:
+        message["sessionId"] = session_id
+    return message
+
+
+def test_paused_request_is_continued_without_auth_roundtrip() -> None:
+    """Chrome 153 ставит ``requestPaused`` перед CONNECT даже без ``patterns``.
+
+    Без ``continueRequest`` соединение в сеть не уходит, прокси не отдаёт
+    407, ``authRequired`` не приходит — навигация виснет до таймаута.
+    Поймано живым e2e-прогоном: страницы через авторизованный прокси
+    не открывались ни разу, 0 событий авторизации.
+    """
+    ws = FakeWs()
+    manager = _started_manager(ws)
+    try:
+        ws.incoming.put(json.dumps(_paused_event("P-1", session_id="S-9")))
+        assert _wait_until(lambda: len(_sent_methods(ws, "Fetch.continueRequest")) == 1)
+        sent = _sent_methods(ws, "Fetch.continueRequest")[0]
+        assert sent["params"] == {"requestId": "P-1"}
+        assert sent["sessionId"] == "S-9"
+        # Пауза — не неудачная авторизация: счётчик не растёт.
+        assert manager.fail_count == 0
+    finally:
+        manager.stop()
+
+
+def test_response_stage_pause_uses_continue_response() -> None:
+    ws = FakeWs()
+    manager = _started_manager(ws)
+    try:
+        ws.incoming.put(json.dumps(_paused_event("P-2", response_stage=True)))
+        assert _wait_until(lambda: len(_sent_methods(ws, "Fetch.continueResponse")) == 1)
+        assert _sent_methods(ws, "Fetch.continueRequest") == []
+    finally:
+        manager.stop()
+
+
+def test_lowercase_scheme_from_real_chrome_is_accepted() -> None:
+    """Chrome шлёт scheme строчными (``basic``), а словарь — «Basic».
+
+    Регистр несовпадение уводило вызов в CancelAuth: страница получала
+    HTTP 407 и не открывалась — поймано живым e2e-прогоном через
+    авторизованный прокси (unit-тесты использовали «Basic» с заглавной).
+    """
+    ws = FakeWs()
+    manager = _started_manager(ws)
+    try:
+        event = _auth_event("REQ-lower", scheme="basic")
+        ws.incoming.put(json.dumps(event))
+        assert _wait_until(lambda: len(_sent_methods(ws, "Fetch.continueWithAuth")) == 1)
+        sent = _sent_methods(ws, "Fetch.continueWithAuth")[0]
+        assert sent["params"]["authChallengeResponse"]["response"] == "ProvideCredentials"
+        assert manager.fail_count == 0
+    finally:
+        manager.stop()
+
+
+def test_auth_answer_is_delivered_in_the_sessions_session() -> None:
+    """Ответ на authRequired обязан уйти в ту же sessionId.
+
+    Событие привязано к сессии (flatten), а ответ без sessionId Chrome
+    отвергает — запрос падает с net::ERR_ABORTED, страница не открывается
+    (поймано живым e2e-прогоном через авторизованный прокси).
+    """
+    ws = FakeWs()
+    manager = _started_manager(ws)
+    try:
+        event = _auth_event("REQ-S")
+        event["sessionId"] = "S-77"
+        ws.incoming.put(json.dumps(event))
+        assert _wait_until(lambda: len(_sent_methods(ws, "Fetch.continueWithAuth")) == 1)
+        sent = _sent_methods(ws, "Fetch.continueWithAuth")[0]
+        assert sent["sessionId"] == "S-77"
+        # повтор того же requestId (CancelAuth) тоже уходит в сессию
+        ws.incoming.put(json.dumps(event))
+        assert _wait_until(lambda: len(_sent_methods(ws, "Fetch.continueWithAuth")) == 2)
+        cancelled = _sent_methods(ws, "Fetch.continueWithAuth")[1]
+        assert cancelled["params"]["authChallengeResponse"]["response"] == "CancelAuth"
+        assert cancelled["sessionId"] == "S-77"
+    finally:
+        manager.stop()
+
+
+def test_paused_and_auth_are_answered_independently() -> None:
+    ws = FakeWs()
+    manager = _started_manager(ws)
+    try:
+        ws.incoming.put(json.dumps(_paused_event("P-3")))
+        ws.incoming.put(json.dumps(_auth_event("REQ-9")))
+        assert _wait_until(lambda: len(_sent_methods(ws, "Fetch.continueRequest")) == 1)
+        assert _wait_until(lambda: len(_sent_methods(ws, "Fetch.continueWithAuth")) == 1)
+        assert manager.fail_count == 0
+    finally:
+        manager.stop()
+
+
 # --- Network.enable на каждой новой сессии ---
 
 

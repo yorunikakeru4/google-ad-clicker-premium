@@ -71,7 +71,9 @@ __all__ = [
 log = get_logger()
 
 # Схемы, для которых CDP умеет отдать логин/пароль.
-_SUPPORTED_SCHEMES = frozenset({"Basic", "Digest"})
+# Схемы в строчном виде: Chrome шлёт authChallenge.scheme строчными («basic»),
+# а прежний словарь с заглавными уводил вызов в CancelAuth → HTTP 407 (e2e).
+_SUPPORTED_SCHEMES = frozenset({"basic", "digest"})
 
 
 def mask_secret(value: str) -> str:
@@ -204,6 +206,8 @@ class ProxyAuthManager:
             return self
         self._unsubscribes = [
             self._client.on("Fetch.authRequired", self.handle_event),
+            # Паузы приходят и без patterns (Chrome 153, см. handle_event).
+            self._client.on("Fetch.requestPaused", self.handle_event),
             self._client.on("Target.attachedToTarget", self.handle_attached),
             self._client.on("Target.detachedFromTarget", self.handle_detached),
             self._client.on("Network.requestWillBeSent", self.handle_network_event),
@@ -228,13 +232,44 @@ class ProxyAuthManager:
             self._client.stop()
 
     def handle_event(self, message: dict[str, Any]) -> None:
-        """Точка входа для событий CDP; посторонние методы игнорируются."""
-        if not isinstance(message, dict) or message.get("method") != "Fetch.authRequired":
+        """Точка входа для событий Fetch; посторонние методы игнорируются.
+
+        ``requestPaused`` — обязательная ветка, хотя ``patterns`` не заданы:
+        Chrome 153 ставит паузу перед CONNECT, и без ``continueRequest``
+        соединение в сеть не уходит — прокси не отдаёт 407,
+        ``authRequired`` не приходит, навигация виснет до таймаута
+        (поймано живым e2e-прогоном: через авторизованный прокси не
+        открылась ни одна страница, 0 событий авторизации).
+        """
+        if not isinstance(message, dict):
             return
+        method = message.get("method")
         params = message.get("params")
         if not isinstance(params, dict):
             return
-        self._answer_auth_challenge(params)
+        if method == "Fetch.authRequired":
+            # sessionId обязателен: событие сессионное, ответ без sessionId
+            # Chrome отвергает (net::ERR_ABORTED, страница не открывается —
+            # поймано живым e2e-прогоном).
+            self._answer_auth_challenge(params, message.get("sessionId"))
+        elif method == "Fetch.requestPaused":
+            self._continue_paused(params, message.get("sessionId"))
+
+    def _continue_paused(self, params: dict[str, Any], session_id: str | None) -> None:
+        """Продолжает поставленный на паузу запрос в его сессии.
+
+        Request-стадия → ``continueRequest``, ответная стадия (есть
+        ``responseStatusCode``) → ``continueResponse``. Пауза не считается
+        неудачей авторизации и не трогает ``fail_count``.
+        """
+        request_id = params.get("requestId")
+        if not isinstance(request_id, str):
+            return
+        if "responseStatusCode" in params:
+            method = "Fetch.continueResponse"
+        else:
+            method = "Fetch.continueRequest"
+        self._client.send(method, {"requestId": request_id}, session_id=session_id)
 
     def handle_attached(self, message: dict[str, Any]) -> None:
         """Новая сессия таргета: та же пара Fetch + Network, что и на старте."""
@@ -292,7 +327,7 @@ class ProxyAuthManager:
                 },
             )
 
-    def _answer_auth_challenge(self, params: dict[str, Any]) -> None:
+    def _answer_auth_challenge(self, params: dict[str, Any], session_id: str | None = None) -> None:
         request_id = params.get("requestId")
         challenge = params.get("authChallenge")
         if not isinstance(request_id, str) or not request_id:
@@ -302,17 +337,17 @@ class ProxyAuthManager:
             challenge = {}
         source = challenge.get("source")
         scheme = challenge.get("scheme")
-        if source != "Proxy" or scheme not in _SUPPORTED_SCHEMES:
+        if source != "Proxy" or str(scheme or "").lower() not in _SUPPORTED_SCHEMES:
             log.debug(
                 "proxy",
                 "non-proxy auth challenge, cancelling",
                 fields={"source": source, "scheme": scheme},
             )
-            self._cancel(request_id)
+            self._cancel(request_id, session_id)
             return
         if request_id in self._answered:
             log.info("proxy", "proxy auth rejected for request, cancelling")
-            self._cancel(request_id)
+            self._cancel(request_id, session_id)
             self._register_failure()
             return
         self._answered.add(request_id)
@@ -326,13 +361,15 @@ class ProxyAuthManager:
                     "password": self._password,
                 },
             },
+            session_id=session_id,
         )
         log.debug("proxy", "answered proxy auth challenge")
 
-    def _cancel(self, request_id: str) -> None:
+    def _cancel(self, request_id: str, session_id: str | None = None) -> None:
         self._client.send(
             "Fetch.continueWithAuth",
             {"requestId": request_id, "authChallengeResponse": {"response": "CancelAuth"}},
+            session_id=session_id,
         )
 
     def _register_failure(self) -> None:
