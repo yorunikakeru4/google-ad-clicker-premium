@@ -1,6 +1,9 @@
 import { describe, expect, it } from "vitest";
 import {
+  formatBytes,
+  formatDuration,
   formatLastError,
+  formatLocalDateTime,
   formatPid,
   formatUptime,
   formatClockTime,
@@ -75,5 +78,62 @@ describe("formatLastUsed", () => {
   it("дробные секунды не ломают формат", () => {
     const at = new Date(2026, 0, 1, 23, 59, 59).getTime() / 1000 + 0.999;
     expect(formatLastUsed(at)).toBe("2026-01-01 23:59");
+  });
+});
+
+describe("formatLocalDateTime", () => {
+  it("без значения — тире, а не «Invalid Date»", () => {
+    expect(formatLocalDateTime(null)).toBe("—");
+    expect(formatLocalDateTime(undefined)).toBe("—");
+    expect(formatLocalDateTime(Number.NaN)).toBe("—");
+  });
+
+  it("эпоха в секундах — дата и время локального пояса", () => {
+    const at = new Date(2026, 9, 30, 4, 0, 0).getTime() / 1000;
+    expect(formatLocalDateTime(at)).toBe("2026-10-30 04:00");
+  });
+
+  it("дробная эпоха (float в kv) не ломает минуту", () => {
+    const at = new Date(2026, 0, 1, 23, 59, 59).getTime() / 1000 + 0.4;
+    expect(formatLocalDateTime(at)).toBe("2026-01-01 23:59");
+  });
+});
+
+describe("formatBytes", () => {
+  it("без значения и мусор — тире", () => {
+    expect(formatBytes(null)).toBe("—");
+    expect(formatBytes(undefined)).toBe("—");
+    expect(formatBytes(-1)).toBe("—");
+    expect(formatBytes(Number.NaN)).toBe("—");
+  });
+
+  it("меньше килобайта — целые байты", () => {
+    expect(formatBytes(0)).toBe("0 Б");
+    expect(formatBytes(512)).toBe("512 Б");
+    expect(formatBytes(1023)).toBe("1023 Б");
+  });
+
+  it("килобайты и мегабайты с одной цифрой после запятой", () => {
+    expect(formatBytes(1024)).toBe("1.0 КБ");
+    expect(formatBytes(1536)).toBe("1.5 КБ");
+    expect(formatBytes(1024 * 1024 - 1)).toBe("1024.0 КБ");
+    expect(formatBytes(1024 * 1024)).toBe("1.0 МБ");
+    expect(formatBytes(Math.round(1.5 * 1024 * 1024))).toBe("1.5 МБ");
+  });
+});
+
+describe("formatDuration", () => {
+  it("без значения — тире", () => {
+    expect(formatDuration(null)).toBe("—");
+    expect(formatDuration(undefined)).toBe("—");
+    expect(formatDuration(Number.NaN)).toBe("—");
+    expect(formatDuration(-5)).toBe("—");
+  });
+
+  it("миллисекунды — секунды с десятой", () => {
+    expect(formatDuration(1200)).toBe("1.2 с");
+    expect(formatDuration(400)).toBe("0.4 с");
+    expect(formatDuration(10_000)).toBe("10.0 с");
+    expect(formatDuration(0)).toBe("0.0 с");
   });
 });
