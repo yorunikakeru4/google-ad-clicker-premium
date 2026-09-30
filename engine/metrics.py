@@ -22,36 +22,44 @@
 * ``uptime_seconds`` — секунды бакета, в которые жив был хотя бы один
   воркер.
 
-**Формула uptime.** Воркер жив в момент ``t`` ⇔ найдётся отметка
-``workers.heartbeat_at`` с ``t - stale_after <= heartbeat_at <= t``, где
-``stale_after`` — ``supervisor.DEFAULT_STALE_AFTER_SECONDS``. У каждой
-отметки берётся интервал жизни ``[heartbeat_at, heartbeat_at + stale_after)``,
-интервалы одного воркера сортируются и сливаются (пересекающиеся и смежные —
-в один), объединение пересекается с бакетом ``[bucket, bucket + 3600)`` и
-суммируется. Точка ``heartbeat_at + stale_after`` имеет нулевую меру, поэтому
-полузамкнутый интервал и незамкнутое ``<=`` в определении дают одну и ту же
-сумму; смежные интервалы сливаются именно чтобы «касание» не выглядело
-разрывом при разборе вручную.
+**Два вида обновлений, у каждого — свой контракт.**
 
-**Запись идемпотентна**: ``INSERT ... ON CONFLICT(bucket) DO UPDATE`` всех
-колонок — повторный пересчёт заменяет значения, а не плодит дубли и не
-оставляет устаревшего. На этом стоит догон после рестарта.
+*Исторические колонки* пересчитываются из SQL (:func:`refresh_range`,
+:func:`write_bucket`): повторный пересчёт заменяет значения, поэтому запись
+идемпотентна — на этом стоит догон после рестарта. Пересчёт трогает ровно
+свои четыре колонки.
 
-Модуль обязан оставаться лёгким: только стандартная библиотека,
-``engine.db.migrations`` и константа супервизора. Ни логгера, ни открытия БД
-на уровне импорта — сбой тика логирует вызывающий job.
+*Uptime* пишется только аддитивными импульсами (:func:`record_uptime_impulse`):
+``uptime_seconds += elapsed``, монотонный счётчик бакета с потолком в длину
+часа. Исторический пересчёт его **не трогает вообще** — иначе SQL затирал бы
+накопленное. Живость в момент тика определяет реестр супервизора
+(``Supervisor.has_live_workers``: процесс по ``poll()`` плюс heartbeat не
+старше ``DEFAULT_STALE_AFTER_SECONDS``), а не SQL по ``workers``: тикающий
+реестр эквивалентен ``EXISTS (... heartbeat_at >= now - stale_after)`` в
+момент тика (та же колонка, тот же порог, наблюдение супервизора отстаёт от
+БД максимум на свой интервал, который лежит внутри stale-окна), но не требует
+второго запроса и видит воркеров так, как их видит надзор.
+
+Старый механизм «интервалы жизни ``[heartbeat, heartbeat + 15с)``» удалён:
+в ``workers`` хранится только последняя отметка, поэтому интервалы прошлых
+часов реконструировать не из чего, а текущий бакет давал бы ≤15 с на воркера —
+для NFR «uptime ≥99% за окно» такие цифры бессмысленны. Прошлые бакеты без
+импульсов честно остаются простоем: замер живёт с первого запуска демона,
+окна до старта в доле считаются простоем (см. :func:`uptime_ratio`).
+
+Модуль обязан оставаться лёгким: только стандартная библиотека и
+``engine.db.migrations``. Ни логгера, ни открытия БД на уровне импорта —
+сбой тика логирует вызывающий job.
 """
 
 from __future__ import annotations
 
 import math
 import time
-from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-from engine.control_plane.supervisor import DEFAULT_STALE_AFTER_SECONDS
 from engine.db import migrations
 
 if TYPE_CHECKING:
@@ -65,15 +73,15 @@ __all__ = [
     "BucketMetrics",
     "aggregate_bucket",
     "bucket_of",
-    "bucket_uptime_seconds",
     "classify_run_status",
-    "merge_intervals",
+    "record_uptime_impulse",
     "refresh_range",
     "uptime_ratio",
     "write_bucket",
 ]
 
-# Длина бакета, секунды. Час — и метрика «запросы/час», и период job'а.
+# Длина бакета, секунды. Час — и метрика «запросы/час», и период барьера
+# исторического пересчёта, и потолок счётчика uptime.
 BUCKET_SECONDS = 3600
 
 # Итоги классификации: те же три значения, что RunOutcome в metrics.rs.
@@ -86,17 +94,26 @@ RUN_OUTCOME_OTHER = "other"
 _SUCCESSES = frozenset({"ok", "completed"})
 _FAILURES = frozenset({"failed", "crashed"})
 
-# Одна строка на бакет: PK bucket плюс пересчёт всех пяти колонок.
-_UPSERT_SQL = (
-    "INSERT INTO metrics_hourly "
-    "(bucket, successes, failures, requests, captchas, uptime_seconds) "
-    "VALUES (?, ?, ?, ?, ?, ?) "
+# Исторический upsert: только четыре своих колонки. uptime_seconds в списке
+# намеренно нет — пересчёт не имеет права трогать накопленный счётчик.
+_HISTORY_UPSERT_SQL = (
+    "INSERT INTO metrics_hourly (bucket, successes, failures, requests, captchas) "
+    "VALUES (?, ?, ?, ?, ?) "
     "ON CONFLICT(bucket) DO UPDATE SET "
     "successes = excluded.successes, "
     "failures = excluded.failures, "
     "requests = excluded.requests, "
-    "captchas = excluded.captchas, "
-    "uptime_seconds = excluded.uptime_seconds"
+    "captchas = excluded.captchas"
+)
+
+# Импульс uptime: аддитивная запись с потолком в длину бакета. Потолок —
+# страховка от двойного счёта (два демона на одной БД) и от прыжков часов:
+# честная сумма за час физически не превышает 3600. Строка создаётся при
+# необходимости, остальные колонки берут DEFAULT 0.
+_UPTIME_IMPULSE_SQL = (
+    "INSERT INTO metrics_hourly (bucket, uptime_seconds) VALUES (?, ?) "
+    "ON CONFLICT(bucket) DO UPDATE SET "
+    "uptime_seconds = MIN(metrics_hourly.uptime_seconds + excluded.uptime_seconds, ?)"
 )
 
 
@@ -131,81 +148,37 @@ def classify_run_status(status: str | None) -> str:
     return RUN_OUTCOME_OTHER
 
 
-def merge_intervals(intervals: Iterable[tuple[float, float]]) -> list[tuple[float, float]]:
-    """Сливает пересекающиеся и смежные интервалы в отсортированный список.
-
-    Полуинтервалы ``[start, end)``: касание (``start`` равен концу
-    предыдущего) — непрерывная жизнь, а не разрыв, поэтому условие слияния
-    ``start <= конец``. Пустые интервалы (``end <= start``) отбрасываются —
-    нулевое время жизни это не жизнь.
-    """
-    merged: list[tuple[float, float]] = []
-    for start, end in sorted((float(start), float(end)) for start, end in intervals):
-        if end <= start:
-            continue
-        if merged and start <= merged[-1][1]:
-            if end > merged[-1][1]:
-                merged[-1] = (merged[-1][0], end)
-        else:
-            merged.append((start, end))
-    return merged
-
-
-def bucket_uptime_seconds(
-    heartbeats: Iterable[float], bucket: int, stale_after: float = DEFAULT_STALE_AFTER_SECONDS
-) -> int:
-    """Секунды бакета, в которые жив хотя бы один воркер (0..3600).
-
-    Каждой отметке соответствует интервал жизни
-    ``[heartbeat_at, heartbeat_at + stale_after)``; интервалы всех воркеров
-    сливаются (см. :func:`merge_intervals`), объединение пересекается с
-    бакетом ``[bucket, bucket + 3600)`` — то есть clamp к бакету, — и длины
-    суммируются. Дольки секунды округляются до целой: колонка INTEGER, а
-    сумма из дробных heartbeat'ов держит погрешность порядка 1e-9.
-
-    ``stale_after <= 0`` — жить некому, возвращается 0, а не «бесконечная
-    жизнь из-ста нулевых интервалов».
-    """
-    if stale_after <= 0:
-        return 0
-    bucket_end = bucket + BUCKET_SECONDS
-    total = 0.0
-    for start, end in merge_intervals((hb, hb + stale_after) for hb in heartbeats):
-        low = max(start, float(bucket))
-        high = min(end, float(bucket_end))
-        if high > low:
-            total += high - low
-    return math.floor(min(max(total, 0.0), float(BUCKET_SECONDS)) + 0.5)
-
-
 @dataclass(frozen=True)
 class BucketMetrics:
-    """Один час ``metrics_hourly``: пять колонок плюс метка бакета."""
+    """Историческая часть часа ``metrics_hourly``: четыре колонки плюс бакет.
+
+    Без ``uptime_seconds`` намеренно: у этого поля другой писатель
+    (аддитивные импульсы) и другой контракт (монотонность), и смешивать оба
+    в одном значении — прямой путь к затёртому счётчику.
+    """
 
     bucket: int
     successes: int
     failures: int
     requests: int
     captchas: int
-    uptime_seconds: int
 
 
-def aggregate_bucket(
-    db_path: str | Path, bucket: int, *, stale_after: float = DEFAULT_STALE_AFTER_SECONDS
-) -> BucketMetrics:
-    """Считает агрегат бакета по четырём таблицам одним соединением.
+def aggregate_bucket(db_path: str | Path, bucket: int) -> BucketMetrics:
+    """Считает историческую часть бакета по трём таблицам одним соединением.
 
     Один ``conn`` на все чтения: два отдельных соединения могли бы увидеть
     разные снимки и записать бакет, которого не было ни в одном из них.
+    ``uptime_seconds`` здесь не участвует — его источник импульсы, а не SQL.
     """
     conn = migrations.connect(db_path)
     try:
-        return _aggregate(conn, bucket, stale_after)
+        return _aggregate(conn, bucket)
     finally:
         conn.close()
 
 
-def _aggregate(conn: sqlite3.Connection, bucket: int, stale_after: float) -> BucketMetrics:
+def _aggregate(conn: sqlite3.Connection, bucket: int) -> BucketMetrics:
     """Внутренний разбор бакета на открытом соединении (см. aggregate_bucket)."""
     bucket_end = bucket + BUCKET_SECONDS
     successes = 0
@@ -237,52 +210,65 @@ def _aggregate(conn: sqlite3.Connection, bucket: int, stale_after: float) -> Buc
             (bucket, bucket_end),
         ).fetchone()[0]
     )
-    heartbeats = [
-        float(row[0])
-        for row in conn.execute(
-            "SELECT heartbeat_at FROM workers WHERE heartbeat_at IS NOT NULL"
-        ).fetchall()
-    ]
     return BucketMetrics(
         bucket=bucket,
         successes=successes,
         failures=failures,
         requests=requests,
         captchas=captchas,
-        uptime_seconds=bucket_uptime_seconds(heartbeats, bucket, stale_after),
     )
 
 
 def write_bucket(db_path: str | Path, metrics: BucketMetrics) -> None:
-    """Кладёт бакет: ``INSERT ... ON CONFLICT(bucket) DO UPDATE`` всех колонок.
+    """Кладёт историческую часть бакета, не трогая ``uptime_seconds``.
 
-    Идемпотентность — контракт: повторный пересчёт перезаписывает значения и
-    не оставляет ни дублей (PK ``bucket``), ни устаревших цифр. Поэтому
-    догон после рестарта безопасен и его можно гонять сколько угодно раз.
+    Идемпотентность — контракт исторических колонок: повторный пересчёт
+    перезаписывает их и не оставляет ни дублей (PK ``bucket``), ни
+    устаревших цифр. Uptime при этом переживает запись — его писать здесь
+    нельзя (см. :func:`record_uptime_impulse`).
     """
     conn = migrations.connect(db_path)
     try:
         with conn:
-            conn.execute(_UPSERT_SQL, _values(metrics))
+            conn.execute(_HISTORY_UPSERT_SQL, _values(metrics))
+    finally:
+        conn.close()
+
+
+def record_uptime_impulse(db_path: str | Path, bucket: int, seconds: float) -> None:
+    """Прибавляет ``seconds`` живости к счётчику ``uptime_seconds`` бакета.
+
+    Аддитивно и атомарно: строка создаётся при необходимости (исторические
+    колонки — нули), существующая — увеличивается, поэтому рестарт демона
+    продолжает счёт с того места, где он остановился. Потолок — длина бакета
+    (``BUCKET_SECONDS``): честная сумма за час не превышает его, а вот два
+    демона на одной БД или прыжок часов упрутся именно в потолок.
+
+    ``seconds <= 0`` — ничего не пишет: нулевой импульс не создаёт строку,
+    отрицательный был бы багом вызывающего, а не «отрицательным простоем».
+    """
+    if seconds <= 0:
+        return
+    conn = migrations.connect(db_path)
+    try:
+        with conn:
+            conn.execute(_UPTIME_IMPULSE_SQL, (bucket, seconds, BUCKET_SECONDS))
     finally:
         conn.close()
 
 
 def refresh_range(
-    db_path: str | Path,
-    since: float,
-    *,
-    now: float | None = None,
-    stale_after: float = DEFAULT_STALE_AFTER_SECONDS,
+    db_path: str | Path, since: float, *, now: float | None = None
 ) -> list[int]:
-    """Пересчитывает и записывает бакеты ``floor(since/3600)..floor(now/3600)``.
+    """Пересчитывает историю бакетов ``floor(since/3600)..floor(now/3600)``.
 
     Оба края включительно, окно непрерывно: возвращает перечень бакетов по
     возрастанию — ровно то, что записано в БД. Пустой час получает строку
     нулей, а не пропуск, иначе он выпал бы из доли (см. :func:`uptime_ratio`);
     повторный вызов поверх уже записанных строк их пересчитывает, а не
-    дублирует. ``now=None`` — текущее время; тесты передают своё, чтобы окно
-    не уезжало вместе с часами.
+    дублирует. ``uptime_seconds`` не трогается — это контракт
+    :func:`record_uptime_impulse`. ``now=None`` — текущее время; тесты
+    передают своё, чтобы окно не уезжало вместе с часами.
     """
     now_ts = time.time() if now is None else now
     start = bucket_of(since)
@@ -294,7 +280,7 @@ def refresh_range(
     try:
         with conn:
             for bucket in range(start, stop + 1, BUCKET_SECONDS):
-                conn.execute(_UPSERT_SQL, _values(_aggregate(conn, bucket, stale_after)))
+                conn.execute(_HISTORY_UPSERT_SQL, _values(_aggregate(conn, bucket)))
                 written.append(bucket)
     finally:
         conn.close()
@@ -312,6 +298,12 @@ def uptime_ratio(
     строкам: час без строки в ``metrics_hourly`` — это простой (демон не
     писал метрики ровно тогда, когда их не было), и выкидывать его из доли
     значило бы прятать ночные обрывы.
+
+    **Замер идёт с первого запуска демона**: uptime — аддитивный счётчик, и
+    бакеты, относящиеся к времени до старта (включая часы, которые догон
+    записал только что), остаются нулевыми — это простой по построению, а
+    не пропуск измерения. Чем длиннее окно ``since`` до первого запуска,
+    тем ниже доля: окна честно измеряются такими, какими их застал замер.
 
     ``None`` — в окне нет ни одного записанного бакета: метрики ещё не
     считались вовсе, и «0%» врало бы так же, как «100%». Ноль строк в
@@ -339,13 +331,12 @@ def uptime_ratio(
     return total / (BUCKET_SECONDS * slots)
 
 
-def _values(metrics: BucketMetrics) -> tuple[int, int, int, int, int, int]:
-    """Параметры ``_UPSERT_SQL`` в порядке колонок таблицы."""
+def _values(metrics: BucketMetrics) -> tuple[int, int, int, int, int]:
+    """Параметры ``_HISTORY_UPSERT_SQL`` в порядке колонок таблицы."""
     return (
         metrics.bucket,
         metrics.successes,
         metrics.failures,
         metrics.requests,
         metrics.captchas,
-        metrics.uptime_seconds,
     )
