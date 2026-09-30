@@ -81,6 +81,7 @@ from __future__ import annotations
 import os
 import signal
 import subprocess
+import sys
 import threading
 import time
 from collections.abc import Callable
@@ -275,10 +276,27 @@ def default_browser_ids(count: int) -> list[str]:
 def default_command(browser_id: str) -> list[str]:
     """Команда запуска воркера по умолчанию.
 
-    Модуль Python, а не бинарник в PATH: демон и воркер обязаны быть из одного
-    окружения, иначе воркер не найдёт selenium, которого нет в его python.
+    Обычный режим — модуль Python в том же интерпретаторе (``-m
+    engine.worker``): демон и воркер обязаны быть из одного окружения, иначе
+    воркер не найдёт selenium, которого нет в его python.
+
+    Замороженный режим (``sys.frozen`` — PyInstaller sidecar): интерпретатора
+    рядом нет, модуль ``engine.worker`` в PATH не ищется — сам бинарник
+    запускается с подкомандой ``worker``, и его диспетчер
+    (:func:`engine.bundle.dispatch`) передаёт хвост аргументов в
+    ``engine.worker.main``.
+
+    ``PYTHON`` важнее обеих веток: явный путь к интерпретатору — это
+    venv-сценарий dev-прогона, и даже из бинарника воркер может быть отдан
+    внешнему python. Пустое значение трактуется как отсутствие (иначе argv
+    начинался бы с пустой строки и падал бы в execve).
     """
-    return [os.environ.get("PYTHON", "python3"), "-m", "engine.worker", "--browser-id", browser_id]
+    python = os.environ.get("PYTHON", "").strip()
+    if python:
+        return [python, "-m", "engine.worker", "--browser-id", browser_id]
+    if getattr(sys, "frozen", False):
+        return [sys.executable, "worker", "--browser-id", browser_id]
+    return ["python3", "-m", "engine.worker", "--browser-id", browser_id]
 
 
 def _least_used(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
