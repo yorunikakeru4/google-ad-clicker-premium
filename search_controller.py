@@ -1164,74 +1164,127 @@ class SearchController:
             duration=duration,
         )
 
+    def _disable_random_mouse(self, exp: BaseException) -> None:
+        """Выключить случайное движение мыши на остаток сессии.
+
+        Причина уходит одним полем ``reason`` в структурированный WARNING без
+        traceback: сцену ронять нельзя, а повторная ошибка на каждой итерации
+        превратилась бы в спам (план.md, §5 фаза 11 и §6 «не делать
+        ``random_mouse`` обязательным, деградация с предупреждением»).
+        """
+
+        self._random_mouse_enabled = False
+
+        detail = " ".join(str(exp).split())
+        reason = f"{type(exp).__name__}: {detail}" if detail else type(exp).__name__
+        log.warning("browser", "Random mouse movements disabled", fields={"reason": reason})
+
+    def _recover_cursor_after_fail_safe(self, pyautogui) -> None:
+        """Легаси-ветка FailSafe: лог, сброс ``FAILSAFE``, возврат в центр.
+
+        Размеры экрана читаются здесь, а не берутся из переменных тела: FailSafe
+        мог сработать до вычисления ``screen_width``, и тогда сам обработчик
+        падал бы NameError. Сбой восстановления наружу не выходит — он
+        превращается в ту же деградацию, что и прочие ошибки pyautogui.
+        """
+
+        log.debug("browser", "The mouse cursor was moved to one of the screen corners!")
+
+        try:
+            pyautogui.FAILSAFE = False
+
+            log.debug("browser", "Moving cursor to center...")
+            screen_width, screen_height = pyautogui.size()
+            pyautogui.moveTo(screen_width / 2, screen_height / 2)
+
+        except Exception as exp:
+            self._disable_random_mouse(exp)
+
     def _make_random_mouse_movements(self) -> None:
-        """Make random mouse movements"""
+        """Make random mouse movements
 
-        if self._random_mouse_enabled:
-            try:
-                import pyautogui
+        Никогда не бросает: pyautogui недоступен без пакета, без дисплея
+        (headless Linux) и без разрешения Accessibility на macOS, поэтому
+        любой его отказ гасится здесь, а не уходит трейсбеком в stderr потока.
 
-                log.debug("browser", "Making random mouse movements...")
+        FailSafe (курсор в углу) сохраняет легаси-поведение — лог, сброс
+        ``FAILSAFE`` и возврат в центр; любая другая причина выключает
+        движение мыши одним WARNING'ом, чтобы ошибка не повторялась на
+        каждой итерации сцены.
+        """
 
-                screen_width, screen_height = pyautogui.size()
-                pyautogui.moveTo(screen_width / 2 - 300, screen_height / 2 - 200)
+        if not self._random_mouse_enabled:
+            return
+
+        try:
+            import pyautogui
+        except Exception as exp:
+            self._disable_random_mouse(exp)
+            return
+
+        try:
+            log.debug("browser", "Making random mouse movements...")
+
+            screen_width, screen_height = pyautogui.size()
+            pyautogui.moveTo(screen_width / 2 - 300, screen_height / 2 - 200)
+
+            log.debug("browser", "Mouse position", fields={"position": pyautogui.position()})
+
+            ease_methods = [
+                pyautogui.easeInQuad,
+                pyautogui.easeOutQuad,
+                pyautogui.easeInOutQuad,
+            ]
+
+            log.debug("browser", "Going LEFT and DOWN...")
+
+            pyautogui.move(
+                -random.choice(range(200, 300)),
+                random.choice(range(250, 450)),
+                1,
+                random.choice(ease_methods),
+            )
+
+            log.debug("browser", "Mouse position", fields={"position": pyautogui.position()})
+
+            for _ in range(1, random.choice(range(3, 7))):
+                direction = random.choice(list(Direction))
+                ease_method = random.choice(ease_methods)
+
+                log.debug("browser", "Going", fields={"direction": direction.value})
+
+                if direction == Direction.LEFT:
+                    pyautogui.move(-(random.choice(range(100, 200))), 0, 0.5, ease_method)
+
+                elif direction == Direction.RIGHT:
+                    pyautogui.move(random.choice(range(200, 400)), 0, 0.3, ease_method)
+
+                elif direction == Direction.UP:
+                    pyautogui.move(0, -(random.choice(range(100, 200))), 1, ease_method)
+                    pyautogui.scroll(random.choice(range(1, 7)))
+
+                elif direction == Direction.DOWN:
+                    pyautogui.move(0, random.choice(range(150, 300)), 0.7, ease_method)
+                    pyautogui.scroll(-random.choice(range(1, 7)))
+
+                else:
+                    pyautogui.move(
+                        random.choice(range(100, 200)),
+                        random.choice(range(150, 250)),
+                        1,
+                        ease_method,
+                    )
 
                 log.debug("browser", "Mouse position", fields={"position": pyautogui.position()})
 
-                ease_methods = [
-                    pyautogui.easeInQuad,
-                    pyautogui.easeOutQuad,
-                    pyautogui.easeInOutQuad,
-                ]
-
-                log.debug("browser", "Going LEFT and DOWN...")
-
-                pyautogui.move(
-                    -random.choice(range(200, 300)),
-                    random.choice(range(250, 450)),
-                    1,
-                    random.choice(ease_methods),
-                )
-
-                log.debug("browser", "Mouse position", fields={"position": pyautogui.position()})
-
-                for _ in range(1, random.choice(range(3, 7))):
-                    direction = random.choice(list(Direction))
-                    ease_method = random.choice(ease_methods)
-
-                    log.debug("browser", "Going", fields={"direction": direction.value})
-
-                    if direction == Direction.LEFT:
-                        pyautogui.move(-(random.choice(range(100, 200))), 0, 0.5, ease_method)
-
-                    elif direction == Direction.RIGHT:
-                        pyautogui.move(random.choice(range(200, 400)), 0, 0.3, ease_method)
-
-                    elif direction == Direction.UP:
-                        pyautogui.move(0, -(random.choice(range(100, 200))), 1, ease_method)
-                        pyautogui.scroll(random.choice(range(1, 7)))
-
-                    elif direction == Direction.DOWN:
-                        pyautogui.move(0, random.choice(range(150, 300)), 0.7, ease_method)
-                        pyautogui.scroll(-random.choice(range(1, 7)))
-
-                    else:
-                        pyautogui.move(
-                            random.choice(range(100, 200)),
-                            random.choice(range(150, 250)),
-                            1,
-                            ease_method,
-                        )
-
-                    log.debug("browser", "Mouse position", fields={"position": pyautogui.position()})
-
-            except pyautogui.FailSafeException:
-                log.debug("browser", "The mouse cursor was moved to one of the screen corners!")
-
-                pyautogui.FAILSAFE = False
-
-                log.debug("browser", "Moving cursor to center...")
-                pyautogui.moveTo(screen_width / 2, screen_height / 2)
+        except Exception as exp:
+            # FailSafeException отсутствует у заглушек и у пакета, собранного
+            # без него: значение по умолчанию () ничего не ловит, и такая
+            # ошибка уходит в общую деградацию, а не роняет обработчик.
+            if isinstance(exp, getattr(pyautogui, "FailSafeException", ())):
+                self._recover_cursor_after_fail_safe(pyautogui)
+            else:
+                self._disable_random_mouse(exp)
 
     def _check_captcha(self) -> None:
         """Проверить страницу на CAPTCHA и применить ``behavior.captcha_policy``.
