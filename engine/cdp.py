@@ -131,7 +131,11 @@ def resolve_browser_ws_url(
 
 
 def _default_ws_factory(url: str, timeout: float) -> Any:
-    return websocket.create_connection(url, timeout=timeout)
+    # suppress_origin: Chrome DevTools отвергает WS-подключение с Origin
+    # http://127.0.0.1:<port> (403 Forbidden) — websocket-client шлёт его по
+    # умолчанию, выводя из URL. Поймано живым e2e-прогоном: все подключения
+    # тонули в ретраях до "CDP connect timed out" и роняли авторизацию.
+    return websocket.create_connection(url, timeout=timeout, suppress_origin=True)
 
 
 class CdpClient:

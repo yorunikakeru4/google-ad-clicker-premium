@@ -191,7 +191,15 @@ class ProxyAuthManager:
         return self._recorder
 
     def start(self) -> ProxyAuthManager:
-        """Подписывается на события, включает auto-attach, Fetch и Network."""
+        """Подписывается на события и включает auto-attach на браузере.
+
+        ``Fetch.enable``/``Network.enable`` сюда НЕ входят: они работают
+        только на сессии таргета, а на browser-endpoint реальный Chrome
+        отвечает -32601 (``'Network.enable' wasn't found``) — поймано
+        живым e2e-прогоном, где менеджер не поднимался ни разу. Обе
+        команды уходят per-session в :meth:`handle_attached` (контракт
+        §2.1, п.4), туда же приходят и вкладки, открытые после старта.
+        """
         if self._started:
             return self
         self._unsubscribes = [
@@ -206,13 +214,8 @@ class ProxyAuthManager:
             "Target.setAutoAttach",
             {"autoAttach": True, "waitForDebuggerOnStart": False, "flatten": True},
         )
-        # Без patterns: иначе CDP перехватит весь трафик и вкладки встанут.
-        self._client.send("Fetch.enable", {"handleAuthRequests": True})
-        # Отдельной командой рядом с Fetch — включение метрики запросов/час.
-        self._client.send("Network.enable")
         self._started = True
         log.info("proxy", "proxy CDP auth enabled", fields={"user": mask_secret(self._username)})
-        log.debug("browser", "network metrics enabled")
         return self
 
     def stop(self) -> None:

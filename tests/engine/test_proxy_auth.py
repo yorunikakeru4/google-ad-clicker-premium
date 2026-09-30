@@ -41,7 +41,14 @@ USERNAME = "spyuser9"
 PASSWORD = "Sup3rS3cret!"
 
 # Сколько команд уходит на старте: auto-attach + Fetch.enable + Network.enable.
-START_COMMANDS = 3
+# Browser-level на старте — только Target.setAutoAttach: реальный Chrome
+# отвечает -32601 "'Network.enable' wasn't found" на browser-endpoint
+# (поймано живым e2e-прогоном: 'cdp auth start failed: CdpError' на каждой
+# сессии, юнит-фейк домены не валидировал). Fetch.enable и Network.enable
+# уходят per-session в handle_attached.
+START_COMMANDS = 1
+# Команды, которые менеджер шлёт на каждую новую сессию таргета.
+SESSION_COMMANDS = 2
 
 
 def _auth_event(request_id: str, source: str = "Proxy", scheme: str = "Basic") -> dict:
@@ -156,7 +163,13 @@ def test_resolve_proxy_transport() -> None:
 # --- старт: auto-attach + Fetch.enable без patterns + Network.enable ---
 
 
-def test_start_sends_auto_attach_fetch_and_network_enable() -> None:
+def test_start_sends_only_auto_attach_on_browser_endpoint() -> None:
+    """На старте — ровно Target.setAutoAttach.
+
+    ``Fetch.enable``/``Network.enable`` на browser-endpoint не уходят:
+    ``Network.enable`` там даёт -32601 (живой e2e), а нужные домены
+    включаются per-session в ``handle_attached`` (контракт §2.1, п.4).
+    """
     ws = FakeWs()
     client = _make_client(ws)
     client.start(timeout=2.0)
@@ -165,24 +178,17 @@ def test_start_sends_auto_attach_fetch_and_network_enable() -> None:
         manager.start()
         assert _wait_until(lambda: len(ws.sent_json()) == START_COMMANDS), ws.sent_json()
         bodies = ws.sent_json()
-        assert [b["method"] for b in bodies] == [
-            "Target.setAutoAttach",
-            "Fetch.enable",
-            "Network.enable",
-        ]
-        assert [b["id"] for b in bodies] == [1, 2, 3]
+        assert [b["method"] for b in bodies] == ["Target.setAutoAttach"]
         assert bodies[0]["params"] == {
             "autoAttach": True,
             "waitForDebuggerOnStart": False,
             "flatten": True,
         }
-        assert bodies[1]["params"] == {"handleAuthRequests": True}
-        assert "patterns" not in bodies[1]["params"]
         assert "sessionId" not in bodies[0]
-        assert "sessionId" not in bodies[1]
-        # Network.enable — отдельная команда рядом с Fetch, параметры не нужны.
-        assert bodies[2].get("params", {}) == {}
-        assert "sessionId" not in bodies[2]
+        # Ни Fetch, ни Network на browser-level: Chrome это отвергает.
+        methods = {b["method"] for b in bodies}
+        assert "Fetch.enable" not in methods
+        assert "Network.enable" not in methods
     finally:
         manager.stop()
 

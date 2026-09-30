@@ -861,3 +861,31 @@ def test_poll_timeout_does_not_kill_loop() -> None:
 
 def test_stop_without_start_is_safe() -> None:
     CdpClient("ws://127.0.0.1:1/x", ws_factory=lambda url, timeout: FakeWs()).stop()
+
+
+def test_default_ws_factory_suppresses_origin(monkeypatch) -> None:
+    """Chrome DevTools отвечает 403 на WS-подключение с Origin.
+
+    websocket-client по умолчанию шлёт Origin, выведенный из URL
+    (``http://127.0.0.1:<port>``) — живой e2e-прогон получал 403 Forbidden
+    и тонул в ретраях до ``CDP connect timed out``, из-за чего авторизация
+    прокси не поднималась ни разу. Клиент обязан подключаться без Origin.
+    """
+    import engine.cdp as cdp_module
+
+    captured: dict = {}
+
+    def fake_create_connection(url, **kwargs):
+        captured["url"] = url
+        captured.update(kwargs)
+        return object()
+
+    monkeypatch.setattr(
+        cdp_module.websocket, "create_connection", fake_create_connection
+    )
+
+    cdp_module._default_ws_factory("ws://127.0.0.1:9/devtools/browser/x", 5.0)
+
+    assert captured["url"] == "ws://127.0.0.1:9/devtools/browser/x"
+    assert captured["timeout"] == 5.0
+    assert captured["suppress_origin"] is True
