@@ -47,13 +47,15 @@
           httpx
         ];
 
-        # GTK/WebKit-стек для Rust-части UI (Tauri).
+        # GTK/WebKit-стек для Rust-части UI (Tauri) + библиотеки chromedriver.
         #
         # cargo test/build для ui/src-tauri без этого падает на первом же
         # -sys крейте: gtk-sys ищет gtk+-3.0.pc и др. через pkg-config,
         # libdbus-sys — dbus-1.pc. Список покрывает всё, что тянет tauri v2
         # на Linux: webkit2gtk-4.1 (включая javascriptcoregtk) + libsoup-3.0
         # + gtk3 с транзитивными glib/cairo/pango/atk/gdk-pixbuf + dbus.
+        # nss/nspr/libxcb — динамические зависимости chromedriver (живые
+        # e2e-прогоны): без них драйвер падает со status 127 на NixOS.
         #
         # lib.optionals hostPlatform.isLinux: на macOS этих пакетов в nixpkgs
         # нет (webkitgtk, dbus, appindicator — linux-only), и сам факт их
@@ -71,8 +73,12 @@
             libsoup_3
             webkitgtk_4_1
             dbus
+            nss
+            nspr
+            libxcb
           ]
-        );      in
+        );
+      in
       {
         devShells.default = pkgs.mkShell {
           packages = with pkgs; [
