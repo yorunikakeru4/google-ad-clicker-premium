@@ -53,9 +53,10 @@ function fakeApi(initial: CleanupStatus = { last: null, next_run: null }) {
       if (state.status === null) throw new Error("нет статуса");
       return state.status;
     }),
-    run: vi.fn(async () => {
+    // Как движок: dry_run в отчёте — это флаг запроса, а не состояние fake.
+    run: vi.fn(async (dryRun: boolean) => {
       if (state.runError) throw state.runError;
-      return state.runReport;
+      return { ...state.runReport, dry_run: dryRun };
     }),
   };
 

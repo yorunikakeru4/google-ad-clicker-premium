@@ -10,17 +10,28 @@
 //     конкретным полем, сводка над формой — для того, что полю отнести
 //     нельзя; неудачное сохранение введённые значения не откатывает;
 //   * маска ******** нетронута — в патч не попадает, секрет не затирается.
+//
+// Секция «Очистка профилей» (план §5, фаза 10) живёт под формой: статус
+// расписания читается через useCleanup при монтировании, ручной запуск и
+// превью (dry_run) идут в POST /control/cleanup/run и показывают отчёт.
 
 import { onMounted } from "vue";
 import PageLayout from "../components/layout/PageLayout.vue";
 import SettingField from "../components/forms/SettingField.vue";
 import { settingsSections } from "../constants/settingsSchema";
 import { useSettings } from "../composables/useSettings";
+import { useCleanup } from "../composables/useCleanup";
+import { cleanupReportTone } from "../lib/cleanup";
+import { formatBytes, formatDuration } from "../lib/format";
 import { fieldPath } from "../lib/settings";
 
 const settings = useSettings();
+const cleanup = useCleanup();
 
-onMounted(() => void settings.load());
+onMounted(() => {
+  void settings.load();
+  void cleanup.refresh();
+});
 
 function errorOf(section: string, key: string): string | null {
   return settings.fieldErrors.value[fieldPath(section, key)] ?? null;
@@ -152,6 +163,111 @@ function isDirty(section: string, key: string): boolean {
                 settings.setValue(fieldPath(section.key, field.key), $event)
               "
             />
+          </v-card-text>
+        </v-card>
+      </v-col>
+
+      <v-col cols="12" data-test="settings-cleanup">
+        <v-card>
+          <v-card-title class="text-subtitle-1 font-weight-bold">
+            Очистка профилей
+            <span class="text-muted text-body-2"> — расписание и ручной запуск</span>
+          </v-card-title>
+
+          <v-card-text class="pt-0">
+            <v-alert
+              v-if="cleanup.statusError.value"
+              type="error"
+              variant="tonal"
+              class="mb-3"
+              closable
+              data-test="cleanup-status-error"
+              @click:close="cleanup.statusError.value = null"
+            >
+              Не удалось прочитать статус очистки: {{ cleanup.statusError.value }}
+            </v-alert>
+
+            <v-alert
+              v-if="cleanup.actionError.value"
+              type="error"
+              variant="tonal"
+              class="mb-3"
+              closable
+              data-test="cleanup-action-error"
+              @click:close="cleanup.actionError.value = null"
+            >
+              {{ cleanup.actionError.value }}
+            </v-alert>
+
+            <div class="text-body-2" data-test="cleanup-last">
+              {{ cleanup.lastLine.value }}
+            </div>
+            <div class="text-body-2 mb-3" data-test="cleanup-next">
+              {{ cleanup.nextLine.value }}
+            </div>
+
+            <div class="d-flex flex-wrap align-center ga-2 mb-3">
+              <v-btn
+                variant="text"
+                prepend-icon="mdi-refresh"
+                :disabled="cleanup.pending.value !== null"
+                :loading="cleanup.loading.value"
+                data-test="cleanup-refresh"
+                @click="void cleanup.refresh()"
+              >
+                Обновить
+              </v-btn>
+              <v-btn
+                color="primary"
+                prepend-icon="mdi-broom"
+                :disabled="cleanup.pending.value !== null"
+                :loading="cleanup.pending.value === 'run'"
+                data-test="cleanup-run"
+                @click="void cleanup.run(false)"
+              >
+                Очистить сейчас
+              </v-btn>
+              <v-btn
+                variant="outlined"
+                prepend-icon="mdi-eye-outline"
+                :disabled="cleanup.pending.value !== null"
+                :loading="cleanup.pending.value === 'preview'"
+                data-test="cleanup-preview"
+                @click="void cleanup.run(true)"
+              >
+                Проверить (без удаления)
+              </v-btn>
+            </div>
+
+            <v-alert
+              v-if="cleanup.report.value !== null"
+              :type="cleanupReportTone(cleanup.report.value)"
+              variant="tonal"
+              class="mb-0"
+              data-test="cleanup-report"
+            >
+              <div
+                v-if="cleanup.report.value.dry_run"
+                class="font-weight-medium"
+                data-test="cleanup-report-preview"
+              >
+                Превью: ничего не удалено — показаны только кандидаты
+              </div>
+              <div data-test="cleanup-report-removed">
+                {{ cleanup.report.value.dry_run ? "Кандидатов" : "Удалено" }}:
+                {{ cleanup.report.value.removed }}
+                ({{ formatBytes(cleanup.report.value.removed_bytes) }})
+              </div>
+              <div data-test="cleanup-report-skipped">
+                Пропущено активных: {{ cleanup.report.value.skipped_active }}
+              </div>
+              <div data-test="cleanup-report-errors">
+                Ошибок: {{ cleanup.report.value.errors }}
+              </div>
+              <div data-test="cleanup-report-duration">
+                Длительность: {{ formatDuration(cleanup.report.value.duration_ms) }}
+              </div>
+            </v-alert>
           </v-card-text>
         </v-card>
       </v-col>
