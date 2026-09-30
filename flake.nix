@@ -45,7 +45,17 @@
           pytest-asyncio
           pytest-mock
           httpx
-        ];
+        ]
+        # macOS (план.md, фаза 11): pyautogui на darwin работает через
+        # PyObjC/Quartz — без него random_mouse и доступ к экрану падают.
+        # На Linux эти пакетов в nixpkgs нет, поэтому только под darwin.
+        ++ pkgs.lib.optionals pkgs.stdenv.hostPlatform.isDarwin (
+          with ps;
+          [
+            pyobjc-core
+            pyobjc
+          ]
+        );
 
         # GTK/WebKit-стек для Rust-части UI (Tauri) + библиотеки chromedriver.
         #

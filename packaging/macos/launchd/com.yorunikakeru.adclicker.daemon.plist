@@ -1,0 +1,56 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  launchd-конфиг демона Google Ad Clicker (план.md, фаза 11).
+
+  Установка (отредактировав оба REPLACE_ME):
+    1. Скопировать в ~/Library/LaunchAgents/com.yorunikakeru.adclicker.daemon.plist
+    2. chmod 600 (файл содержит токен)
+    3. launchctl load -w ~/Library/LaunchAgents/com.yorunikakeru.adclicker.daemon.plist
+
+  Требования к окружению демона:
+  - WorkingDirectory — каталог с config.json, queries.txt, user_agents.txt,
+    proxies.txt, domains.txt: legacy-движок читает их из cwd (см. отчёт
+    фазы 11 про бандл ресурсов). В установке это каталог данных приложения
+    (~/Library/Application Support/Google Ad Clicker), НЕ каталог .app.
+  - ADCLICKER_CONTROL_TOKEN — тот же токен, что видит UI-приложение
+    (адресуется в его окружении); без совпадения control API отвечает 401.
+  - Путь к бинарнику sidecar: внутри .app это Contents/MacOS/<имя бинарника>;
+    имя зависит от сборки (Tauri кладёт sidecar с учётом триплета) — сверьтесь
+    с фактическим содержимым Contents/MacOS после `tauri build`.
+
+  KeepAlive + ThrottleInterval дают автозапуск при логине и рестарт при падении
+  (план §11: «launchd plist: автозапуск при логине, KeepAlive, рестарт демона»).
+-->
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.yorunikakeru.adclicker.daemon</string>
+
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Applications/Google Ad Clicker.app/Contents/MacOS/engine</string>
+    </array>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/REPLACE_ME/Library/Application Support/Google Ad Clicker</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>ADCLICKER_CONTROL_TOKEN</key>
+        <string>REPLACE_ME_long_random_string</string>
+    </dict>
+
+    <key>RunAtLoad</key>
+    <true/>
+    <key>KeepAlive</key>
+    <true/>
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+
+    <key>StandardOutPath</key>
+    <string>/tmp/adclicker-daemon.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/adclicker-daemon.err</string>
+</dict>
+</plist>
