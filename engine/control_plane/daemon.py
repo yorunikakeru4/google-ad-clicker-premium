@@ -19,6 +19,8 @@ import signal
 import sys
 import threading
 import time
+from collections.abc import Callable
+from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any, Sequence
 
@@ -157,6 +159,11 @@ DB_SIZE_THREAD_NAME = "db-size"
 # стартует и говорит, что именно не так, а не молча закрывает день не тогда.
 DAY_CLOSE_INTERVAL_ENV_VAR = "ADCLICKER_DAY_CLOSE_INTERVAL"
 
+# Задержка второй допроводки после полуночи, в секундах: 00:00:05 — время на
+# то, чтобы записи последней минуты суток успели доехать из буферов воркеров
+# в БД до повторного экспорта.
+MIDNIGHT_REEXPORT_DELAY_SECONDS = 5
+
 # Чистка старых дней: после каждого закрытия дня и, независимо от него, раз
 # в сутки; 0 (и любое отрицательное) расписание выключает.
 RETENTION_INTERVAL_ENV_VAR = "ADCLICKER_RETENTION_INTERVAL"
@@ -226,6 +233,37 @@ def day_close_interval_from_environ(environ: dict[str, str] | None = None) -> fl
     return interval if interval > 0 else 0.0
 
 
+def seconds_until_midnight_reexport(now: float) -> float:
+    """Секунд до ближайшей допроводки вчерашнего дня — цель 00:00:05.
+
+    Как и у ``seconds_until_day_close``: цель всегда строго в будущем, иначе
+    job, проснувшийся ровно в 00:00:05 (или позже, например из-за долгого
+    основного тика), ждал бы допроводки ещё сутки.
+    """
+    local = time.localtime(now)
+    midnight = time.mktime((local.tm_year, local.tm_mon, local.tm_mday, 0, 0, 0, 0, 0, -1))
+    target = midnight + MIDNIGHT_REEXPORT_DELAY_SECONDS
+    if target <= now:
+        tomorrow = date(local.tm_year, local.tm_mon, local.tm_mday) + timedelta(days=1)
+        target = (
+            time.mktime((tomorrow.year, tomorrow.month, tomorrow.day, 0, 0, 0, 0, 0, -1))
+            + MIDNIGHT_REEXPORT_DELAY_SECONDS
+        )
+    return target - now
+
+
+def previous_local_day(now: float) -> str:
+    """Локальная дата суток, предшествующих дате ``now``, в ``YYYY-MM-DD``.
+
+    День вычитается из строки даты, а не из unix-секунд: сутки с перехода на
+    летнее время бывают не 86400 секунд, и вычитание секунд дало бы то ли
+    «позавчера», то ли сегодняшний день. Ровно та же логика нужна допроводке
+    в 00:00:0X — «вчера» там это день, закрытый в 23:59.
+    """
+    today = datetime.strptime(local_day(now), "%Y-%m-%d")
+    return (today - timedelta(days=1)).strftime("%Y-%m-%d")
+
+
 class Daemon:
     """Демон целиком: HTTP-сервер плюс супервизор в отдельном потоке."""
 
@@ -255,7 +293,11 @@ class Daemon:
         self.token = token
         self.port = port
         self.store = store or StateStore(self.db_path)
-        self.config = config or Config.load(self.config_path)
+        # Начальный конфиг — только для сборки супервизора и сервера: сама
+        # «живая» копия отныне одна и принадлежит ControlPlaneServer (см.
+        # property config ниже). Держать у демона собственный экземпляр
+        # значило бы читать значение до рестарта — ровно тот дефект.
+        initial_config = config or Config.load(self.config_path)
         self.proxy_check_interval = proxy_check_interval
         # Период проверки порога CAPTCHA — своя настройка запуска, а не
         # соседний интервал: выключить один job'ом можно, не выключая другой.
@@ -279,7 +321,7 @@ class Daemon:
         )
         self.supervisor = supervisor or Supervisor(
             store=self.store,
-            settings=supervisor_settings_from_config(self.config),
+            settings=supervisor_settings_from_config(initial_config),
             # Тот же пул, что у /control/proxies и расписания: иначе
             # назначения супервизора и то, что видит UI, разъезжались бы.
             proxy_pool=self.proxy_pool,
@@ -287,7 +329,7 @@ class Daemon:
         )
         self.server = ControlPlaneServer(
             supervisor=self.supervisor,
-            config=self.config,
+            config=initial_config,
             token=self.token,
             config_path=self.config_path,
             host=host,
@@ -315,6 +357,19 @@ class Daemon:
         self._shutdown_thread: threading.Thread | None = None
         self._previous_handlers: dict[int, Any] = {}
         self._started = False
+
+    @property
+    def config(self) -> Config:
+        """Текущий конфиг демона — та же ссылка, которую меняет POST.
+
+        Раньше у демона была собственная копия, созданная при сборке и не
+        обновляемая ни при чём: job порога CAPTCHA читал её напрямую и видел
+        старый ``captcha_threshold_*`` до рестарта. Теперь property уводит в
+        ``ControlPlaneServer``, где конфиг меняется под замком в
+        ``patch_config`` — тот же объект читают ``_current_config`` (его
+        используют retention/db-size/day-close) и обработчики HTTP.
+        """
+        return self.server.config
 
     # --- жизненный цикл ---------------------------------------------------
 
@@ -590,9 +645,12 @@ class Daemon:
     def _captcha_threshold_settings(self) -> tuple[float, str]:
         """Порог и действие с текущего конфига демона: ``(процент, действие)``.
 
-        Конфиг уже прошёл валидацию при загрузке (диапазон 0..100, enum
-        действий), поэтому здесь только приведение типа: нечисловое значение
-        должно упасть здесь, в читаемом месте, а не внутри сравнения доли.
+        Чтение идёт через property ``config``, то есть с последним
+        применённым патчем из UI: порог и действие действуют на каждом
+        следующем тике без рестарта. Конфиг уже прошёл валидацию при
+        загрузке/патче (диапазон 0..100, enum действий), поэтому здесь
+        только приведение типа: нечисловое значение должно упасть здесь, в
+        читаемом месте, а не внутри сравнения доли.
         """
         return (
             float(self.config.get("behavior.captcha_threshold_percent")),
@@ -604,13 +662,13 @@ class Daemon:
     def _current_config(self) -> Config:
         """Конфиг с последним применённым патчем из UI.
 
-        POST /control/config заменяет объект у HTTP-сервера (и у его
-        bound-обработчика), но не у демона — а план требует, чтобы настройка
-        хранения логов применялась без рестарта. Поэтому чтение идёт от
-        сервера: при сборке демон передал ему тот же объект, что и держит
-        сам, так что инъекция конфига в тестах работает как раньше.
+        POST /control/config меняет конфиг под замком ``ControlPlaneServer``,
+        и чтение оттуда — единственный путь для job'ов демона (retention,
+        db-size, day-close): держать у демона собственную копию значило бы
+        читать значение до рестарта. ``Daemon.config`` (property) ведёт в ту
+        же ссылку, так что все читатели ходят к одному объекту.
         """
-        return getattr(self.server, "config", self.config)
+        return self.server.config
 
     def _day_close_tick(self) -> None:
         """Закрыть день: экспорт в ``logs/YYYY-MM-DD.log``, затем retention.
@@ -639,6 +697,29 @@ class Daemon:
                 "deleted_rows": result.deleted_rows,
                 "deleted_files": len(result.deleted_files),
             },
+        )
+
+    def _midnight_reexport_tick(self) -> None:
+        """Допроводка вчерашнего дня сразу после полуночи (00:00:0X).
+
+        Основной проход закрыл день в 23:59:00 и физически не видел записей
+        23:59:00–23:59:59 — они приходят в БД после снимка. Здесь выполняется
+        тот же экспорт (тем же ``log_file_level``) за **вчерашний** day:
+        ``export_day`` перезаписывает файл целиком, поэтому проход идемпотентен
+        — повторный запуск не плодит дубли, а опоздавшие строки попадают в
+        файл. Retention не выполняется: её проход уже был в основном тике, а
+        вчерашний день ей ещё не стар.
+        """
+        day = previous_local_day(time.time())
+        config = self._current_config()
+        exported = export_day(
+            self.db_path, day, default_export_dir(), str(config.get("behavior.log_file_level"))
+        )
+        self.store.log(
+            "INFO",
+            "scheduler",
+            "yesterday export topped up",
+            {"day": day, "exported": exported is not None},
         )
 
     def _retention_tick(self) -> None:
@@ -720,23 +801,43 @@ class Daemon:
         Остановка идёт по тому же stop_event, что и у остальных фоновых работ
         демона: shutdown не ждёт наступления 23:59.
 
+        **Второй проход (полночь).** Основной экспорт в 23:59:00 не видит
+        записи 23:59:00–23:59:59: они приходят в БД после снимка дня. Поэтому
+        в расписании сразу после закрытия дня идёт допроводка в 00:00:0X за
+        вчерашний day (``_midnight_reexport_tick``): файл перезаписывается
+        целиком, проход идемпотентен и добавляет только опоздавшие строки.
+        Retention во втором проходе не выполняется — её уже сделал основной
+        тик. В env-периодном режиме (``day_close_interval > 0``) допроводка не
+        нужна: экспорт и так крутится непрерывно и пропущенной минуты нет.
+
         Сбой тика (нет места, БД занята) логируется и не роняет ни нить, ни
         демон — тот же паттерн, что у проверки прокси.
         """
         while True:
-            wait = (
-                self.day_close_interval
-                if self.day_close_interval is not None
-                else seconds_until_day_close(time.time())
-            )
-            if stop_event.wait(wait):
+            if self.day_close_interval is None:
+                if stop_event.wait(seconds_until_day_close(time.time())):
+                    return
+                self._run_tick(self._day_close_tick, "day close failed")
+                if stop_event.wait(seconds_until_midnight_reexport(time.time())):
+                    return
+                self._run_tick(self._midnight_reexport_tick, "midnight export failed")
+                continue
+            if stop_event.wait(self.day_close_interval):
                 return
-            try:
-                self._day_close_tick()
-            except Exception as exc:  # noqa: BLE001 - расписание обязано пережить сбой
-                self.store.log(
-                    "ERROR", "scheduler", "day close failed", {"error": type(exc).__name__}
-                )
+            self._run_tick(self._day_close_tick, "day close failed")
+
+    def _run_tick(self, tick: Callable[[], None], error_message: str) -> None:
+        """Один тик расписания: сбой уходит в лог и не убивает нить.
+
+        Общая обёртка для обоих проходов закрытия дня, чтобы по тексту ошибки
+        было видно, упал основной экспорт в 23:59 или полночная допроводка.
+        """
+        try:
+            tick()
+        except Exception as exc:  # noqa: BLE001 - расписание обязано пережить сбой
+            self.store.log(
+                "ERROR", "scheduler", error_message, {"error": type(exc).__name__}
+            )
 
     def _start_retention_loop(self) -> threading.Thread | None:
         """Поднимает нить чистки старых дней; None — расписание выключено."""

@@ -183,14 +183,28 @@ class ControlPlaneHandler(BaseHTTPRequestHandler):
 
     # Проставляются ControlPlaneServer.
     supervisor: Supervisor
-    config: Config
-    config_path: Path
+    # Ссылка на ControlPlaneServer: обработчик не хранит собственную копию
+    # конфига, а читает её оттуда — единый источник, который меняет POST
+    # /control/config под замком.
+    control: ControlPlaneServer
     token: str
     proxy_pool: ProxyPool
     profile_pool: ProfilePool
     # Any, а не ProxyHealthChecker: тесты подменяют проверяющий объект
     # фейком, а супервизорской нотации для duck-typing здесь не требуется.
     proxy_checker: Any
+
+    @property
+    def config(self) -> Config:
+        """Текущий конфиг демона — живая ссылка с сервера, а не копия.
+
+        Патч из UI обновляет конфиг под замком ``ControlPlaneServer``, поэтому
+        обработчики всех последующих запросов видят применённое значение, а
+        через сервер его же читают job'ы демона. Раньше патч оставался только
+        на этом обработчике (instance + bound-класс), и демон видел старое
+        значение до рестарта.
+        """
+        return self.control.config
 
     def do_GET(self) -> None:  # noqa: N802 - имя задано BaseHTTPRequestHandler
         self._dispatch("GET")
@@ -321,13 +335,39 @@ class ControlPlaneHandler(BaseHTTPRequestHandler):
 
     def _handle_config_post(self) -> None:
         patch = self._read_json_object()
-        updated = self.config.patch(patch)
-        updated.save(self.config_path)
-        # Замена целиком, а не обновление на месте: обработчики уже держат
-        # ссылку на старый объект и должны увидеть новое состояние конфига.
-        self.config = updated
-        type(self).config = updated
+        # Валидация, запись файла и замена ссылки — под одним замком сервера:
+        # два конкурентных POST не теряют поля друг друга, а читатели (job'ы
+        # демона, следующие запросы) получают объект целиком — старый или новый.
+        updated = self.control.patch_config(patch)
+        self._apply_file_level(updated)
         self._send_json(200, {"config": updated.to_dict()})
+
+    def _apply_file_level(self, config: Config) -> None:
+        """Переприменяет уровень файлового лога после каждого успешного POST.
+
+        ``behavior.log_file_level`` — поле config.json, но файловый
+        обработчик живёт в этом процессе: без этого вызова демон писал бы
+        ``adclicker.log`` старым уровнем до рестарта. Невалидное значение
+        запрос не роняет: старый уровень остаётся, причина уходит в лог
+        демона (сам POST уже прошёл валидацию схемы, поэтому ветка —
+        защитная). Импорт ленивый — ``logger.py`` создаёт каталог ``logs/``
+        при импорте, и модуль API не должен делать этого до первого POST.
+
+        Для воркеров live-уровень не действует: они перечитывают
+        ``config.json`` в своём процессе (``config_reader``) и подхватывают
+        новое значение при следующем старте/перечитывании настроек.
+        """
+        from logger import apply_file_level
+
+        try:
+            apply_file_level(str(config.get("behavior.log_file_level")))
+        except ValueError as exc:
+            self.supervisor.store.log(
+                "WARNING",
+                "config",
+                "log_file_level not applied",
+                {"error": str(exc)},
+            )
 
     def _handle_proxies_list(self) -> None:
         # Креды маскируются внутри list_proxies: ответ уходит в UI наружу.
@@ -674,7 +714,14 @@ class ControlPlaneServer:
                 f"токен не задан. Передайте токен или экспортируйте {TOKEN_ENV_VAR}"
             )
         self.supervisor = supervisor
-        self.config = config
+        # Живой конфиг демона: единый источник для обработчиков HTTP и для
+        # job'ов демона (он читает его через свойство config). Замок держит
+        # только запись — патч это read-modify-write, и два конкурентных POST
+        # не должны читать один и тот же базовый конфиг и терять поля.
+        # Чтение идёт без замка: замена ссылки атомарна, читатель получает
+        # либо старый, либо новый объект Config целиком.
+        self._config = config
+        self._config_lock = threading.Lock()
         self.token = token
         self.config_path = Path(config_path)
         # Пул прокси по умолчанию строится на той же БД, что и супервизор:
@@ -701,6 +748,30 @@ class ControlPlaneServer:
         # Публичная ссылка на класс-обработчик: нужна и для диагностики, и
         # тестам, которые проверяют поведение при неожиданном исключении.
         self.handler_class: type[ControlPlaneHandler] | None = None
+
+    @property
+    def config(self) -> Config:
+        """Текущий конфиг демона. Единственный источник для всех читателей.
+
+        Значение меняется только внутри ``patch_config`` (под замком), поэтому
+        ``Daemon.config``, ``_current_config`` и ``ControlPlaneHandler.config``
+        — все читают одну и ту же ссылку и видят патч из UI без рестарта.
+        """
+        return self._config
+
+    def patch_config(self, patch: dict[str, Any]) -> Config:
+        """Применяет патч из UI: валидация → запись файла → замена ссылки.
+
+        Всё под одним замком: конкурентные POST сериализуются и не теряют
+        поля друг друга. Сохранение идёт до замены: упавшая запись файла
+        оставляет демон со старым конфигом, а ``ConfigError`` из валидации
+        не доходит до замены вовсе — в ответ уходит 400, как и раньше.
+        """
+        with self._config_lock:
+            updated = self._config.patch(patch)
+            updated.save(self.config_path)
+            self._config = updated
+        return updated
 
     def start(self) -> None:
         """Поднимает сервер в фоновом потоке и возвращает управление.
@@ -734,8 +805,7 @@ class ControlPlaneServer:
             (ControlPlaneHandler,),
             {
                 "supervisor": self.supervisor,
-                "config": self.config,
-                "config_path": self.config_path,
+                "control": self,
                 "token": self.token,
                 "proxy_pool": self.proxy_pool,
                 "profile_pool": self.profile_pool,

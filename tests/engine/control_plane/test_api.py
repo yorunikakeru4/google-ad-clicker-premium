@@ -697,8 +697,9 @@ class TestConfigEndpoint:
         assert status == 200
         assert body["config"]["behavior"]["2captcha_apikey"] == config_module.SECRET_MASK
         assert body["config"]["behavior"]["click_order"] == 3
-        # Живой конфиг демона — на bound-классе обработчика, не на сервере.
-        live = instance.handler_class.config
+        # Живой конфиг демона — на сервере; bound-обработчик только читает
+        # его оттуда (единый источник, а не копия на обработчике).
+        live = instance.config
         assert live.get("behavior.2captcha_apikey") == "REAL-KEY"
         saved = json.loads((tmp_path / "config.json").read_text(encoding="utf-8"))
         assert saved["behavior"]["2captcha_apikey"] == "REAL-KEY"
@@ -729,8 +730,8 @@ class TestConfigEndpoint:
 
         assert status == 200
         assert posted["config"]["behavior"]["2captcha_apikey"] == config_module.SECRET_MASK
-        # Живой конфиг демона — на bound-классе обработчика, не на сервере.
-        live = instance.handler_class.config
+        # Живой конфиг демона — на сервере; обработчик читает его оттуда же.
+        live = instance.config
         assert live.get("behavior.2captcha_apikey") == "REAL-KEY"
         assert live.get("webdriver.proxy") == "http://user:pw@1.2.3.4:8080"
         text = (tmp_path / "config.json").read_text(encoding="utf-8")
