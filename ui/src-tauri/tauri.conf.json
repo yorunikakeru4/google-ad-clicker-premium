@@ -32,6 +32,9 @@
     "category": "Utility",
     "shortDescription": "Google Ad Clicker Premium desktop app",
     "longDescription": "Desktop UI for the Google Ad Clicker automation tool.",
+    "externalBin": [
+      "binaries/engine"
+    ],
     "icon": [
       "icons/32x32.png",
       "icons/128x128.png",
