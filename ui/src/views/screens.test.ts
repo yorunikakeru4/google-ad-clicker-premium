@@ -274,7 +274,7 @@ describe("экраны на шаблоне", () => {
     expect(html).not.toContain("diagnostics-collect-result");
   });
 
-  it("Settings: тулбар, три секции и поля из схемы без ошибок", async () => {
+  it("Settings: тулбар, три секции, поля из схемы и секция очистки", async () => {
     const html = await render(SettingsView);
 
     expect(html).toContain("Settings");
@@ -284,6 +284,12 @@ describe("экраны на шаблоне", () => {
       "settings-section-paths",
       "settings-section-webdriver",
       "settings-section-behavior",
+      "settings-cleanup",
+      "cleanup-last",
+      "cleanup-next",
+      "cleanup-run",
+      "cleanup-preview",
+      "cleanup-refresh",
     ]) {
       expect(html).toContain(`data-test="${hook}"`);
     }
@@ -294,10 +300,19 @@ describe("экраны на шаблоне", () => {
     expect(html).not.toContain("settings-success");
     expect(html).not.toContain("settings-dirty");
 
+    // статус очистки ещё не читался: заглушки, а не выдуманный прогон
+    expect(html).not.toContain("не выполнялась");
+    expect(html).not.toContain("cleanup-report");
+    expect(html).not.toContain("cleanup-action-error");
+
     // поля схемы и подсказки дошли в разметку, включая поздно добавленные
     expect(html).toContain("proxy_transport");
     expect(html).toContain("running_interval_start");
     expect(html).toContain("2captcha_apikey");
+    expect(html).toContain("cleanup_time");
+    expect(html).toContain("cleanup_interval_days");
     expect(html).toContain("Нижняя граница случайной паузы на странице с рекламой");
+    expect(html).toContain("Время ежедневной очистки");
+    expect(html).toContain("Периодичность очистки профилей");
   });
 });

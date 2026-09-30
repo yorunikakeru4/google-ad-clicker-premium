@@ -119,6 +119,37 @@ export function diagnosticsRequest(action: DiagnosticsAction): DiagnosticsReques
   }
 }
 
+/** Действия API очистки профилей (контракт /control/cleanup/*). */
+export type CleanupAction = { kind: "run"; dryRun: boolean } | { kind: "status" };
+
+export interface CleanupRequest {
+  method: "GET" | "POST";
+  path: string;
+  /** JSON-тело POST; у GET его нет вовсе. */
+  body?: string;
+}
+
+/**
+ * Билдер запросов к API очистки.
+ *
+ * Тот же принцип, что у [`proxiesRequest`]: контракт тел (`{}` против
+ * `{"dry_run": true}`) живёт здесь, а не в вызывающем коде, — тесты видят
+ * ровно то, что уйдёт в control_request. Пути — из строчных сегментов,
+ * поэтому проходят allowlist `control.rs::allowed_path`.
+ */
+export function cleanupRequest(action: CleanupAction): CleanupRequest {
+  switch (action.kind) {
+    case "run":
+      return {
+        method: "POST",
+        path: "/control/cleanup/run",
+        body: action.dryRun ? JSON.stringify({ dry_run: true }) : "{}",
+      };
+    case "status":
+      return { method: "GET", path: "/control/cleanup/status" };
+  }
+}
+
 /**
  * Разбор ответа демона вида `{"error": {"code", "message"}}`.
  *

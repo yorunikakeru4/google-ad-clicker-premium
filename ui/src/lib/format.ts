@@ -48,18 +48,48 @@ export function formatClockTime(epochMs: number | null | undefined): string {
 }
 
 /**
- * Последнее использование профиля: `YYYY-MM-DD HH:MM` локального пояса.
+ * Дата и время из эпохи секунд: `YYYY-MM-DD HH:MM` локального пояса.
  *
- * `epochSeconds` — эпоха в секундах (REAL в SQLite, как `last_used_at`),
- * в отличие от [`formatClockTime`], которому нужны миллисекунды. Дата
- * обязательна: профиль мог не использоваться неделю, и одного времени суток
- * для «когда» было бы мало.
+ * `epochSeconds` — эпоха в секундах (REAL в SQLite, как `last_used_at`, и
+ * значения kv-флагов расписания), в отличие от [`formatClockTime`], которому
+ * нужны миллисекунды. Дата обязательна: очистка и профиль могли не
+ * выполняться неделю, и одного времени суток для «когда» было бы мало.
  */
-export function formatLastUsed(epochSeconds: number | null | undefined): string {
-  if (epochSeconds == null) return EM_DASH;
+export function formatLocalDateTime(epochSeconds: number | null | undefined): string {
+  if (epochSeconds == null || !Number.isFinite(epochSeconds)) return EM_DASH;
   const date = new Date(Math.floor(epochSeconds) * 1000);
   const year = date.getFullYear();
   const month = pad(date.getMonth() + 1);
   const day = pad(date.getDate());
   return `${year}-${month}-${day} ${pad(date.getHours())}:${pad(date.getMinutes())}`;
+}
+
+/** Последнее использование профиля: та же локальная дата, что и у статусов. */
+export function formatLastUsed(epochSeconds: number | null | undefined): string {
+  return formatLocalDateTime(epochSeconds);
+}
+
+/**
+ * Размер в человекочитаемый вид: байты меньше килобайта, дальше КБ и МБ
+ * с одной цифрой после запятой.
+ *
+ * `removed_bytes` из отчёта очистки приходит целым числом байт; мусор
+ * (NaN, отрицательное) показывается тире, а не «NaN Б».
+ */
+export function formatBytes(bytes: number | null | undefined): string {
+  if (bytes == null || !Number.isFinite(bytes) || bytes < 0) return EM_DASH;
+  if (bytes < 1024) return `${Math.round(bytes)} Б`;
+  if (bytes < 1024 * 1024) return `${(bytes / 1024).toFixed(1)} КБ`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} МБ`;
+}
+
+/**
+ * Длительность в секундах с десятой: `duration_ms` из отчёта очистки → `1.2 с`.
+ *
+ * Сотые доли секунды в отчёте нет смысла показывать: прогон и так измеряется
+ * секундами, а лишняя точка только шумит строку.
+ */
+export function formatDuration(ms: number | null | undefined): string {
+  if (ms == null || !Number.isFinite(ms) || ms < 0) return EM_DASH;
+  return `${(ms / 1000).toFixed(1)} с`;
 }

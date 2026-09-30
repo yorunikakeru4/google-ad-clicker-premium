@@ -1,6 +1,7 @@
 import { describe, expect, it } from "vitest";
 import {
   apiErrorMessage,
+  cleanupRequest,
   configRequest,
   controlRequest,
   diagnosticsRequest,
@@ -100,6 +101,46 @@ describe("configRequest", () => {
     const request = configRequest();
     expect(request).toEqual({ method: "GET", path: "/control/config" });
     expect(request.body).toBeUndefined();
+  });
+});
+
+describe("cleanupRequest", () => {
+  it("ручной запуск — POST /control/cleanup/run с пустым объектом в теле", () => {
+    expect(cleanupRequest({ kind: "run", dryRun: false })).toEqual({
+      method: "POST",
+      path: "/control/cleanup/run",
+      body: "{}",
+    });
+  });
+
+  it("dry_run — тот же endpoint с явным флагом в теле", () => {
+    const request = cleanupRequest({ kind: "run", dryRun: true });
+    expect(request).toEqual({
+      method: "POST",
+      path: "/control/cleanup/run",
+      body: '{"dry_run":true}',
+    });
+    expect(JSON.parse(request.body ?? "")).toEqual({ dry_run: true });
+  });
+
+  it("статус — GET /control/cleanup/status без тела", () => {
+    const request = cleanupRequest({ kind: "status" });
+    expect(request).toEqual({ method: "GET", path: "/control/cleanup/status" });
+    expect(request.body).toBeUndefined();
+  });
+
+  it("пути состоят из строчных сегментов — проходят allowlist control.rs", () => {
+    for (const request of [
+      cleanupRequest({ kind: "run", dryRun: false }),
+      cleanupRequest({ kind: "run", dryRun: true }),
+      cleanupRequest({ kind: "status" }),
+    ]) {
+      const tail = request.path.replace(/^\/control\//, "");
+      expect(tail).not.toBe("");
+      for (const segment of tail.split("/")) {
+        expect(segment, request.path).toMatch(/^[a-z]+$/);
+      }
+    }
   });
 });
 
