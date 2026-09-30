@@ -4,8 +4,9 @@
 captcha-check:
 
 * **day-close** — в 23:59 локального времени закрывает день: экспорт в
-  ``logs/YYYY-MM-DD.log``, затем retention; env-период ускоряет расписание
-  в тестах;
+  ``logs/YYYY-MM-DD.log``, затем retention; сразу после полуночи (00:00:0X)
+  — второй идемпотентный проход за вчерашний day, дописывающий записи
+  23:59:00–23:59:59; env-период ускоряет расписание в тестах;
 * **retention** — чистка старых дней раз в сутки (и после каждого
   закрытия дня);
 * **db-size** — защита от роста БД, по умолчанию раз в час.
@@ -26,7 +27,7 @@ import threading
 import time
 import urllib.error
 import urllib.request
-from datetime import datetime, timedelta
+from datetime import date, datetime, timedelta
 
 import pytest
 
@@ -690,5 +691,176 @@ class TestLevelWiring:
             assert wait_until(
                 lambda: any("db size check failed" in m for m in log_messages(db_path))
             )
+        finally:
+            daemon.shutdown()
+
+
+def previous_local_day(now):
+    """Локальная дата суток, предшествующих ``now``; импорт внутри — краснота."""
+    from engine.control_plane.daemon import previous_local_day as implementation
+
+    return implementation(now)
+
+
+def midnight_target(now):
+    """Цель допроводки (unix-время 00:00:0X следующих суток после ``now``)."""
+    from engine.control_plane.daemon import seconds_until_midnight_reexport
+
+    return now + seconds_until_midnight_reexport(now)
+
+
+class TestSecondsUntilMidnightReexport:
+    """Расписание допроводки: ближайшие 00:00:05, цель всегда в будущем."""
+
+    @pytest.mark.parametrize(
+        "now,expected",
+        [
+            (at(2024, 4, 1, 23, 59, 0), (2024, 4, 2, 0, 0, 5)),
+            (at(2024, 4, 1, 23, 59, 30), (2024, 4, 2, 0, 0, 5)),
+            (at(2024, 4, 1, 23, 59, 59), (2024, 4, 2, 0, 0, 5)),
+            (at(2024, 4, 2, 0, 0, 0), (2024, 4, 2, 0, 0, 5)),
+            (at(2024, 4, 2, 0, 0, 4), (2024, 4, 2, 0, 0, 5)),
+            # Ровно в цель и после неё — следующие сутки: иначе job,
+            # проснувшийся в 00:00:05, ждал бы ещё сутки.
+            (at(2024, 4, 2, 0, 0, 5), (2024, 4, 3, 0, 0, 5)),
+            (at(2024, 4, 2, 0, 0, 6), (2024, 4, 3, 0, 0, 5)),
+            (at(2024, 4, 2, 12, 0, 0), (2024, 4, 3, 0, 0, 5)),
+        ],
+    )
+    def test_target_is_the_next_midnight_pass(self, now, expected):
+        assert time.localtime(midnight_target(now))[:6] == expected
+
+    @pytest.mark.parametrize(
+        "now",
+        [
+            at(2024, 4, 1, 23, 58, 59),
+            at(2024, 4, 1, 23, 59, 30),
+            at(2024, 4, 2, 0, 0, 0),
+            at(2024, 4, 2, 0, 0, 5),
+            at(2024, 4, 2, 12, 0, 0),
+        ],
+    )
+    def test_wait_is_always_positive(self, now):
+        from engine.control_plane.daemon import seconds_until_midnight_reexport
+
+        assert seconds_until_midnight_reexport(now) > 0
+
+
+class TestPreviousLocalDay:
+    """«Вчера» для допроводки: строка YYYY-MM-DD, а не вычитание секунд."""
+
+    def test_just_after_midnight_gives_the_closed_day(self):
+        assert previous_local_day(at(2024, 4, 2, 0, 0, 5)) == "2024-04-01"
+
+    def test_on_the_eve_it_gives_the_day_before_today(self):
+        assert previous_local_day(at(2024, 4, 1, 23, 59, 30)) == "2024-03-31"
+
+
+class TestMidnightReexportJob:
+    """Второй проход экспорта: записи конца дня попадают в файл вчерашнего дня."""
+
+    @pytest.fixture
+    def late_row(self, db_path):
+        """Запись 23:59:30 вчерашнего дня — та, которую пропускает проход в 23:59."""
+        yesterday = (date.today() - timedelta(days=1)).isoformat()
+        stamp = datetime.combine(date.today() - timedelta(days=1), datetime.min.time())
+        stamp = stamp.replace(hour=23, minute=59, second=30)
+        insert_log(db_path, yesterday, message="late evening record", ts=stamp.timestamp())
+        return yesterday
+
+    def test_late_record_lands_in_yesterdays_file(
+        self, late_row, db_path, config_path, registry, tmp_path, monkeypatch
+    ):
+        monkeypatch.chdir(tmp_path)
+        daemon = make_daemon(db_path, config_path, registry)
+
+        daemon._midnight_reexport_tick()
+        daemon.shutdown()
+
+        exported = tmp_path / "logs" / f"{late_row}.log"
+        assert exported.exists(), "допроводка обязана создать файл вчерашнего дня"
+        assert "late evening record" in exported.read_text(encoding="utf-8"), (
+            "запись 23:59:30 должна попасть в файл после midnight-прохода"
+        )
+
+    def test_second_pass_is_idempotent_and_picks_up_new_rows(
+        self, late_row, db_path, config_path, registry, tmp_path, monkeypatch
+    ):
+        monkeypatch.chdir(tmp_path)
+        daemon = make_daemon(db_path, config_path, registry)
+        try:
+            daemon._midnight_reexport_tick()
+            exported = tmp_path / "logs" / f"{late_row}.log"
+            first = exported.read_text(encoding="utf-8")
+
+            insert_log(db_path, late_row, message="second late record")
+            daemon._midnight_reexport_tick()
+            second = exported.read_text(encoding="utf-8")
+
+            assert second.count("late evening record") == 1, (
+                "повторный проход перезаписывает файл, а не плодит дубли"
+            )
+            assert "second late record" in second, (
+                "строка, дописанная после первого прохода, обязана попасть в файл"
+            )
+            assert first != second, "файл должен был пополниться новой строкой"
+        finally:
+            daemon.shutdown()
+
+    def test_loop_runs_the_pass_after_the_close(
+        self, db_path, config_path, registry, tmp_path, monkeypatch
+    ):
+        """Расписание (23:59, без env-периода) ведёт оба прохода подряд."""
+        import engine.control_plane.daemon as daemon_module
+
+        monkeypatch.chdir(tmp_path)
+        yesterday = (date.today() - timedelta(days=1)).isoformat()
+        today = local_day(time.time())
+        insert_log(db_path, yesterday, message="late evening record")
+        insert_log(db_path, today, message="regular record")
+        monkeypatch.setattr(daemon_module, "seconds_until_day_close", lambda now: 0.05)
+        monkeypatch.setattr(
+            daemon_module, "seconds_until_midnight_reexport", lambda now: 0.05
+        )
+        daemon = make_daemon(db_path, config_path, registry, day_close_interval=None)
+
+        daemon.start()
+        try:
+            today_file = tmp_path / "logs" / f"{today}.log"
+            late_file = tmp_path / "logs" / f"{yesterday}.log"
+            assert wait_until(today_file.exists), "основной проход в 23:59 не сработал"
+            assert wait_until(
+                lambda: late_file.exists()
+                and "late evening record" in late_file.read_text(encoding="utf-8")
+            ), "midnight-проход не дописал вчерашнюю запись в файл"
+        finally:
+            daemon.shutdown()
+
+    def test_failure_is_logged_and_the_job_keeps_ticking(
+        self, db_path, config_path, registry, tmp_path, monkeypatch
+    ):
+        import engine.control_plane.daemon as daemon_module
+
+        calls = []
+
+        def broken_export(*args, **kwargs):
+            calls.append(args)
+            raise RuntimeError("диск недоступен")
+
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setattr(daemon_module, "export_day", broken_export)
+        monkeypatch.setattr(daemon_module, "seconds_until_day_close", lambda now: 0.05)
+        monkeypatch.setattr(
+            daemon_module, "seconds_until_midnight_reexport", lambda now: 0.05
+        )
+        daemon = make_daemon(db_path, config_path, registry, day_close_interval=None)
+
+        daemon.start()
+        try:
+            assert wait_until(lambda: len(calls) >= 2), "job остановился после ошибки"
+            assert get_health(daemon) == 200
+            assert wait_until(
+                lambda: any("midnight export failed" in m for m in log_messages(db_path))
+            ), "сбой допроводки обязан попасть в лог"
         finally:
             daemon.shutdown()
