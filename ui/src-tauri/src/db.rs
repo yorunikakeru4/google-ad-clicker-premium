@@ -8,7 +8,7 @@
 use std::fmt;
 use std::fs;
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use rusqlite::{Connection, OpenFlags, ToSql};
@@ -206,6 +206,47 @@ pub struct CaptchaEventRow {
     pub elapsed_ms: Option<i64>,
 }
 
+/// Размер файлов БД на диске — индикатор в тулбаре Logs.
+///
+/// Считаются основной файл и `-wal` ровно так же, как их меряет автозащита
+/// в движке (`engine.log_rotation.db_size_bytes`): UI сравнивает с лимитом
+/// тем же числом, которым его сравнивает демон, иначе индикатор врал бы о
+/// превышении. `-shm` не считается — он не растёт с данными.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct DbSize {
+    /// Резолвленный путь основного файла.
+    pub path: String,
+    /// Байты основного файла; файла нет — 0.
+    pub bytes: u64,
+    /// Байты `-wal`; журнала нет — 0.
+    pub wal_bytes: u64,
+}
+
+/// Размер на диске: основной файл плюс `-wal`. Отсутствующий файл — 0, а не
+/// ошибка: WAL закрывается вместе с последним соединением и его отсутствие —
+/// норма, а не поломка. Читать ошибки метаданных громко здесь незачем —
+/// индикатор показывает ноль и честно живёт дальше.
+pub fn db_size(path: &Path) -> DbSize {
+    DbSize {
+        path: path.display().to_string(),
+        bytes: file_len(path),
+        wal_bytes: file_len(&sidecar(path, "-wal")),
+    }
+}
+
+/// `file` + `suffix` одним путём: `-wal` дописывается к имени файла, а не
+/// подменяет расширение (`adclicker.db-wal`, а не `adclicker.wal`).
+fn sidecar(path: &Path, suffix: &str) -> PathBuf {
+    let mut name = path.as_os_str().to_os_string();
+    name.push(suffix);
+    PathBuf::from(name)
+}
+
+/// Размер файла в байтах; файла нет — 0.
+fn file_len(path: &Path) -> u64 {
+    fs::metadata(path).map_or(0, |meta| meta.len())
+}
+
 /// Читатель боевой БД: одно соединение, строго на чтение.
 ///
 /// Соединение не разделяется между потоками (`SQLITE_OPEN_NO_MUTEX`):
@@ -215,6 +256,8 @@ pub struct DbReader {
     /// Соединение отдаётся модулю `metrics` для агрегатов дашборда: поле
     /// видно только внутри крейта, наружу читалка остаётся закрытой.
     pub(crate) conn: Connection,
+    /// Путь, которым база открылась: по нему считается [`DbReader::size`].
+    path: PathBuf,
 }
 
 impl DbReader {
@@ -250,7 +293,15 @@ impl DbReader {
             });
         }
 
-        Ok(Self { conn })
+        Ok(Self {
+            conn,
+            path: path.to_path_buf(),
+        })
+    }
+
+    /// Размер файлов этой БД на диске — см. [`db_size`].
+    pub fn size(&self) -> DbSize {
+        db_size(&self.path)
     }
 
     /// Строки `logs` по убыванию `ts`, с точным фильтром по уровню,
@@ -2416,8 +2467,9 @@ mod tests {
         }
     }
 
-    /// Путь `-wal` рядом с файлом БД: суффикс дописывается к имени файла,
-    /// как его создаёт SQLite (`adclicker.db-wal`).
+    /// Путь `-wal`, собранный вручную, а не через `sidecar` продакшена:
+    /// тест пишет журнал туда, где его создаёт SQLite (`adclicker.db-wal`),
+    /// и ловит случай подмены расширения в продакшен-коде.
     fn wal_path(path: &Path) -> PathBuf {
         let mut name = path.as_os_str().to_os_string();
         name.push("-wal");

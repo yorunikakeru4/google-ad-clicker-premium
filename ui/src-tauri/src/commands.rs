@@ -10,7 +10,7 @@ use std::sync::{Mutex, MutexGuard};
 use tauri::State;
 
 use crate::db::{
-    CaptchaEventRow, DbError, DbReader, DiagnosticRow, LogEntry, LogFilters, LogPageEntry,
+    CaptchaEventRow, DbError, DbReader, DbSize, DiagnosticRow, LogEntry, LogFilters, LogPageEntry,
     ProfileRow, ProxyRow,
 };
 use crate::metrics::{ActiveWorker, HourlyClicks, RequestsLastHour, RunsSummary};
@@ -287,6 +287,20 @@ pub fn list_captcha_events(
     limit: u32,
 ) -> Result<Vec<CaptchaEventRow>, DbError> {
     with_reader(&state.0, |reader| reader.list_captcha_events(limit))
+}
+
+/// Размер файлов открытой БД: основной файл плюс `-wal`, байтами.
+/// Дешёвая команда — два `stat` без чтения страниц базы, поэтому тулбар
+/// Logs может опрашивать её по таймеру.
+pub fn read_db_size(state: &Mutex<Option<DbReader>>) -> Result<DbSize, DbError> {
+    with_reader(state, |reader| Ok(reader.size()))
+}
+
+/// Индикатор размера БД для UI. Без открытого читателя — `NotOpen`:
+/// индикатор честно показывает «размер неизвестен», а не нули.
+#[tauri::command]
+pub fn db_size(state: State<'_, DbState>) -> Result<DbSize, DbError> {
+    read_db_size(&state.0)
 }
 
 #[cfg(test)]
