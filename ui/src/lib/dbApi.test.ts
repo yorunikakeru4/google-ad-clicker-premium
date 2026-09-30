@@ -153,6 +153,17 @@ describe("createDbApi", () => {
     expect(calls[5].args).toEqual({ now: 5000, thresholdSecs: 15 });
   });
 
+  it("dbSize уходит в свою команду и возвращает байты", async () => {
+    const reply = { path: "/data/adclicker.db", bytes: 1234, wal_bytes: 56 };
+    const { calls, invoke } = fakeInvoke(reply);
+    const api = createDbApi(invoke);
+
+    const size = await api.dbSize();
+
+    expect(size).toEqual(reply);
+    expect(calls).toEqual([{ command: "db_size", args: {} }]);
+  });
+
   it("listCaptchaEvents уходит в свою команду с limit", async () => {
     const { calls, invoke } = fakeInvoke([]);
     const api = createDbApi(invoke);

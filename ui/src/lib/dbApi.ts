@@ -59,6 +59,17 @@ export interface ActiveWorker {
   last_error: string | null;
 }
 
+/**
+ * Размер файлов открытой БД — ответ команды `db_size`.
+ * `bytes` — основной файл, `wal_bytes` — `-wal`; сумма ровно то, что
+ * сравнивает с лимитом автозащита демона.
+ */
+export interface DbSize {
+  path: string;
+  bytes: number;
+  wal_bytes: number;
+}
+
 export interface DbApi {
   /** Открыть БД без аргументов: env ADCLICKER_DB → adclicker.db решает Rust. */
   open(): Promise<string>;
@@ -73,6 +84,8 @@ export interface DbApi {
   listDiagnostics(): Promise<DiagnosticSnapshot[]>;
   /** Последние события CAPTCHA — лента и подсветка на Dashboard. */
   listCaptchaEvents(limit: number): Promise<CaptchaEvent[]>;
+  /** Размер файлов открытой БД — индикатор «БД: X МБ» в тулбаре Logs. */
+  dbSize(): Promise<DbSize>;
 }
 
 /** Поле из `message`-объекта сериализованного DbError. */
@@ -162,6 +175,8 @@ export function createDbApi(call: DbInvoke = invoke): DbApi {
 
     listCaptchaEvents: (limit) =>
       call("list_captcha_events", { limit }) as Promise<CaptchaEvent[]>,
+
+    dbSize: () => call("db_size", {}) as Promise<DbSize>,
   };
 }
 
