@@ -255,11 +255,12 @@ class TestCleanupRun:
         )
         instance.start()
         try:
-            request(instance, "/control/cleanup/run", method="POST", body={})
+            status, payload = request(instance, "/control/cleanup/run", method="POST", body={})
             raw = cleanup_service.store.get_flag(CLEANUP_NEXT_RUN_KEY)
         finally:
             instance.stop()
 
+        assert status == 200, payload
         assert raw == "1711954800.0"
 
     @pytest.mark.parametrize("dry_run", ["yes", 1, None, {}])
@@ -325,7 +326,7 @@ class TestCleanupStatus:
         assert payload["next_run"] is None
 
     def test_status_reports_the_last_run(self, server, store):
-        store.set_flag(CLEANUP_LAST_TS, "1711954800.0")
+        store.set_flag(CLEANUP_LAST_TS_KEY, "1711954800.0")
         store.set_flag(
             CLEANUP_LAST_REPORT_KEY,
             json.dumps({"removed": 2, "removed_bytes": 10, "errors": 0}),

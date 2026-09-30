@@ -195,11 +195,6 @@ class ControlPlaneHandler(BaseHTTPRequestHandler):
     # Any, а не ProxyHealthChecker: тесты подменяют проверяющий объект
     # фейком, а супервизорской нотации для duck-typing здесь не требуется.
     proxy_checker: Any
-    # Очистка профилей: сервис и пересчёт ближайшего запуска приходят от
-    # демона (см. ControlPlaneServer.__init__), чтобы ручной запуск и плановая
-    # нить делили один замок и одну метку в kv.
-    cleanup_service: CleanupService
-    cleanup_next_run: Callable[[], float | None] | None
 
     @property
     def config(self) -> Config:
@@ -498,6 +493,44 @@ class ControlPlaneHandler(BaseHTTPRequestHandler):
             request_signal(self.supervisor.store, target)
         self._send_json(200, {"requested": len(targets)})
 
+    # --- очистка профилей (план §5, фаза 10) --------------------------------
+
+    def _handle_cleanup_run(self) -> None:
+        """``POST /control/cleanup/run``: синхронный прогон очистки.
+
+        Тело — объект; ``{"dry_run": true}`` перечисляет кандидатов и пишет
+        каждый в лог, но ничего не удаляет и не двигает метку последнего
+        прогона. Долгая работа внутри сервиса ограничена бюджетом по времени,
+        поэтому ответ приходит за секунды, а не «когда кончится tempdir».
+
+        После реального прогона kv-цель пересчитывается: ручной запуск
+        сдвигает интервал ``cleanup_interval_days``, и статус обязан показать
+        следующий запуск с учётом этого, а не цель, посчитанную до кнопки.
+        """
+        raw = self._read_optional_object()
+        dry_run = raw.get("dry_run", False)
+        if not isinstance(dry_run, bool):
+            raise InvalidRequestError("поле dry_run должно быть true или false")
+        # Сервис и провайдер цели читаются через control (тот же приём, что
+        # у config): подкласс обработчика не должен был бы жить в словаре
+        # биндинга — обычную функцию там Python превратил бы в метод и передал
+        # бы self первым аргументом.
+        service = self.control.cleanup_service
+        report = service.run(self.config, dry_run=dry_run)
+        if not dry_run and self.control.cleanup_next_run is not None:
+            service.set_next_run(self.control.cleanup_next_run())
+        self._send_json(200, {"report": report})
+
+    def _handle_cleanup_status(self) -> None:
+        """``GET /control/cleanup/status``: последний отчёт и ближайший запуск.
+
+        Оба значения из kv: отчёт пишет сервис после каждого реального
+        прогона, цель — нить расписания (и ручной запуск). ``last: null`` —
+        прогона ещё не было, ``next_run: null`` — job выключен. Ответ ровно
+        по контракту, без внутренностей демона.
+        """
+        self._send_json(200, self.control.cleanup_service.status(self.config))
+
     # --- вспомогательное -------------------------------------------------
 
     def _requested_worker_count(self) -> int:
@@ -677,6 +710,8 @@ _ROUTES: dict[tuple[str, str], str] = {
     ("POST", "/control/profiles/unassign"): "_handle_profiles_unassign",
     ("POST", "/control/profiles/status"): "_handle_profiles_status",
     ("POST", "/control/diagnostics/collect"): "_handle_diagnostics_collect",
+    ("POST", "/control/cleanup/run"): "_handle_cleanup_run",
+    ("GET", "/control/cleanup/status"): "_handle_cleanup_status",
 }
 
 
@@ -827,8 +862,6 @@ class ControlPlaneServer:
                 "proxy_pool": self.proxy_pool,
                 "profile_pool": self.profile_pool,
                 "proxy_checker": self.proxy_checker,
-                "cleanup_service": self.cleanup_service,
-                "cleanup_next_run": self.cleanup_next_run,
             },
         )
         return bound
