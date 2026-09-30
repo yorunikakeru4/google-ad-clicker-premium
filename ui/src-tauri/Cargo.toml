@@ -16,6 +16,9 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 
 [build-dependencies]
 tauri-build = { version = "2", features = [] }
+# build.rs читает bundle.externalBin из tauri.conf.json, чтобы создать
+# заглушку sidecar'а до штатной обработки tauri-build
+serde_json = "1"
 
 [dependencies]
 tauri = { version = "2", features = [] }

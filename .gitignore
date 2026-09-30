@@ -32,6 +32,9 @@ MANIFEST
 #  before PyInstaller builds the exe, so as to inject date/other infos into it.
 *.manifest
 *.spec
+# ...кроме нашего: bundle.spec — источник сборки sidecar, он в git
+# (build/ и dist/ с артефактами уже игнорируются выше)
+!bundle.spec
 
 # Installer logs
 pip-log.txt
@@ -170,6 +173,12 @@ ui/dist/
 ui/target/
 ui/src-tauri/target/
 ui/gen/
+
+# Sidecar-бинарники (PyInstaller): собираются scripts/build-sidecar.sh и
+# складываются под именем engine-<triple> для bundle.externalBin; в git не
+# идут — платформозависимый артефакт, как и dist/engine из pyinstaller
+ui/src-tauri/binaries/
+binaries/
 
 # Python-шаблон выше игнорирует lib/ на ЛЮБОМ уровне, а у UI исходники лежат
 # в ui/src/lib/ — исключаем именно её, иначе весь TS-код молча вне индекса

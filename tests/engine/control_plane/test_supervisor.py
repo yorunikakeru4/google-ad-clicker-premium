@@ -11,6 +11,7 @@ terminate, kill, код возврата.
 """
 
 import json
+import sys
 import threading
 
 import pytest
@@ -1295,6 +1296,60 @@ class TestWorkerEnvironment:
         supervisor.restart(3)
 
         assert supervisor._default_env("br-1")["ADCLICKER_POOL_SIZE"] == "3"
+
+
+class TestWorkerCommand:
+    """Команда спавна воркера: обычный режим, frozen-бинарник, приоритет PYTHON.
+
+    В обычном режиме воркер — модуль в том же интерпретаторе (``-m
+    engine.worker``). В замороженном бинарнике (PyInstaller sidecar) модулей и
+    интерпретатора рядом нет: сам бинарник запускается с подкомандой
+    ``worker``, и диспетчер (:mod:`engine.bundle`) передаёт хвост аргументов
+    в ``engine.worker.main``. ``PYTHON`` — явный путь к интерпретатору для
+    venv-сценария и поэтому важнее обеих веток.
+
+    ``sys.frozen`` подменяется через monkeypatch, а не создаётся настоящий
+    frozen-бинарник: проверяется выбор команды, а не механизм заморозки.
+    """
+
+    MODULE_COMMAND = ["-m", "engine.worker", "--browser-id", "br-1"]
+
+    def test_default_command_is_python_module(self, monkeypatch):
+        monkeypatch.delenv("PYTHON", raising=False)
+        monkeypatch.delattr(sys, "frozen", raising=False)
+
+        assert sup.default_command("br-1") == ["python3", *self.MODULE_COMMAND]
+
+    def test_python_env_overrides_interpreter(self, monkeypatch):
+        monkeypatch.setenv("PYTHON", "/srv/venv/bin/python")
+        monkeypatch.delattr(sys, "frozen", raising=False)
+
+        assert sup.default_command("br-1") == ["/srv/venv/bin/python", *self.MODULE_COMMAND]
+
+    def test_empty_python_env_falls_back_to_default(self, monkeypatch):
+        """Пустая переменная — как её нет: иначе команда начиналась бы с
+        пустой строки и падала бы уже в execve."""
+        monkeypatch.setenv("PYTHON", "")
+        monkeypatch.delattr(sys, "frozen", raising=False)
+
+        assert sup.default_command("br-1") == ["python3", *self.MODULE_COMMAND]
+
+    def test_frozen_binary_spawns_itself_with_worker_subcommand(self, monkeypatch):
+        monkeypatch.delenv("PYTHON", raising=False)
+        monkeypatch.setattr(sys, "frozen", True, raising=False)
+
+        assert sup.default_command("br-1") == [
+            sys.executable,
+            "worker",
+            "--browser-id",
+            "br-1",
+        ]
+
+    def test_python_env_wins_over_frozen_mode(self, monkeypatch):
+        monkeypatch.setenv("PYTHON", "/srv/venv/bin/python")
+        monkeypatch.setattr(sys, "frozen", True, raising=False)
+
+        assert sup.default_command("br-1") == ["/srv/venv/bin/python", *self.MODULE_COMMAND]
 
 
 class TestParallelShutdown:
