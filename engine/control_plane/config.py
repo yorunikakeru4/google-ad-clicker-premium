@@ -34,6 +34,12 @@ from engine.captcha_threshold import (
     DEFAULT_CAPTCHA_THRESHOLD_ACTION,
     DEFAULT_CAPTCHA_THRESHOLD_PERCENT,
 )
+from engine.log_rotation import (
+    DEFAULT_DB_SIZE_LIMIT_MB,
+    DEFAULT_LOG_FILE_LEVEL,
+    DEFAULT_LOG_RETENTION_DAYS,
+    LEVEL_ORDER,
+)
 from engine.proxy_transport import DEFAULT_PROXY_TRANSPORT, PROXY_TRANSPORTS
 
 # Значение, которым секрет заменяется в любом JSON наружу.
@@ -98,6 +104,14 @@ _SCHEMA: dict[str, dict[str, tuple[type | tuple[type, ...], Any]]] = {
         # читает политика.
         "captcha_threshold_percent": (float, DEFAULT_CAPTCHA_THRESHOLD_PERCENT),
         "captcha_threshold_action": (str, DEFAULT_CAPTCHA_THRESHOLD_ACTION),
+        # Хранение логов (план §5, фаза 9). Срок в днях (1 = минимум «вчера
+        # ещё жив»), уровень дневного файла и лимит размера БД в мегабайтах,
+        # где 0 — лимит выключен. Дефолты и словарь уровней приходят из
+        # engine.log_rotation, границы диапазонов живут в _numeric_limits:
+        # их же читают export_day и защита от роста, второй копии быть не должно.
+        "log_retention_days": (int, DEFAULT_LOG_RETENTION_DAYS),
+        "log_file_level": (str, DEFAULT_LOG_FILE_LEVEL),
+        "db_size_limit_mb": (int, DEFAULT_DB_SIZE_LIMIT_MB),
     },
 }
 
@@ -115,6 +129,9 @@ _ENUM_FIELDS: dict[str, frozenset[str]] = {
     "webdriver.proxy_transport": PROXY_TRANSPORTS,
     "behavior.captcha_policy": CAPTCHA_POLICIES,
     "behavior.captcha_threshold_action": CAPTCHA_THRESHOLD_ACTIONS,
+    # Уровень файла лога — тот же порядок, по которому export_day отбирает
+    # записи в дневной файл: enum и фильтр не могут разойтись.
+    "behavior.log_file_level": frozenset(LEVEL_ORDER),
 }
 
 # browser_count: legacy трактует 0 как "столько, сколько ядер". Демон держит
@@ -136,6 +153,10 @@ _MAX_WAIT_FACTOR = 100.0
 # Порог доли CAPTCHA — проценты: 0 допустим (срабатывать при любой доле),
 # больше 100 смысла нет — доля по построению не превышает единицу.
 _MAX_CAPTCHA_THRESHOLD_PERCENT = 100.0
+
+# Границы полей хранения логов (план §5, фаза 9).
+_MAX_LOG_RETENTION_DAYS = 3650
+_MAX_DB_SIZE_LIMIT_MB = 102400
 
 
 class ConfigError(ValueError):
@@ -246,6 +267,12 @@ def _numeric_limits(field_path: str) -> tuple[float, float] | None:
         "behavior.wait_factor": (0.01, _MAX_WAIT_FACTOR),
         "behavior.max_scroll_limit": (0, _MAX_WAIT_SECONDS),
         "behavior.captcha_threshold_percent": (0.0, _MAX_CAPTCHA_THRESHOLD_PERCENT),
+        # Срок хранения логов: день минимум (иначе retention удаляла бы всё,
+        # включая сегодня), 3650 — десять лет, дальше бессмысленно хранить.
+        "behavior.log_retention_days": (1, _MAX_LOG_RETENTION_DAYS),
+        # 0 — лимит выключен; 102400 (100 ГБ) — потолок, дальше защита уже
+        # не про «не задисковить машину», а про неправильно заданный путь.
+        "behavior.db_size_limit_mb": (0, _MAX_DB_SIZE_LIMIT_MB),
     }
     return limits.get(field_path)
 

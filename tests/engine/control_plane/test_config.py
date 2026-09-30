@@ -22,6 +22,7 @@ from engine.captcha_threshold import (
 )
 from engine.control_plane import config as config_module
 from engine.control_plane.config import Config, ConfigError, validate_settings
+from engine.log_rotation import LEVEL_ORDER
 from engine.proxy_auth import DEFAULT_PROXY_TRANSPORT, PROXY_TRANSPORTS
 
 SECRET_MASK = config_module.SECRET_MASK
@@ -729,6 +730,140 @@ class TestCaptchaThreshold:
         assert patched.get("behavior.captcha_threshold_percent") == 12.5
         assert patched.get("behavior.captcha_threshold_action") == "pause"
         assert cfg.get("behavior.captcha_threshold_percent") == 5.0
+
+
+class TestLogRetentionSettings:
+    """Поля хранения логов (план §5, фаза 9): срок, уровень файла, лимит БД.
+
+    Три поля обязаны жить и в `_SCHEMA` демона, и в корневом `config.json`
+    (source of truth) с теми же дефолтами: UI читает форму из `_SCHEMA`,
+    legacy-код — из файла, и расхождение дефолтов означало бы, что одно и то
+    же значение «30 дней» где-то стало «0».
+    """
+
+    @pytest.mark.parametrize("value", [1, 30, 3650])
+    def test_accepts_retention_days_inside_the_range(self, value):
+        cfg = Config.from_dict(_raw(behavior__log_retention_days=value))
+
+        assert cfg.get("behavior.log_retention_days") == value
+
+    @pytest.mark.parametrize("value", [0, -1, 3651])
+    def test_rejects_retention_days_outside_the_range(self, value):
+        with pytest.raises(ConfigError) as excinfo:
+            Config.from_dict(_raw(behavior__log_retention_days=value))
+
+        assert "behavior.log_retention_days" in str(excinfo.value)
+
+    @pytest.mark.parametrize("value", [True, "30"])
+    def test_rejects_wrong_type_for_retention_days(self, value):
+        with pytest.raises(ConfigError) as excinfo:
+            Config.from_dict(_raw(behavior__log_retention_days=value))
+
+        assert [p["field"] for p in excinfo.value.problems] == ["behavior.log_retention_days"]
+
+    def test_default_retention_is_thirty_days(self):
+        assert config_module.default_config()["behavior"]["log_retention_days"] == 30
+        assert Config.from_dict(_raw()).get("behavior.log_retention_days") == 30
+
+    def test_config_without_the_retention_key_keeps_working(self):
+        raw = _raw()
+        del raw["behavior"]["log_retention_days"]
+
+        assert Config.from_dict(raw).get("behavior.log_retention_days") == 30
+
+    @pytest.mark.parametrize("value", ["DEBUG", "INFO", "WARNING", "ERROR"])
+    def test_accepts_every_known_file_level(self, value):
+        cfg = Config.from_dict(_raw(behavior__log_file_level=value))
+
+        assert cfg.get("behavior.log_file_level") == value
+
+    def test_default_file_level_is_info(self):
+        assert config_module.default_config()["behavior"]["log_file_level"] == "INFO"
+        assert Config.from_dict(_raw()).get("behavior.log_file_level") == "INFO"
+
+    def test_unknown_file_level_is_a_readable_problem(self):
+        with pytest.raises(ConfigError) as excinfo:
+            Config.from_dict(_raw(behavior__log_file_level="TRACE"))
+
+        problems = excinfo.value.problems
+        assert [p["field"] for p in problems] == ["behavior.log_file_level"]
+        assert "ожидается одно из" in problems[0]["message"]
+        for value in LEVEL_ORDER:
+            assert value in problems[0]["message"]
+
+    def test_non_string_file_level_reports_the_expected_type(self):
+        with pytest.raises(ConfigError) as excinfo:
+            Config.from_dict(_raw(behavior__log_file_level=30))
+
+        assert [p["field"] for p in excinfo.value.problems] == ["behavior.log_file_level"]
+        assert "str" in excinfo.value.problems[0]["message"]
+
+    def test_file_level_enum_is_the_shared_level_order(self):
+        """Страховка от второго места правды для словаря значений."""
+        assert config_module._ENUM_FIELDS["behavior.log_file_level"] == frozenset(LEVEL_ORDER)
+
+    @pytest.mark.parametrize("value", [0, 1, 102400])
+    def test_accepts_db_size_limit_inside_the_range(self, value):
+        cfg = Config.from_dict(_raw(behavior__db_size_limit_mb=value))
+
+        assert cfg.get("behavior.db_size_limit_mb") == value
+
+    @pytest.mark.parametrize("value", [-1, 102401])
+    def test_rejects_db_size_limit_outside_the_range(self, value):
+        with pytest.raises(ConfigError) as excinfo:
+            Config.from_dict(_raw(behavior__db_size_limit_mb=value))
+
+        assert "behavior.db_size_limit_mb" in str(excinfo.value)
+
+    def test_default_db_size_limit_is_zero(self):
+        """Ноль — лимит выключен, а не «удалить всё»."""
+        assert config_module.default_config()["behavior"]["db_size_limit_mb"] == 0
+        assert Config.from_dict(_raw()).get("behavior.db_size_limit_mb") == 0
+
+    def test_rejects_bool_where_db_size_limit_expected(self):
+        with pytest.raises(ConfigError) as excinfo:
+            Config.from_dict(_raw(behavior__db_size_limit_mb=True))
+
+        assert [p["field"] for p in excinfo.value.problems] == ["behavior.db_size_limit_mb"]
+
+    def test_config_without_the_three_keys_keeps_working(self):
+        raw = _raw()
+        for key in ("log_retention_days", "log_file_level", "db_size_limit_mb"):
+            del raw["behavior"][key]
+
+        cfg = Config.from_dict(raw)
+
+        assert cfg.get("behavior.log_retention_days") == 30
+        assert cfg.get("behavior.log_file_level") == "INFO"
+        assert cfg.get("behavior.db_size_limit_mb") == 0
+
+    def test_patch_can_change_all_three(self):
+        cfg = Config.from_dict(_raw())
+
+        patched = cfg.patch(
+            {
+                "behavior": {
+                    "log_retention_days": 7,
+                    "log_file_level": "DEBUG",
+                    "db_size_limit_mb": 2048,
+                }
+            }
+        )
+
+        assert patched.get("behavior.log_retention_days") == 7
+        assert patched.get("behavior.log_file_level") == "DEBUG"
+        assert patched.get("behavior.db_size_limit_mb") == 2048
+        assert cfg.get("behavior.log_retention_days") == 30, "исходный конфиг не меняется"
+
+    def test_repository_config_json_carries_the_three_keys(self):
+        """config.json — source of truth: ключи есть и там, с дефолтами."""
+        repo_config = json.loads(
+            (config_module.Path(__file__).parents[3] / "config.json").read_text(encoding="utf-8")
+        )
+
+        assert repo_config["behavior"]["log_retention_days"] == 30
+        assert repo_config["behavior"]["log_file_level"] == "INFO"
+        assert repo_config["behavior"]["db_size_limit_mb"] == 0
 
 
 class TestImportHasNoSideEffects:

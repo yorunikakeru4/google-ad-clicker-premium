@@ -57,10 +57,14 @@ from typing import Any
 
 from engine.control_plane.state import StateStore
 from engine.db.migrations import BUSY_TIMEOUT_MS
+from engine.log_rotation import local_day
 
+# day — локальная дата от ts, а не от момента записи: строка могла полежать
+# в батче до полуночи. Считается до попадания в буфер, чтобы значение не
+# зависело от того, когда батч сбросится.
 _LOG_INSERT = (
-    "INSERT INTO logs (ts, level, browser_id, category, message, fields) "
-    "VALUES (?, ?, ?, ?, ?, ?)"
+    "INSERT INTO logs (ts, day, level, browser_id, category, message, fields) "
+    "VALUES (?, ?, ?, ?, ?, ?, ?)"
 )
 _CLICK_INSERT = (
     "INSERT INTO clicks (ts, url, query, category, browser_id, proxy_id, http_status) "
@@ -198,11 +202,12 @@ class StoreWriter:
     ) -> None:
         stamp = time.time() if ts is None else ts
         payload = self._coerce_fields(fields)
+        day = local_day(stamp)
         with self._lock:
             if self._closed:
                 self._record_loss_locked(1, "writer закрыт: запись в logs отброшена")
                 return
-            self._logs.append((stamp, level, browser_id, category, message, payload))
+            self._logs.append((stamp, day, level, browser_id, category, message, payload))
             if len(self._logs) + len(self._clicks) + len(self._network) >= self._batch_size:
                 self._flush_locked()
 

@@ -140,6 +140,60 @@ class TestLogBatching:
             writer.close()
 
 
+class TestLogDay:
+    """Колонка logs.day: локальная дата от самого ts, а не от стены.
+
+    Экспорт дня и retention читают по этой колонке, поэтому неверно взятая
+    дата (сегодняшняя вместо даты события) молча увела бы запись в чужой
+    дневной файл и в чужую отсечку.
+    """
+
+    def test_day_comes_from_the_given_ts_not_from_the_wall_clock(self, db_path):
+        just_before_midnight = time.mktime((2024, 3, 31, 23, 59, 59, 0, 0, -1))
+        after_midnight = time.mktime((2024, 4, 1, 0, 0, 0, 0, 0, -1))
+        writer = StoreWriter(db_path, batch_size=100, flush_interval=60.0)
+        try:
+            writer.log(level="INFO", category="click", message="late", ts=just_before_midnight)
+            writer.log(level="INFO", category="click", message="early", ts=after_midnight)
+            writer.flush()
+
+            rows = _read(db_path, "SELECT day FROM logs ORDER BY id")
+        finally:
+            writer.close()
+
+        assert [row["day"] for row in rows] == ["2024-03-31", "2024-04-01"]
+
+    def test_default_ts_fills_the_current_local_day(self, db_path):
+        """ts=None — текущая локальная дата; гонка через полночь не должна ломать тест."""
+        before = time.strftime("%Y-%m-%d", time.localtime())
+        writer = StoreWriter(db_path, batch_size=100, flush_interval=60.0)
+        try:
+            writer.log(level="INFO", category="scheduler", message="now")
+            writer.flush()
+
+            rows = _read(db_path, "SELECT day FROM logs")
+        finally:
+            writer.close()
+        after = time.strftime("%Y-%m-%d", time.localtime())
+
+        assert rows[0]["day"] in {before, after}
+
+    def test_day_survives_the_batch_not_being_flushed_immediately(self, db_path):
+        """Буферизация не должна терять day: значение считается до батча."""
+        ts = time.mktime((2023, 12, 31, 12, 0, 0, 0, 0, -1))
+        writer = StoreWriter(db_path, batch_size=100, flush_interval=60.0)
+        try:
+            writer.log(level="DEBUG", category="browser", message="buffered", ts=ts)
+
+            assert _read(db_path, "SELECT day FROM logs") == []
+            writer.flush()
+            rows = _read(db_path, "SELECT day FROM logs")
+        finally:
+            writer.close()
+
+        assert rows[0]["day"] == "2023-12-31"
+
+
 class TestConcurrency:
     def test_concurrent_writers_lose_nothing_and_keep_per_worker_order(self, db_path):
         writer = StoreWriter(db_path, batch_size=7, flush_interval=0.02)

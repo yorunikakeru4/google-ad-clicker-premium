@@ -276,3 +276,53 @@ class TestOrderingAndShape:
         validate_settings(data, base_dir=base)
 
         assert data == untouched
+
+
+class TestLogSettingsValidation:
+    """Поля хранения логов в публичной валидации: диапазоны и enum."""
+
+    @pytest.mark.parametrize("value", [1, 30, 3650])
+    def test_accepts_log_settings_with_valid_values(self, tmp_path, value):
+        problems = validate_settings(
+            _raw(
+                behavior__log_retention_days=value,
+                behavior__log_file_level="DEBUG",
+                behavior__db_size_limit_mb=value,
+            ),
+            base_dir=_base_dir(tmp_path),
+        )
+
+        assert problems == []
+
+    @pytest.mark.parametrize("value", [0, -1, 3651])
+    def test_reports_retention_days_out_of_range(self, tmp_path, value):
+        problems = validate_settings(
+            _raw(behavior__log_retention_days=value), base_dir=_base_dir(tmp_path)
+        )
+
+        assert _fields(problems) == ["behavior.log_retention_days"]
+        assert "минимума" in problems[0]["message"] or "максимума" in problems[0]["message"]
+
+    def test_reports_unknown_log_file_level(self, tmp_path):
+        problems = validate_settings(
+            _raw(behavior__log_file_level="TRACE"), base_dir=_base_dir(tmp_path)
+        )
+
+        assert _fields(problems) == ["behavior.log_file_level"]
+        assert "ожидается одно из" in problems[0]["message"]
+
+    @pytest.mark.parametrize("value", [-1, 102401])
+    def test_reports_db_size_limit_out_of_range(self, tmp_path, value):
+        problems = validate_settings(
+            _raw(behavior__db_size_limit_mb=value), base_dir=_base_dir(tmp_path)
+        )
+
+        assert _fields(problems) == ["behavior.db_size_limit_mb"]
+
+    @pytest.mark.parametrize("field", ["log_retention_days", "log_file_level", "db_size_limit_mb"])
+    def test_reports_wrong_type_for_each_field(self, tmp_path, field):
+        problems = validate_settings(
+            _raw(**{f"behavior__{field}": None}), base_dir=_base_dir(tmp_path)
+        )
+
+        assert _fields(problems) == [f"behavior.{field}"]

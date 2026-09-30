@@ -27,6 +27,7 @@ from pathlib import Path
 from typing import Any, Iterator
 
 from engine.db import migrations
+from engine.log_rotation import local_day
 
 # Ключи в таблице kv. Совпадают с тем, что ищет UI.
 PAUSE_REQUESTED_KEY = "PAUSE_REQUESTED"
@@ -472,14 +473,19 @@ class StateStore:
         fields уходит JSON-строкой: схема объявлена «message читаем человеком,
         fields — всё машинное», и разбирать это обратно на стороне UI дешевле,
         чем городить формат.
+
+        Второй INSERT в logs наряду с engine.store, поэтому day считается
+        здесь той же функцией: запись демона без дня невидима для экспорта и
+        retention и навсегда остаётся в таблице.
         """
         payload = json.dumps(fields, ensure_ascii=False, sort_keys=True) if fields else None
+        stamp = time.time()
         with self._connect() as conn:
             with self._lock:
                 conn.execute(
-                    "INSERT INTO logs (ts, level, browser_id, category, message, fields) "
-                    "VALUES (?, ?, ?, ?, ?, ?)",
-                    (time.time(), level, browser_id, category, message, payload),
+                    "INSERT INTO logs (ts, day, level, browser_id, category, message, fields) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?)",
+                    (stamp, local_day(stamp), level, browser_id, category, message, payload),
                 )
                 conn.commit()
 

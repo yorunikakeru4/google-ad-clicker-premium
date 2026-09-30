@@ -83,10 +83,13 @@ from pathlib import Path
 from typing import Any, Callable
 
 from engine.db import migrations
+from engine.log_rotation import LEVEL_ORDER
 from engine.store import StoreWriter
 
 CATEGORIES = frozenset({"proxy", "browser", "captcha", "click", "cleanup", "scheduler"})
-LEVELS = frozenset({"DEBUG", "INFO", "WARNING", "ERROR"})
+# Уровни структурированного лога — тот же порядок, что и у хранения логов:
+# enum behavior.log_file_level и фильтр дневного экспорта берут его оттуда же.
+LEVELS = frozenset(LEVEL_ORDER)
 
 # Путь к БД: переменная окружения и имя файла по умолчанию.
 DB_ENV_VAR = "ADCLICKER_DB"

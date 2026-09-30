@@ -83,9 +83,12 @@ CREATE TABLE IF NOT EXISTS runs (
 );
 
 -- Структурированные логи: message читаем человеком, fields — всё машинное в JSON.
+-- day — локальная дата ts (YYYY-MM-DD): экспорт дня, retention и защита от
+-- роста БД читают и пишут по ней; DEFAULT нет (см. migrations/003_logs_day.sql).
 CREATE TABLE IF NOT EXISTS logs (
     id         INTEGER PRIMARY KEY,
     ts         REAL    NOT NULL,
+    day        TEXT,
     level      TEXT    NOT NULL DEFAULT 'INFO',
     browser_id TEXT,
     category   TEXT,
@@ -186,6 +189,8 @@ CREATE TABLE IF NOT EXISTS kv (
 -- Фильтры UI: по времени и по browser_id.
 CREATE INDEX IF NOT EXISTS idx_logs_ts             ON logs (ts);
 CREATE INDEX IF NOT EXISTS idx_logs_browser_id     ON logs (browser_id);
+-- Дневной экспорт и retention: выборки по дню с уровнем и воркером.
+CREATE INDEX IF NOT EXISTS idx_logs_day_level_browser ON logs (day, level, browser_id);
 CREATE INDEX IF NOT EXISTS idx_clicks_ts           ON clicks (ts);
 CREATE INDEX IF NOT EXISTS idx_clicks_browser_id   ON clicks (browser_id);
 CREATE INDEX IF NOT EXISTS idx_captcha_events_ts   ON captcha_events (ts);
