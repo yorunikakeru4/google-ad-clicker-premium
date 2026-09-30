@@ -398,6 +398,10 @@ class TestProxyTransportOptions:
         assert call["username"] == "user"
         assert call["password"] == "pass"
         assert "uc_profiles" in str(call["user_data_dir"])
+        # UC держит фиксированный --remote-debugging-port (файла
+        # DevToolsActivePort нет) — адрес обязан доехать до менеджера,
+        # иначе авторизация не поднимается ни на одной сессии (e2e).
+        assert call["debugger_address"] == driver.options.debugger_address
         assert callable(call["on_proxy_dead"])
         assert callable(call["client_factory"])
         # Менеджер привязан к драйверу и гасится в его quit().

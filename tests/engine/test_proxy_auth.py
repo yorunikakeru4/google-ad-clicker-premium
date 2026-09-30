@@ -795,6 +795,48 @@ def test_create_proxy_auth_via_debugger_address() -> None:
         server.shutdown()
 
 
+def test_create_proxy_auth_falls_back_when_port_file_is_missing(tmp_path) -> None:
+    """UC поднимает Chrome с фиксированным ``--remote-debugging-port``:
+
+    файла ``DevToolsActivePort`` в профиле нет вовсе, и без перехода на
+    ``debugger_address`` авторизация не поднимается ни на одной сессии —
+    поймано живым e2e-прогоном (``cdp auth start failed: CdpError`` на
+    каждом воркере, прокси сгорали в ротации).
+    """
+    from http.server import HTTPServer
+
+    from tests.engine.test_cdp import _VersionHandler
+
+    ws = FakeWs()
+    seen_urls: list[str] = []
+
+    def fake_client(url: str, **kwargs) -> CdpClient:
+        seen_urls.append(url)
+        return _make_client(ws)
+
+    server = HTTPServer(("127.0.0.1", 0), _VersionHandler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    try:
+        port = server.server_address[1]
+        _VersionHandler.payload = {
+            "webSocketDebuggerUrl": f"ws://127.0.0.1:{port}/devtools/browser/f"
+        }
+        manager = create_proxy_auth(
+            username=USERNAME,
+            password=PASSWORD,
+            user_data_dir=tmp_path,  # каталог без DevToolsActivePort
+            debugger_address=f"127.0.0.1:{port}",
+            client_factory=fake_client,
+        )
+        try:
+            assert seen_urls == [f"ws://127.0.0.1:{port}/devtools/browser/f"]
+        finally:
+            manager.stop()
+    finally:
+        server.shutdown()
+
+
 def test_create_proxy_auth_forwards_max_failures() -> None:
     ws = FakeWs()
 

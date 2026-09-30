@@ -276,14 +276,18 @@ def _start_proxy_auth(
     credentials: tuple[str, str],
     user_data_dir,
     proxy_host_port: str,
+    debugger_address: str | None = None,
 ) -> ProxyAuthManager | None:
     """Поднять CDP-авторизацию после создания драйвера. None — не вышло.
 
-    Порт DevTools менеджер находит сам по ``user_data_dir``. Отказ не роняет
-    создание драйвера: браузер жив и доедет до первой 407, а супервизору нужен
-    сигнал, а не падение воркера — причина уходит в WARNING и в
-    ``workers.status='degraded'``. Колбэк ``on_proxy_dead`` и обрыв CDP держат
-    ту же дорогу сигнала, только с другой причиной.
+    Порт DevTools менеджер находит сам: файл ``DevToolsActivePort`` в
+    ``user_data_dir``, а при его отсутствии — ``debugger_address`` (UC
+    держит фиксированный ``--remote-debugging-port`` и файла не пишет;
+    без этой ветки авторизация не поднималась ни разу — e2e). Отказ не
+    роняет создание драйвера: браузер жив и доедет до первой 407, а
+    супервизору нужен сигнал, а не падение воркера — причина уходит в
+    WARNING и в ``workers.status='degraded'``. Колбэк ``on_proxy_dead``
+    и обрыв CDP держат ту же дорогу сигнала, только с другой причиной.
     """
     username, password = credentials
     try:
@@ -291,6 +295,7 @@ def _start_proxy_auth(
             username,
             password,
             user_data_dir=user_data_dir,
+            debugger_address=debugger_address,
             on_proxy_dead=lambda: _report_degraded(
                 "proxy rejected credentials", proxy_host_port
             ),
@@ -304,6 +309,18 @@ def _start_proxy_auth(
     except Exception as exc:
         _report_degraded(f"cdp auth start failed: {type(exc).__name__}", proxy_host_port)
         return None
+
+
+def _debugger_address_of(driver) -> str | None:
+    """DevTools-адрес драйвера, если платформа его знает.
+
+    UC всегда пишет ``options.debugger_address`` (фиксированный
+    ``--remote-debugging-port``); у SeleniumBase и заглушек атрибута может
+    не быть вовсе — тогда возвращается None и менеджер ищет порт по
+    старой цепочке (файл в профиле).
+    """
+    options = getattr(driver, "options", None)
+    return getattr(options, "debugger_address", None)
 
 
 def _apply_locale(chrome_options, lang: Optional[object]) -> None:
@@ -483,9 +500,16 @@ def create_webdriver(
         )
 
         if transport == PROXY_TRANSPORT_CDP_AUTH and credentials is not None:
-            # Старт после создания драйвера: порт DevTools появляется только
-            # когда Chrome поднялся. Остановка — в quit() драйвера.
-            manager = _start_proxy_auth(credentials, profile_dir, host_port)
+            # Старт после создания драйвера: DevTools-порт доступен только
+            # когда Chrome поднялся. UC пишет его в options.debugger_address
+            # (файла DevToolsActivePort при фиксированном порту нет) —
+            # отдаём менеджеру как фолбэк. Остановка — в quit() драйвера.
+            manager = _start_proxy_auth(
+                credentials,
+                profile_dir,
+                host_port,
+                _debugger_address_of(driver),
+            )
             if manager is not None:
                 attach_proxy_auth(driver, manager)
 
@@ -648,9 +672,15 @@ def create_seleniumbase_driver(
     )
 
     if proxy and transport == PROXY_TRANSPORT_CDP_AUTH and credentials is not None:
-        # Тот же механизм, что и в UC-ветке: порт DevTools берётся из
-        # user_data_dir, который только что ушёл в get_driver.
-        manager = _start_proxy_auth(credentials, profile_dir, host_port)
+        # Тот же механизм, что и в UC-ветке: DevTools-порт берётся из
+        # user_data_dir (файл) или из options.debugger_address (фолбэк,
+        # обязателен для UC с фиксированным портом).
+        manager = _start_proxy_auth(
+            credentials,
+            profile_dir,
+            host_port,
+            _debugger_address_of(driver),
+        )
         if manager is not None:
             attach_proxy_auth(driver, manager)
 

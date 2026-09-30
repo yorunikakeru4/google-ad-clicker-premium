@@ -368,19 +368,24 @@ def create_proxy_auth(
     """Строит клиент по готовому DevTools-порту и запускает авторизацию.
 
     Приоритет источника ws-URL: явный ``ws_url`` > ``user_data_dir`` >
-    ``debugger_address`` > ``devtools_port``. Возвращённый менеджер владеет
-    клиентом: ``stop()`` (или выход из ``with``) гасит и подписку, и сокет —
-    вызывать это надо в том же ``finally``, что закрывает браузер.
+    ``debugger_address`` > ``devtools_port``. Источники передаются в
+    ``resolve_browser_ws_url`` **одним вызовом**, а не по очереди: у UC
+    Chrome файл ``DevToolsActivePort`` отсутствует вовсе (он держит
+    фиксированный ``--remote-debugging-port``), и жёсткий ``elif`` на
+    ``user_data_dir`` терял фолбэк на ``debugger_address`` — авторизация
+    не поднималась ни на одной живой сессии (поймано e2e-прогоном).
+    Возвращённый менеджер владеет клиентом: ``stop()`` (или выход из
+    ``with``) гасит и подписку, и сокет — вызывать это надо в том же
+    ``finally``, что закрывает браузер.
     """
     if ws_url is None:
-        if user_data_dir is not None:
-            ws_url = resolve_browser_ws_url(user_data_dir=user_data_dir)
-        elif debugger_address is not None:
-            ws_url = resolve_browser_ws_url(debugger_address=debugger_address)
-        elif devtools_port is not None:
-            ws_url = resolve_browser_ws_url(port=devtools_port)
-        else:
+        if user_data_dir is None and debugger_address is None and devtools_port is None:
             raise ValueError("need ws_url, user_data_dir, debugger_address or devtools_port")
+        ws_url = resolve_browser_ws_url(
+            user_data_dir=user_data_dir,
+            debugger_address=debugger_address,
+            port=devtools_port,
+        )
     client = client_factory(ws_url)
     client.start(timeout=start_timeout)
     manager = ProxyAuthManager(
