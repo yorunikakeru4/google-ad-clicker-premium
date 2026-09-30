@@ -1,12 +1,20 @@
 <script setup lang="ts">
-// Экран Logs (план §5, фаза 4): live-логи с фильтрами (уровень, категория,
+// Экран Logs (план §5, фазы 4 и 9): live-логи с фильтрами (уровень, категория,
 // browser_id, время), пагинация подгрузкой старых по курсору, счётчик
-// count_logs, экспорт выгрузки в CSV и пауза живого режима.
+// count_logs, экспорт диапазона в CSV/JSON, пауза живого режима и индикатор
+// размера БД.
 //
 // Порядок строк — новые сверху (как в БД). Автоскролл ведёт к верху только
 // когда живой тик привёз новые строки: подгрузка старого и пауза чтение не
 // сбивают. Фильтры валидируются и сохраняются в localStorage — они
 // переживают перезагрузку (см. lib/logFilters).
+//
+// Экспорт — диалог с диапазоном дат поверх текущих фильтров (lib/logExport):
+// выборка грузится курсорными страницами до исчерпания или EXPORT_ROW_CAP
+// строк, при усечении диалог честно предупреждает. Старый экспорт «того,
+// что на экране» заменён этой операцией: диалог по умолчанию предзаполнен
+// окном текущих фильтров, то есть прежний сценарий — один клик, а поверх —
+// формат, больший диапазон и потолок с предупреждением.
 //
 // Вёрстка — шаблон: PageLayout (заголовок + тулбар) и FilterBar (контролы,
 // чипы активных фильтров, «Сбросить»). Сам список остаётся локальным:
@@ -22,23 +30,65 @@ import DbUnavailableAlert from "../components/DbUnavailableAlert.vue";
 import FilterBar from "../components/data/FilterBar.vue";
 import PageLayout from "../components/layout/PageLayout.vue";
 import { useDb } from "../composables/useDb";
+import { useDbSize } from "../composables/useDbSize";
 import { MAX_LOGS_ROWS, useLogs } from "../composables/useLogs";
-import { logsToCsv } from "../lib/csv";
+import { useSettings } from "../composables/useSettings";
+import { dbApi, dbErrorMessage } from "../lib/dbApi";
+import { dbSizeStatus } from "../lib/dbSize";
 import { activeFilterChips } from "../lib/logFilterChips";
 import {
   LOG_CATEGORIES,
   LOG_LEVELS,
   type LogFilterValues,
 } from "../lib/logFilters";
+import {
+  EXPORT_ROW_CAP,
+  buildExportQuery,
+  collectExportRows,
+  exportFile,
+  exportFilename,
+  rangeProblem,
+  type ExportFormat,
+} from "../lib/logExport";
 
 const db = useDb();
 const logs = useLogs();
+const size = useDbSize();
+const settings = useSettings();
 
 onMounted(() => {
   void db.ensureOpen();
   void logs.start();
+  // Лимит индикатора — из того же GET /control/config, что и Settings:
+  // синглтон кэширует ответ, повторное открытие экрана не ходит в сеть.
+  void settings.load();
+  size.start();
 });
-onUnmounted(() => logs.stop());
+onUnmounted(() => {
+  logs.stop();
+  size.stop();
+});
+
+// --- индикатор размера БД -------------------------------------------------
+
+// Лимит честен только после ответа демона: до load() конфиг не загружен и
+// limit = null, а не дефолт схемы 0 — «лимит не задан» у непрочитанного
+// конфига врало бы.
+const limitMb = computed(() => {
+  if (!settings.loaded.value) return null;
+  const raw = settings.values.value["behavior.db_size_limit_mb"];
+  return typeof raw === "number" ? raw : null;
+});
+
+const sizeStatus = computed(() => dbSizeStatus(size.bytes.value, limitMb.value));
+
+const sizeChipColor = computed(() =>
+  sizeStatus.value.tone === "error" ? "error" : undefined,
+);
+
+const sizeTitle = computed(
+  () => size.path.value ?? size.error.value ?? "размер БД ещё не прочитан",
+);
 
 // --- фильтры -------------------------------------------------------------
 
@@ -69,6 +119,13 @@ const categoryItems = [
 /** Активные фильтры чипами: их наличие и есть «фильтр включён». */
 const filterChips = computed(() => activeFilterChips(logs.filters.value));
 
+/** Строка «что применяется» в диалоге экспорта. */
+const filterSummary = computed(() =>
+  filterChips.value.length === 0
+    ? "фильтры не заданы"
+    : filterChips.value.map((chip) => `${chip.label}: ${chip.value}`).join(", "),
+);
+
 /** Крестик на чипе снимает ровно это поле, остальные фильтры остаются. */
 function onFilterClear(key: string): void {
   const fieldKey = key as keyof LogFilterValues;
@@ -98,30 +155,79 @@ async function onLoadOlder(): Promise<void> {
   // Подгрузка не трогает автоскролл — читатель остаётся на своём месте.
 }
 
-const canExport = computed(() => hasRows.value);
+// --- экспорт -------------------------------------------------------------
 
-function csvStamp(): string {
-  const at = new Date();
-  const p = (value: number) => String(value).padStart(2, "0");
-  return (
-    `${at.getFullYear()}-${p(at.getMonth() + 1)}-${p(at.getDate())}` +
-    `-${p(at.getHours())}${p(at.getMinutes())}${p(at.getSeconds())}`
-  );
+const exportDialog = ref(false);
+const exportSince = ref<string | null>(null);
+const exportUntil = ref<string | null>(null);
+const exportFormat = ref<ExportFormat>("csv");
+const exportBusy = ref(false);
+const exportError = ref<string | null>(null);
+/** Текст усечения; null — выгрузка полная. */
+const exportTruncated = ref<string | null>(null);
+/** Текст успеха; null — ещё не выгружали. */
+const exportDone = ref<string | null>(null);
+
+const exportProblem = computed(() =>
+  rangeProblem({ since: exportSince.value, until: exportUntil.value }),
+);
+
+// Экспорт доступен, пока открыта база: диалог перечитывает БД курсорными
+// страницами и не зависит от того, что успело загрузиться на экран.
+const canExport = computed(() => db.phase.value === "open");
+
+function openExport(): void {
+  // Диалог стартует с окна текущих фильтров: «экспорт того, что вижу» —
+  // это дефолт, а не отдельная кнопка.
+  exportSince.value = logs.filters.value.since;
+  exportUntil.value = logs.filters.value.until;
+  exportFormat.value = "csv";
+  exportError.value = null;
+  exportTruncated.value = null;
+  exportDone.value = null;
+  exportDialog.value = true;
 }
 
-// Экспорт — из реально загруженных строк (≤ MAX_LOGS_ROWS), без повторного
-// чтения базы: файл соответствует тому, что видит пользователь.
-function exportCsv(): void {
-  const csv = logsToCsv(logs.rows.value);
-  const blob = new Blob([csv], { type: "text/csv;charset=utf-8" });
+async function runExport(): Promise<void> {
+  if (exportBusy.value || exportProblem.value !== null) return;
+
+  exportBusy.value = true;
+  exportError.value = null;
+  exportTruncated.value = null;
+  exportDone.value = null;
+  try {
+    const query = buildExportQuery(logs.filters.value, {
+      since: exportSince.value,
+      until: exportUntil.value,
+    });
+    const { rows, truncated } = await collectExportRows((cursor, limit) =>
+      dbApi.listLogsPage({ query, limit, cursor }),
+    );
+
+    const file = exportFile(rows, exportFormat.value);
+    download(file.content, exportFilename(exportFormat.value, new Date()), file.mime);
+
+    exportTruncated.value = truncated
+      ? `Диапазон усечён до ${EXPORT_ROW_CAP} строк: выгружено ${rows.length}, старше потолка не попало в файл. Сузьте окно времени для полной выгрузки.`
+      : null;
+    exportDone.value = `Выгружено строк: ${rows.length}.`;
+  } catch (caught) {
+    exportError.value = dbErrorMessage(caught);
+  } finally {
+    exportBusy.value = false;
+  }
+}
+
+/** Скачивание готового файла; отложенная revoke — браузер должен забрать blob. */
+function download(content: string, filename: string, mime: string): void {
+  const blob = new Blob([content], { type: mime });
   const url = URL.createObjectURL(blob);
   const link = document.createElement("a");
   link.href = url;
-  link.download = `adclicker-logs-${csvStamp()}.csv`;
+  link.download = filename;
   document.body.appendChild(link);
   link.click();
   link.remove();
-  // Отложенная отмена: браузер должен успеть забрать blob до revoke.
   setTimeout(() => URL.revokeObjectURL(url), 0);
 }
 
@@ -213,6 +319,17 @@ watch(logs.liveAdded, async () => {
     </template>
 
     <template #toolbar-right>
+      <v-chip
+        size="small"
+        variant="tonal"
+        :color="sizeChipColor"
+        :title="sizeTitle"
+        data-test="db-size"
+      >
+        {{ sizeStatus.sizeMb === null ? "БД: …" : `БД: ${sizeStatus.sizeMb} МБ` }}
+        · {{ sizeStatus.detail }}
+      </v-chip>
+
       <v-btn
         size="small"
         variant="outlined"
@@ -230,11 +347,10 @@ watch(logs.liveAdded, async () => {
         variant="outlined"
         prepend-icon="mdi-download"
         :disabled="!canExport"
-        :title="atRowCap ? `Экспорт ограничен ${MAX_LOGS_ROWS} строками` : undefined"
-        data-test="export-csv"
-        @click="exportCsv"
+        data-test="export-open"
+        @click="openExport"
       >
-        Экспорт CSV
+        Экспорт
       </v-btn>
 
       <v-btn
@@ -339,6 +455,108 @@ watch(logs.liveAdded, async () => {
       Достигнут лимит просмотра — сузьте фильтр по времени, чтобы увидеть
       старее.
     </p>
+
+    <v-dialog v-model="exportDialog" max-width="560">
+      <v-card data-test="export-dialog">
+        <v-card-title>Экспорт логов</v-card-title>
+        <v-card-text>
+          <p class="text-body-2 text-muted mb-3">
+            Текущие фильтры применяются: {{ filterSummary }}. Максимум
+            {{ EXPORT_ROW_CAP.toLocaleString("ru-RU") }} строк за выгрузку.
+          </p>
+
+          <div class="d-flex flex-wrap ga-3">
+            <v-text-field
+              v-model="exportSince"
+              label="с"
+              type="datetime-local"
+              hide-details
+              density="compact"
+              clearable
+              style="max-width: 230px"
+              data-test="export-since"
+            />
+            <v-text-field
+              v-model="exportUntil"
+              label="по"
+              type="datetime-local"
+              hide-details
+              density="compact"
+              clearable
+              style="max-width: 230px"
+              data-test="export-until"
+            />
+          </div>
+
+          <v-btn-toggle
+            v-model="exportFormat"
+            mandatory
+            density="compact"
+            class="mt-4"
+            data-test="export-format"
+          >
+            <v-btn value="csv">CSV</v-btn>
+            <v-btn value="json">JSON</v-btn>
+          </v-btn-toggle>
+
+          <v-alert
+            v-if="exportProblem"
+            type="warning"
+            variant="tonal"
+            class="mt-4"
+            data-test="export-problem"
+          >
+            {{ exportProblem }}
+          </v-alert>
+
+          <v-alert
+            v-if="exportError"
+            type="error"
+            variant="tonal"
+            class="mt-4"
+            data-test="export-error"
+          >
+            {{ exportError }}
+          </v-alert>
+
+          <v-alert
+            v-if="exportTruncated"
+            type="warning"
+            variant="tonal"
+            class="mt-4"
+            data-test="export-truncated"
+          >
+            {{ exportTruncated }}
+          </v-alert>
+
+          <v-alert
+            v-if="exportDone && !exportTruncated"
+            type="success"
+            variant="tonal"
+            class="mt-4"
+            data-test="export-done"
+          >
+            {{ exportDone }}
+          </v-alert>
+        </v-card-text>
+        <v-card-actions>
+          <v-spacer />
+          <v-btn variant="text" data-test="export-close" @click="exportDialog = false">
+            Закрыть
+          </v-btn>
+          <v-btn
+            color="primary"
+            prepend-icon="mdi-download"
+            :loading="exportBusy"
+            :disabled="exportProblem !== null"
+            data-test="export-run"
+            @click="runExport"
+          >
+            Выгрузить
+          </v-btn>
+        </v-card-actions>
+      </v-card>
+    </v-dialog>
   </PageLayout>
 </template>
 

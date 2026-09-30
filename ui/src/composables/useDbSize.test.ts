@@ -4,9 +4,9 @@
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { DB_SIZE_POLL_MS, createDbSize } from "./useDbSize";
-import type { DbSizeInfo } from "../lib/dbApi";
+import type { DbSize } from "../lib/dbApi";
 
-function reply(overrides: Partial<DbSizeInfo> = {}): DbSizeInfo {
+function reply(overrides: Partial<DbSize> = {}): DbSize {
   return { path: "/data/adclicker.db", bytes: 1000, wal_bytes: 300, ...overrides };
 }
 
