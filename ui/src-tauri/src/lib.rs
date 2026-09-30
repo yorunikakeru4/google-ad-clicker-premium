@@ -9,7 +9,7 @@ use tauri::Manager;
 use commands::{
     active_workers, captcha_share, clicks_per_hour, count_logs, db_open, db_size,
     list_captcha_events, list_diagnostics, list_logs, list_logs_page, list_profiles, list_proxies,
-    requests_last_hour, runs_summary, DbState,
+    requests_last_hour, runs_summary, uptime_summary, DbState,
 };
 use daemon::{DaemonSpec, DaemonStatus, DaemonSupervisor, SupervisorOptions};
 
@@ -55,6 +55,7 @@ pub fn run() {
             requests_last_hour,
             captcha_share,
             active_workers,
+            uptime_summary,
             list_proxies,
             list_profiles,
             list_diagnostics,

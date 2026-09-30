@@ -9,6 +9,11 @@ use serde::Serialize;
 
 use crate::db::{read_failed, DbError, DbReader};
 
+/// Длина часового слота, секунды — зеркало Python `BUCKET_SECONDS`
+/// (`engine/metrics.py`): бакет — целый час в шкале unix-секунд, пояс в
+/// метки не входит. Та же длина у `metrics_hourly.uptime_seconds` сверху.
+const BUCKET_SECONDS: i64 = 3600;
+
 /// Сводка по запускам сценария в окне `since`.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct RunsSummary {
@@ -57,6 +62,24 @@ pub struct ActiveWorker {
     pub last_error: Option<String>,
 }
 
+/// Uptime-доля дашборда — зеркало Python `engine/metrics.py::uptime_ratio`.
+///
+/// `ratio = Σuptime_seconds / window_seconds`: знаменатель считается по
+/// часовым слотам окна, а не по записанным строкам, поэтому час без строки
+/// — простой, а не вычеркнутый из доли. `None` — в окне нет ни одной
+/// строки: метрики ещё не считались, и «0%» врало бы так же, как «100%».
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct UptimeSummary {
+    /// Доля времени с живым воркером, 0..1; `None` — данных в окне нет.
+    pub ratio: Option<f64>,
+    /// Сумма `uptime_seconds` по строкам окна.
+    pub uptime_seconds: i64,
+    /// Знаменатель доли: `BUCKET_SECONDS` × число слотов окна.
+    pub window_seconds: i64,
+    /// Число строк `metrics_hourly`, попавших в окно.
+    pub buckets: i64,
+}
+
 /// Куда попадает статус запуска.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum RunOutcome {
@@ -75,6 +98,14 @@ fn classify_run_status(status: &str) -> RunOutcome {
         "failed" | "crashed" => RunOutcome::Failure,
         _ => RunOutcome::Other,
     }
+}
+
+/// Текущее время в unix-секундах. Час до эпохи отдаёт 0 — часов до 1970
+/// года в метриках нет, а паника на чтении дашборда недопустима.
+fn unix_seconds() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0.0, |elapsed| elapsed.as_secs_f64())
 }
 
 impl DbReader {
@@ -269,6 +300,48 @@ impl DbReader {
             .map_err(read_failed)?;
 
         rows.map(|row| row.map_err(read_failed)).collect()
+    }
+
+    /// Доля времени, когда был хотя бы один живой воркер, за окно в
+    /// `since_hours` часов — зеркало Python `engine/metrics.py::uptime_ratio`
+    /// (план §5, фаза 12: цель ≥99%).
+    ///
+    /// Окно: от `floor(now / 3600) * 3600 − since_hours × 3600` до текущего
+    /// бакета включительно — то есть `since_hours + 1` слотов «по сетке»:
+    /// нижняя и текущая границы входят целиком, как в Python, где окно
+    /// строится от `bucket_of(since)` до `bucket_of(now)`. Строки вне окна,
+    /// включая бакеты будущего, в сумму не входят.
+    pub fn uptime_summary(&self, since_hours: u32) -> Result<UptimeSummary, DbError> {
+        self.uptime_summary_at(since_hours, unix_seconds())
+    }
+
+    /// Та же формула с явным `now`: боевой вызов берёт системное время,
+    /// тесты — фиксированную шкалу, чтобы окно не ездило вместе с часами.
+    fn uptime_summary_at(&self, since_hours: u32, now: f64) -> Result<UptimeSummary, DbError> {
+        let current_bucket = ((now / 3600.0).floor() as i64) * BUCKET_SECONDS;
+        let since_bucket = current_bucket - i64::from(since_hours) * BUCKET_SECONDS;
+        let window_seconds = BUCKET_SECONDS * (i64::from(since_hours) + 1);
+
+        let (uptime_seconds, buckets): (i64, i64) = self
+            .conn
+            .query_row(
+                "SELECT COALESCE(SUM(uptime_seconds), 0), COUNT(*) \
+                 FROM metrics_hourly WHERE bucket >= ?1 AND bucket <= ?2",
+                rusqlite::params![since_bucket, current_bucket],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .map_err(read_failed)?;
+
+        // Ни одной строки в окне — метрики не считались вовсе: None, а не
+        // 0% (пустая таблица, окно в будущем, окно до первой записи).
+        let ratio = (buckets > 0).then(|| uptime_seconds as f64 / window_seconds as f64);
+
+        Ok(UptimeSummary {
+            ratio,
+            uptime_seconds,
+            window_seconds,
+            buckets,
+        })
     }
 }
 
@@ -805,7 +878,8 @@ mod tests {
         assert_eq!(summary.buckets, 0, "строк в окне нет");
         assert_eq!(summary.uptime_seconds, 0);
         assert_eq!(
-            summary.window_seconds, 3600 * 25,
+            summary.window_seconds,
+            3600 * 25,
             "окно 24 ч: слоты включительно — 25 часовых позиций"
         );
     }
@@ -823,7 +897,8 @@ mod tests {
 
         assert_eq!(summary.ratio, None, "боевые часы не выдумывают данные");
         assert_eq!(
-            summary.window_seconds, 3600 * 25,
+            summary.window_seconds,
+            3600 * 25,
             "публичный вход считает окно тем же правилом, что и тесты"
         );
     }
@@ -837,9 +912,7 @@ mod tests {
         insert_metrics_hourly(&writer, bucket_at(now), 3600);
 
         let reader = DbReader::open(&path).expect("БД открывается");
-        let summary = reader
-            .uptime_summary_at(0, now)
-            .expect("доля читается");
+        let summary = reader.uptime_summary_at(0, now).expect("доля читается");
 
         assert_ratio(&summary, 1.0, "час прожит целиком");
         assert_eq!(summary.uptime_seconds, 3600);
@@ -859,9 +932,7 @@ mod tests {
         insert_metrics_hourly(&writer, bucket_at(now), 3564);
 
         let reader = DbReader::open(&path).expect("БД открывается");
-        let summary = reader
-            .uptime_summary_at(0, now)
-            .expect("доля читается");
+        let summary = reader.uptime_summary_at(0, now).expect("доля читается");
 
         assert_ratio(&summary, 0.99, "ровно 99% — граница цели фазы 12");
     }
@@ -875,9 +946,7 @@ mod tests {
         insert_metrics_hourly(&writer, bucket_at(now), 0);
 
         let reader = DbReader::open(&path).expect("БД открывается");
-        let summary = reader
-            .uptime_summary_at(0, now)
-            .expect("доля читается");
+        let summary = reader.uptime_summary_at(0, now).expect("доля читается");
 
         assert_eq!(
             summary.ratio,
@@ -896,19 +965,14 @@ mod tests {
         insert_metrics_hourly(&writer, bucket_at(now), 3600);
 
         let reader = DbReader::open(&path).expect("БД открывается");
-        let summary = reader
-            .uptime_summary_at(2, now)
-            .expect("доля читается");
+        let summary = reader.uptime_summary_at(2, now).expect("доля читается");
 
         assert_eq!(
             summary.window_seconds,
             3600 * 3,
             "два часа до текущего включительно — три слота"
         );
-        assert_eq!(
-            summary.buckets, 1,
-            "записан только один час, два — простой"
-        );
+        assert_eq!(summary.buckets, 1, "записан только один час, два — простой");
         assert_ratio(
             &summary,
             1.0 / 3.0,
@@ -928,9 +992,7 @@ mod tests {
         insert_metrics_hourly(&writer, current, 1800);
 
         let reader = DbReader::open(&path).expect("БД открывается");
-        let summary = reader
-            .uptime_summary_at(1, now)
-            .expect("доля читается");
+        let summary = reader.uptime_summary_at(1, now).expect("доля читается");
 
         assert_eq!(
             summary.buckets, 2,
@@ -951,9 +1013,7 @@ mod tests {
         insert_metrics_hourly(&writer, current + 3600, 3600);
 
         let reader = DbReader::open(&path).expect("БД открывается");
-        let summary = reader
-            .uptime_summary_at(0, now)
-            .expect("доля читается");
+        let summary = reader.uptime_summary_at(0, now).expect("доля читается");
 
         assert_eq!(
             summary.buckets, 1,
@@ -979,23 +1039,14 @@ mod tests {
         insert_metrics_hourly(&writer, current, 3600);
 
         let reader = DbReader::open(&path).expect("БД открывается");
-        let summary = reader
-            .uptime_summary_at(24, now)
-            .expect("доля читается");
+        let summary = reader.uptime_summary_at(24, now).expect("доля читается");
 
         assert_eq!(
             summary.window_seconds,
             3600 * 25,
             "24 часа минус часовая сетка: слоты включительно"
         );
-        assert_eq!(
-            summary.buckets, 2,
-            "обе краевые строки окна учтены"
-        );
-        assert_ratio(
-            &summary,
-            2.0 / 25.0,
-            "две живые строки из 25 слотов окна",
-        );
+        assert_eq!(summary.buckets, 2, "обе краевые строки окна учтены");
+        assert_ratio(&summary, 2.0 / 25.0, "две живые строки из 25 слотов окна");
     }
 }
