@@ -1,12 +1,13 @@
 <script setup lang="ts">
 // Dashboard (план §5, фазы 4 и 8): успешные/неуспешные сценарии, аптайм
 // демона, запросы/час как проверяемое утверждение ≥50, доля CAPTCHA с
-// порогом 5% и три графика (клики/час, CAPTCHA по часам, нагрузка на
-// воркеры). Под метриками — таблица воркеров из /state (WorkersTable): опрос
-// и AppShell, экран только читает снимок; воркеры с нерешённой капчей за
-// 30 минут получают warning-чип — значение приходит из ленты CAPTCHA,
-// отдельного запроса по воркерам нет. Ниже — лента последних событий
-// CAPTCHA с кнопкой скриншота и всплывающее уведомление о новом событии.
+// порогом 5%, Uptime с целью ≥99% (фаза 12) и три графика (клики/час,
+// CAPTCHA по часам, нагрузка на воркеры). Под метриками — таблица воркеров
+// из /state (WorkersTable): опрос и AppShell, экран только читает снимок;
+// воркеры с нерешённой капчей за 30 минут получают warning-чип — значение
+// приходит из ленты CAPTCHA, отдельного запроса по воркерам нет. Ниже —
+// лента последних событий CAPTCHA с кнопкой скриншота и всплывающее
+// уведомление о новом событии.
 //
 // Вёрстка — шаблон экрана: PageLayout + MetricCard + StatusChip. Пороговые
 // правила остаются в lib/thresholds, данные — в useDashboard: карточка только
@@ -30,7 +31,9 @@ import {
   REQUESTS_PER_HOUR_TARGET,
   captchaShareStatus,
   formatCaptchaShare,
+  formatUptimeShare,
   requestsPerHourStatus,
+  uptimeStatus,
 } from "../lib/thresholds";
 
 const db = useDb();
@@ -112,6 +115,31 @@ const runsTotal = computed(() => {
 });
 
 const demoWindowHint = "окно 24 часа";
+
+// Uptime (план §5, фаза 12): доля времени, когда был хотя бы один живой
+// воркер; цель ≥99%. Порог живёт в lib/thresholds, здесь — только тексты.
+// Хинт честно предупреждает: замер идёт с первого запуска демона, окна
+// до старта в доле считаются простоем (как в Python uptime_ratio).
+const uptimeHint = "за 24 ч, с первого запуска демона";
+
+const uptimeStatusValue = computed(() =>
+  uptimeStatus(dash.uptime.value?.ratio ?? null),
+);
+
+const uptimeStatusKind = computed<StatusKind>(() =>
+  toneToStatus(uptimeStatusValue.value.tone),
+);
+
+/** Текст утверждения: нет данных ≠ 0% — idle объясняет причину. */
+const uptimeClaim = computed(() => {
+  const status = uptimeStatusValue.value;
+  if (!status.known) return "нет данных — замер с первого запуска демона";
+  return status.met ? "цель ≥99% выполнена" : "цель ≥99% не выполнена";
+});
+
+const uptimeShare = computed(() =>
+  formatUptimeShare(dash.uptime.value?.ratio ?? null),
+);
 </script>
 
 <template>
@@ -216,6 +244,19 @@ const demoWindowHint = "окно 24 часа";
           :status="captchaStatusKind"
           :status-label="shareClaim"
           status-test="captcha-claim"
+        />
+      </v-col>
+
+      <v-col cols="12" md="6" lg="3">
+        <MetricCard
+          data-test="card-uptime-ratio"
+          label="Uptime"
+          :hint="uptimeHint"
+          :value="uptimeShare"
+          value-test="uptime-ratio-value"
+          :status="uptimeStatusKind"
+          :status-label="uptimeClaim"
+          status-test="uptime-claim"
         />
       </v-col>
     </v-row>

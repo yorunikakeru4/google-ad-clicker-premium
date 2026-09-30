@@ -50,3 +50,31 @@ export function formatCaptchaShare(share: number | null | undefined): string {
   if (share == null || !Number.isFinite(share)) return "н/д";
   return `${(share * 100).toFixed(1)}%`;
 }
+
+/** Целевая доля времени с живым воркером — план §5, «Фаза 12»: uptime ≥99%.
+ *  Ровно 99% — выполнено: цель «не меньше», порог включается. */
+export const UPTIME_TARGET = 0.99;
+
+export interface UptimeStatus {
+  /** Есть ли данные: `ratio: null` от БД — «нет данных», не 0%. */
+  known: boolean;
+  /** Утверждение «uptime ≥99%» выполнено. */
+  met: boolean;
+  tone: ThresholdTone;
+}
+
+export function uptimeStatus(
+  ratio: number | null | undefined,
+): UptimeStatus {
+  if (ratio == null || !Number.isFinite(ratio)) {
+    return { known: false, met: false, tone: "neutral" };
+  }
+  const met = ratio >= UPTIME_TARGET;
+  return { known: true, met, tone: met ? "success" : "error" };
+}
+
+/** Доля uptime как процент с двумя знаками; нет данных — «н/д». */
+export function formatUptimeShare(ratio: number | null | undefined): string {
+  if (ratio == null || !Number.isFinite(ratio)) return "н/д";
+  return `${(ratio * 100).toFixed(2)}%`;
+}

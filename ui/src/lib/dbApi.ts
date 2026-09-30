@@ -60,6 +60,20 @@ export interface ActiveWorker {
 }
 
 /**
+ * Uptime-доля за окно в часах — ответ команды `uptime_summary`.
+ *
+ * `ratio: null` — в окне нет ни одной часовой строки (замер идёт с первого
+ * запуска демона), не «0%». `window_seconds` — знаменатель доли:
+ * 3600 × число слотов окна, `buckets` — сколько строк в окно попало.
+ */
+export interface UptimeSummary {
+  ratio: number | null;
+  uptime_seconds: number;
+  window_seconds: number;
+  buckets: number;
+}
+
+/**
  * Размер файлов открытой БД — ответ команды `db_size`.
  * `bytes` — основной файл, `wal_bytes` — `-wal`; сумма ровно то, что
  * сравнивает с лимитом автозащита демона.
@@ -80,6 +94,8 @@ export interface DbApi {
   requestsLastHour(now: number): Promise<RequestsLastHour>;
   captchaShare(since: number): Promise<number | null>;
   activeWorkers(now: number, thresholdSecs: number): Promise<ActiveWorker[]>;
+  /** Uptime-доля за окно в часах — карточка Uptime на Dashboard. */
+  uptimeSummary(sinceHours: number): Promise<UptimeSummary>;
   /** Последний снимок диагностики на каждый воркер — экран Diagnostics. */
   listDiagnostics(): Promise<DiagnosticSnapshot[]>;
   /** Последние события CAPTCHA — лента и подсветка на Dashboard. */
@@ -169,6 +185,9 @@ export function createDbApi(call: DbInvoke = invoke): DbApi {
 
     activeWorkers: (now, thresholdSecs) =>
       call("active_workers", { now, thresholdSecs }) as Promise<ActiveWorker[]>,
+
+    uptimeSummary: (sinceHours) =>
+      call("uptime_summary", { sinceHours }) as Promise<UptimeSummary>,
 
     listDiagnostics: () =>
       call("list_diagnostics", {}) as Promise<DiagnosticSnapshot[]>,
