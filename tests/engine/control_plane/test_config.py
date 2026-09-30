@@ -201,6 +201,82 @@ class TestValidation:
         assert "behavior.running_interval_start" in str(excinfo.value)
 
 
+class TestCleanupScheduleFields:
+    """Поля очистки (план §5, фаза 10): время ЧЧ:ММ и период в днях."""
+
+    def test_defaults_match_the_contract(self):
+        behavior = config_module.default_config()["behavior"]
+
+        assert behavior["cleanup_time"] == "04:00"
+        assert behavior["cleanup_interval_days"] == 1
+
+    def test_config_without_the_new_keys_loads_with_defaults(self):
+        """Старый config.json без ключей обязан читаться, как у любых новых полей."""
+        cfg = Config.from_dict({"behavior": {"browser_count": 2}})
+
+        assert cfg.get("behavior.cleanup_time") == "04:00"
+        assert cfg.get("behavior.cleanup_interval_days") == 1
+
+    @pytest.mark.parametrize("value", ["00:00", "04:00", "12:30", "23:59"])
+    def test_accepts_any_time_within_the_day(self, value):
+        cfg = Config.from_dict(_raw(behavior__cleanup_time=value))
+
+        assert cfg.get("behavior.cleanup_time") == value
+
+    @pytest.mark.parametrize("value", ["4:00", "24:00", "04:60", "04-00", "noon"])
+    def test_rejects_malformed_time(self, value):
+        with pytest.raises(ConfigError) as excinfo:
+            Config.from_dict(_raw(behavior__cleanup_time=value))
+
+        assert "behavior.cleanup_time" in str(excinfo.value)
+
+    def test_empty_time_is_rejected_unlike_the_running_interval(self):
+        """Пусто у интервалов дня — «не задано», у времени очистки — ошибка."""
+        cfg = Config.from_dict(
+            _raw(behavior__running_interval_start="", behavior__running_interval_end="")
+        )
+        assert cfg.get("behavior.running_interval_start") == ""
+
+        with pytest.raises(ConfigError) as excinfo:
+            Config.from_dict(_raw(behavior__cleanup_time=""))
+
+        assert "behavior.cleanup_time" in str(excinfo.value)
+
+    @pytest.mark.parametrize("value", [1, 7, 30])
+    def test_accepts_interval_days_within_the_range(self, value):
+        cfg = Config.from_dict(_raw(behavior__cleanup_interval_days=value))
+
+        assert cfg.get("behavior.cleanup_interval_days") == value
+
+    @pytest.mark.parametrize("value", [0, -1, 31, 365])
+    def test_rejects_interval_days_outside_the_range(self, value):
+        with pytest.raises(ConfigError) as excinfo:
+            Config.from_dict(_raw(behavior__cleanup_interval_days=value))
+
+        assert "behavior.cleanup_interval_days" in str(excinfo.value)
+
+    def test_rejects_a_bool_for_interval_days(self):
+        """bool — подкласс int: JSON true не должно пройти как «раз в день»."""
+        with pytest.raises(ConfigError) as excinfo:
+            Config.from_dict(_raw(behavior__cleanup_interval_days=True))
+
+        assert "behavior.cleanup_interval_days" in str(excinfo.value)
+
+    def test_hhmm_validation_is_tied_to_explicit_fields_not_suffixes(self):
+        """Механизм ЧЧ:ММ явный: одинаковый суффикс правила сам по себе не даёт.
+
+        Прежняя проверка шла по ``endswith(("running_interval_start",
+        "running_interval_end"))``: любое новое поле с похожим именем получило
+        бы или потеряло правило молча. Проверка идёт по полному пути поля.
+        """
+        assert config_module._validate_field(
+            "behavior.some_running_interval_start", "25:00", str
+        ) == []
+        problems = config_module._validate_field("behavior.cleanup_time", "25:00", str)
+
+        assert problems and "ЧЧ:ММ" in problems[0]["message"]
+
+
 class TestCrossFieldRules:
     """Ограничения между полями: их нельзя выразить по одному полю."""
 
