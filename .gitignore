@@ -157,6 +157,9 @@ downloaded_files/
 proxies.txt
 queries.txt
 
+# локальные venv (bootstrap-venv, .venv-sb для пробы seleniumbase)
+.venv*/
+
 # SQLite: основной файл + WAL-объекты. WAL-файлы образуются рядом с базой
 # при первом же подключении, поэтому игнорируются по маске, а не по имени
 *.db
