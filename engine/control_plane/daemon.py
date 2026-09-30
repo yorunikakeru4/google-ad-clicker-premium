@@ -56,6 +56,7 @@ from engine.log_rotation import (
     run_retention,
     seconds_until_day_close,
 )
+from engine.metrics import BUCKET_SECONDS, refresh_range
 from engine.proxy_health import ProxyHealthChecker
 from engine.profile_pool import ProfilePool
 from engine.proxy_pool import ProxyError, ProxyPool
@@ -280,6 +281,33 @@ def cleanup_interval_from_environ(environ: dict[str, str] | None = None) -> floa
     return interval if interval > 0 else 0.0
 
 
+# Часовые метрики дашборда (план §2 таблица metrics_hourly, §5 фаза 12).
+# Период — окружение, как и у остальных фоновых задач демона: как часто
+# пересчитывать часы, решает systemd/launchd, а не config.json. Дефолт — раз
+# в час, потому что сам бакет и есть час; 0 (и любое отрицательное) выключает
+# job; нечисловое значение — ValueError при сборке демона, а не молчаливый
+# час вместо секунд (контракт _seconds_from_environ).
+METRICS_INTERVAL_ENV_VAR = "ADCLICKER_METRICS_INTERVAL"
+DEFAULT_METRICS_INTERVAL_SECONDS = 3600.0
+
+# Имя нити расписания: тесты ищут его при остановке, как "supervisor".
+METRICS_THREAD_NAME = "metrics"
+
+# Догон при старте: пересчитать последние 24 часа. Рестарт (и первый запуск)
+# обязан дозаписать часы, прошедшие без демона, — иначе дашборд показывал бы
+# пустые или устаревшие бакеты до первого тика. Сутки — окно с запасом: тик
+# пишет каждый час, поэтому любой простой короче суток догоняется целиком,
+# а пересчёт идёт upsert'ом и не дублирует уже записанные строки.
+METRICS_CATCHUP_HOURS = 24
+
+
+def metrics_interval_from_environ(environ: dict[str, str] | None = None) -> float:
+    """Интервал пересчёта часовых метрик в секундах (см. ``_seconds_from_environ``)."""
+    return _seconds_from_environ(
+        METRICS_INTERVAL_ENV_VAR, DEFAULT_METRICS_INTERVAL_SECONDS, environ
+    )
+
+
 def seconds_until_midnight_reexport(now: float) -> float:
     """Секунд до ближайшей допроводки вчерашнего дня — цель 00:00:05.
 
@@ -343,6 +371,11 @@ class Daemon:
         cleanup_interval: float | None = 0.0,
         cleanup_startup_grace: float = DEFAULT_CLEANUP_STARTUP_GRACE_SECONDS,
         cleanup_service: Any = None,
+        # Часовые метрики (план §2, §5, фаза 12): дефолт — раз в час, 0 —
+        # выключено. Включено по умолчанию, как retention и защита от роста:
+        # job пишет только в metrics_hourly и не ходит ни по сети, ни по
+        # временному каталогу, поэтому тестам нечего от него прятать.
+        metrics_interval: float = DEFAULT_METRICS_INTERVAL_SECONDS,
     ):
         self.db_path = Path(db_path)
         self.config_path = Path(config_path)
@@ -373,6 +406,9 @@ class Daemon:
         self.cleanup_service = (
             cleanup_service if cleanup_service is not None else CleanupService(store=self.store)
         )
+        # Часовые метрики: период — своя настройка запуска, чтобы выключить
+        # пересчёт можно было, не гася ни ротацию логов, ни очистку.
+        self.metrics_interval = metrics_interval
         # Пул и проверяющий — свои у демона, а не у HTTP-сервера: та же пара
         # обслуживает и /control/proxies, и расписание, иначе ручная проверка
         # и фоновая не знали бы друг о друге и шли бы параллельно.
@@ -425,6 +461,7 @@ class Daemon:
         self._retention_thread: threading.Thread | None = None
         self._db_size_thread: threading.Thread | None = None
         self._cleanup_thread: threading.Thread | None = None
+        self._metrics_thread: threading.Thread | None = None
         self._shutdown_thread: threading.Thread | None = None
         self._previous_handlers: dict[int, Any] = {}
         self._started = False
@@ -458,6 +495,7 @@ class Daemon:
         self._retention_thread = self._start_retention_loop()
         self._db_size_thread = self._start_db_size_loop()
         self._cleanup_thread = self._start_cleanup_loop()
+        self._metrics_thread = self._start_metrics_loop()
         self._started = True
         # Токен в лог не пишется никогда: логи демона читаются из UI и
         # попадают в отчёты о поддержке.
@@ -530,6 +568,14 @@ class Daemon:
             if cleanup_thread is not None:
                 cleanup_thread.join(timeout=SHUTDOWN_GRACE_SECONDS)
             self._cleanup_thread = None
+
+            # Метрики спят до интервала (час по умолчанию), поэтому и тут
+            # остановка идёт по взведённому stop_event: shutdown не ждёт
+            # пересчёта следующего часа.
+            metrics_thread = self._metrics_thread
+            if metrics_thread is not None:
+                metrics_thread.join(timeout=SHUTDOWN_GRACE_SECONDS)
+            self._metrics_thread = None
 
             thread = self._supervisor_thread
             if thread is not None:
@@ -1096,6 +1142,58 @@ class Daemon:
                 return
             self._run_tick(self._cleanup_tick, "cleanup failed", category="cleanup")
 
+    # --- часовые метрики дашборда (план §2, §5, фаза 12) ------------------
+
+    def _start_metrics_loop(self) -> threading.Thread | None:
+        """Поднимает нить метрик; None — job выключен (интервал <= 0)."""
+        if self.metrics_interval <= 0:
+            return None
+        thread = threading.Thread(
+            target=self._run_metrics_loop,
+            kwargs={"stop_event": self._stop_event},
+            name=METRICS_THREAD_NAME,
+            daemon=True,
+        )
+        thread.start()
+        return thread
+
+    def _run_metrics_loop(self, stop_event: threading.Event) -> None:
+        """Стартовый догон, затем тик раз в интервал, пока жив демон.
+
+        **Догон первым.** Рестарт и первый запуск обязаны дозаписать часы,
+        прошедшие без демона (``METRICS_CATCHUP_HOURS``), иначе до первого
+        тика дашборд показывал бы пустые или устаревшие бакеты. Сбой догона —
+        в лог, нить жива: тот же интервал попробует ещё раз. Тики идут через
+        ``_run_tick``, поэтому ни сбой пересчёта, ни сбой записи не убивают
+        ни нить, ни демон — тот же паттерн, что у проверки прокси. Остановка
+        по тому же stop_event, что и у остальных фоновых работ: shutdown не
+        ждёт наступления следующего часа.
+        """
+        self._run_tick(
+            self._metrics_catchup_tick, "metrics catch-up failed", category="metrics"
+        )
+        while True:
+            if stop_event.wait(self.metrics_interval):
+                return
+            self._run_tick(self._metrics_tick, "metrics tick failed", category="metrics")
+
+    def _metrics_catchup_tick(self) -> None:
+        """Пересчитывает последние ``METRICS_CATCHUP_HOURS`` часов включая текущий."""
+        now = time.time()
+        refresh_range(self.db_path, now - METRICS_CATCHUP_HOURS * 3600, now=now)
+
+    def _metrics_tick(self) -> None:
+        """Пересчитывает только что закрытый час и текущий — окно в два бакета.
+
+        ``now - BUCKET_SECONDS`` при любом ``now`` попадает в предыдущий час
+        (даже ровно на границе), поэтому закрытый бакет обновляется
+        обязательно — туда дописываются строки, пришедшие на краю часа, — а
+        текущий остаётся видимым как неполный. Прошлые часы не трогаются:
+        их дорисовывает догон при старте.
+        """
+        now = time.time()
+        refresh_range(self.db_path, now - BUCKET_SECONDS, now=now)
+
 
 def supervisor_settings_from_config(config: Config) -> SupervisorSettings:
     """Собирает настройки супервизора из конфига.
@@ -1126,6 +1224,7 @@ def build_daemon(
     retention_interval: float | None = None,
     db_size_interval: float | None = None,
     cleanup_interval: float | None = None,
+    metrics_interval: float | None = None,
 ) -> Daemon:
     """Собирает демона для запуска как самостоятельного процесса.
 
@@ -1137,11 +1236,12 @@ def build_daemon(
     соответствующий интервал из окружения; явное значение важнее окружения
     (так тесты и встраиваемый запуск задают своё, не меняя environ). Нечисловое
     значение окружения — ``ValueError``: молчаливый дефолт при опечатке включил
-    бы таймер, который никто не заказывал. То же для четырёх интервалов:
-    трёх job'ов ротации логов (``day_close_interval``, ``retention_interval``,
-    ``db_size_interval``) и очистки профилей (``cleanup_interval``); у закрытия
-    дня и у очистки ``None`` из окружения означает расписание (23:59 и
-    ``behavior.cleanup_time`` соответственно), а не выключенный job.
+    бы таймер, который никто не заказывал. То же для пяти интервалов: трёх
+    job'ов ротации логов (``day_close_interval``, ``retention_interval``,
+    ``db_size_interval``), очистки профилей (``cleanup_interval``) и часовых
+    метрик (``metrics_interval``); у закрытия дня и у очистки ``None`` из
+    окружения означает расписание (23:59 и ``behavior.cleanup_time``
+    соответственно), а не выключенный job.
 
     Конфиг читается один раз здесь и передаётся демону: из него же
     применяется уровень файлового лога (``behavior.log_file_level``) — до
@@ -1172,6 +1272,9 @@ def build_daemon(
     resolved_cleanup = (
         cleanup_interval_from_environ() if cleanup_interval is None else cleanup_interval
     )
+    resolved_metrics = (
+        metrics_interval_from_environ() if metrics_interval is None else metrics_interval
+    )
     migrations.migrate(db_path)
     config = Config.load(config_path)
     # Уровень файлового лога — поле config.json, и читается конфиг именно
@@ -1196,6 +1299,7 @@ def build_daemon(
         retention_interval=resolved_retention,
         db_size_interval=resolved_db_size,
         cleanup_interval=resolved_cleanup,
+        metrics_interval=resolved_metrics,
     )
 
 
