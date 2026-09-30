@@ -153,6 +153,24 @@ describe("createDbApi", () => {
     expect(calls[5].args).toEqual({ now: 5000, thresholdSecs: 15 });
   });
 
+  it("uptimeSummary уходит в uptime_summary с окном в часах", async () => {
+    const reply = {
+      ratio: 0.99,
+      uptime_seconds: 89_100,
+      window_seconds: 90_000,
+      buckets: 25,
+    };
+    const { calls, invoke } = fakeInvoke(reply);
+    const api = createDbApi(invoke);
+
+    const summary = await api.uptimeSummary(24);
+
+    expect(summary).toEqual(reply);
+    expect(calls).toEqual([
+      { command: "uptime_summary", args: { sinceHours: 24 } },
+    ]);
+  });
+
   it("dbSize уходит в свою команду и возвращает байты", async () => {
     const reply = { path: "/data/adclicker.db", bytes: 1234, wal_bytes: 56 };
     const { calls, invoke } = fakeInvoke(reply);

@@ -123,7 +123,7 @@ describe("компоненты шаблона", () => {
 });
 
 describe("экраны на шаблоне", () => {
-  it("Dashboard: PageLayout, четыре метрики, графики, без панели управления", async () => {
+  it("Dashboard: PageLayout, пять метрик, графики, без панели управления", async () => {
     const html = await render(DashboardView);
 
     expect(html).toContain("Dashboard");
@@ -136,6 +136,7 @@ describe("экраны на шаблоне", () => {
       "card-uptime",
       "card-requests",
       "card-captcha",
+      "card-uptime-ratio",
       "runs-total",
       "runs-succeeded",
       "runs-failed",
@@ -147,6 +148,8 @@ describe("экраны на шаблоне", () => {
       "requests-claim",
       "captcha-value",
       "captcha-claim",
+      "uptime-ratio-value",
+      "uptime-claim",
       "captcha-feed",
       "captcha-feed-empty",
       "chart-Клики/час",
@@ -157,6 +160,10 @@ describe("экраны на шаблоне", () => {
     // данных ещё нет: утверждения честно говорят об этом, а не молчат
     expect(html).toContain("нет данных");
     expect(html).toContain("нет данных за окно — н/д");
+
+    // Uptime до первой выборки: idle-статус объясняет, почему не 0% и не 100%
+    expect(html).toContain("нет данных — замер с первого запуска демона");
+    expect(html).toContain("за 24 ч");
 
     // управление демоном — только в AppShell
     expect(html).not.toContain("control-panel");
