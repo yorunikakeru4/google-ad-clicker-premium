@@ -428,6 +428,36 @@ class TestProxyTransportOptions:
         assert proxy_auth_stub.calls == []
         assert install_plugin_stub == []
 
+    def test_driver_executable_path_is_prepared_even_without_pool(
+        self,
+        isolated_tempdir,
+        fake_chrome,
+        proxy_auth_stub,
+        install_plugin_stub,
+        no_geolocation,
+        record_log,
+        transport,
+        monkeypatch,
+    ):
+        """Путь к драйверу готовится всегда, а не только когда пул больше одного.
+
+        Раньше одиночный запуск получал ``None``, UC качал последний релиз
+        (154) под Chromium 153 — ``session not created`` (поймано e2e).
+        """
+        prepared: list[str] = []
+
+        def fake_prepare(path):
+            prepared.append(str(path))
+            return path
+
+        monkeypatch.setattr(webdriver, "prepare_driver", fake_prepare)
+        transport("direct")
+
+        driver, _ = webdriver.create_webdriver(PLAIN_PROXY, "Mozilla/5.0", "abcde")
+
+        assert prepared, "_get_driver_exe_path должен готовить драйвер"
+        assert driver.init_kwargs["driver_executable_path"] == prepared[0]
+
     def test_extension_installs_plugin_and_adds_no_proxy_flag(
         self,
         isolated_tempdir,

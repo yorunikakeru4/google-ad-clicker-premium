@@ -20,6 +20,7 @@ if TYPE_CHECKING:
 
 from config_reader import config
 from engine.cdp import CdpClient
+from engine.driver_bin import prepare_driver
 from engine.log import get_logger
 from engine.profile_apply import current_profile, resolve_locale, resolve_timezone
 from engine.proxy_auth import (
@@ -452,10 +453,11 @@ def create_webdriver(
     geo_timezone: Optional[str] = None
 
     multi_procs_enabled = is_multi_procs_enabled()
-    driver_exe_path = None
-
-    if multi_procs_enabled:
-        driver_exe_path = _get_driver_exe_path()
+    # Драйвер готовится всегда: скачан под версию браузера и несёт маркер UC
+    # (вместо вредного патча). Раньше путь давался только в пуле — одиночный
+    # запуск получал None, и UC качал последний релиз (154) под Chromium 153
+    # (поймано живым e2e-прогоном: session not created).
+    driver_exe_path = _get_driver_exe_path()
 
     if proxy:
         credentials = _proxy_credentials(proxy, transport)
@@ -491,9 +493,7 @@ def create_webdriver(
         timezone = resolve_timezone(profile, timezone)
 
         driver = CustomChrome(
-            driver_executable_path=(
-                driver_exe_path if multi_procs_enabled and Path(driver_exe_path).exists() else None
-            ),
+            driver_executable_path=driver_exe_path,
             options=chrome_options,
             user_multi_procs=multi_procs_enabled,
             use_subprocess=False,
@@ -549,9 +549,7 @@ def create_webdriver(
         # применяются только его значения (гео здесь неоткуда взять).
         _apply_locale(chrome_options, resolve_locale(profile, None))
         driver = CustomChrome(
-            driver_executable_path=(
-                driver_exe_path if multi_procs_enabled and Path(driver_exe_path).exists() else None
-            ),
+            driver_executable_path=driver_exe_path,
             options=chrome_options,
             user_multi_procs=multi_procs_enabled,
             use_subprocess=False,
@@ -775,10 +773,16 @@ def _shift_window_position(
 
 
 def _get_driver_exe_path() -> str:
-    """Get the path for the chromedriver executable to avoid downloading and patching each time
+    """Путь к chromedriver: кэш на диске, подготовленный под браузер.
+
+    ``prepare_driver`` (engine.driver_bin) скачивает драйвер под версию
+    браузера, если файла нет, и ставит маркер UC — UC-патч байтов пропускается
+    (его замена блока ``window.cdc`` ломает ``maximize_window`` на CfT 153,
+    поймано живым e2e-прогоном). Повторные вызовы дёшевы: только проверка
+    маркера, без сети и без патчей.
 
     :rtype: str
-    :returns: Absoulute path of the chromedriver executable
+    :returns: Absolute path of the chromedriver executable
     """
 
     platform = sys.platform
@@ -804,8 +808,10 @@ def _get_driver_exe_path() -> str:
         dirpath = "~/.undetected_chromedriver"
 
     driver_exe_folder = os.path.abspath(os.path.expanduser(dirpath))
+    os.makedirs(driver_exe_folder, exist_ok=True)
     driver_exe_path = os.path.join(driver_exe_folder, "_".join([prefix, exe_name]))
 
+    prepare_driver(driver_exe_path)
     return driver_exe_path
 
 
