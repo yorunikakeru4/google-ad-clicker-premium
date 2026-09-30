@@ -1,14 +1,25 @@
 """Тесты job'а часовых метрик в демоне (план §2 ``metrics_hourly``, §5 фаза 12).
 
 Нить ``metrics`` на ``stop_event`` — тот же паттерн, что у proxy-check,
-captcha-check и трёх job'ов ротации логов:
+captcha-check и трёх job'ов ротации логов, но с двумя видами обновлений:
 
-* **догон при старте** — пересчитывает последние ``METRICS_CATCHUP_HOURS``
-  часов, чтобы рестарт не оставлял пустых или устаревших показателей;
-* **тик** — пересчитывает только что закрытый час и текущий (неполный);
-* период — окружение ``ADCLICKER_METRICS_INTERVAL``: дефолт час, ``0``
-  выключает, мусор — ``ValueError`` уже при сборке демона;
-* сбой тика (включая догон) уходит в лог и не убивает ни нить, ни демон.
+* **импульс uptime** — каждый тик (период ``ADCLICKER_METRICS_INTERVAL``,
+  дефолт 15 с = stale-окно супервизора): если реестр супервизора знает хотя
+  бы одного живого воркера, в текущий бакет прибавляются фактические секунды
+  прошедшего тика (clamp к периоду). Аддитивно: строка создаётся при
+  необходимости, старое значение не затирается — на этом стоит продолжение
+  счёта после рестарта;
+* **исторический пересчёт** (successes/failures/requests/captchas) — не на
+  каждом тике, а не чаще раза в час (барьер
+  ``METRICS_HISTORY_INTERVAL_SECONDS``): SQL-пересчёт не обязан щёлкать
+  каждые 15 с. Работает по окну от прошлого пересчёта, поэтому часы не
+  теряются и при удвоенном периоде. **Uptime исторический пересчёт не
+  трогает вообще** — иначе SQL затирал бы накопленный счётчик.
+
+При старте — догон ``METRICS_CATCHUP_HOURS`` последних часов для исторических
+колонок; uptime за догоняемые часы не трогается (прошлые бакеты без
+импульсов честно остаются простоем — замер идёт с первого запуска демона).
+Сбой тика (включая догон) уходит в лог и не убивает ни нить, ни демон.
 """
 
 from __future__ import annotations
@@ -16,6 +27,7 @@ from __future__ import annotations
 import sqlite3
 import threading
 import time
+import urllib.request
 
 import pytest
 
@@ -31,7 +43,11 @@ from engine.control_plane.daemon import (
     metrics_interval_from_environ,
 )
 from engine.control_plane.state import StateStore
-from engine.control_plane.supervisor import Supervisor, SupervisorSettings
+from engine.control_plane.supervisor import (
+    DEFAULT_STALE_AFTER_SECONDS,
+    Supervisor,
+    SupervisorSettings,
+)
 from engine.metrics import bucket_of
 from tests.engine.control_plane.test_supervisor import FakeClock, FakeProcessRegistry
 
@@ -121,6 +137,11 @@ def row_for(db_path, bucket):
     return None
 
 
+def uptime_for(db_path, bucket):
+    row = row_for(db_path, bucket)
+    return None if row is None else row[5]
+
+
 def log_messages(db_path):
     with sqlite3.connect(db_path) as conn:
         return [row[0] for row in conn.execute("SELECT message FROM logs ORDER BY id")]
@@ -135,19 +156,13 @@ def insert_run(db_path, status, *, created_at, ended_at=None):
         conn.commit()
 
 
-def insert_request(db_path, ts):
-    with sqlite3.connect(db_path) as conn:
-        conn.execute("INSERT INTO network_requests (ts) VALUES (?)", (ts,))
-        conn.commit()
-
-
 class TestMetricsIntervalFromEnviron:
-    def test_default_is_one_hour(self):
-        assert DEFAULT_METRICS_INTERVAL_SECONDS == 3600.0
-        assert metrics_interval_from_environ({}) == 3600.0
+    def test_default_is_the_stale_window_of_the_supervisor(self):
+        assert DEFAULT_METRICS_INTERVAL_SECONDS == DEFAULT_STALE_AFTER_SECONDS == 15.0
+        assert metrics_interval_from_environ({}) == 15.0
 
     def test_blank_value_falls_back_to_the_default(self):
-        assert metrics_interval_from_environ({METRICS_INTERVAL_ENV_VAR: "  "}) == 3600.0
+        assert metrics_interval_from_environ({METRICS_INTERVAL_ENV_VAR: "  "}) == 15.0
 
     def test_value_is_read_from_the_environment(self):
         assert metrics_interval_from_environ({METRICS_INTERVAL_ENV_VAR: "30"}) == 30.0
@@ -207,9 +222,13 @@ class TestBuildDaemonMetricsInterval:
         assert METRICS_INTERVAL_ENV_VAR in str(excinfo.value)
 
 
-class TestMetricsJob:
-    def test_startup_catchup_fills_the_last_day(self, db_path, config_path, registry):
-        daemon = make_daemon(db_path, config_path, registry, metrics_interval=3600.0)
+class TestMetricsCatchup:
+    """Догон при старте: исторические колонки, uptime не трогается."""
+
+    def test_startup_catchup_fills_the_last_day_without_uptime(
+        self, db_path, config_path, registry
+    ):
+        daemon = make_daemon(db_path, config_path, registry, metrics_interval=15.0)
 
         daemon.start()
         try:
@@ -222,6 +241,9 @@ class TestMetricsJob:
         assert len({row[0] for row in stored}) == len(stored), "бакеты не должны дублироваться"
         assert stored[-1][0] - stored[0][0] == METRICS_CATCHUP_HOURS * 3600
         assert all(stored[i + 1][0] - stored[i][0] == 3600 for i in range(len(stored) - 1))
+        assert all(row[5] == 0 for row in stored), (
+            "догон пересчитывает историю, а не выдумывает uptime за часы до замера"
+        )
 
     def test_catchup_recomputes_a_stale_row_written_before_the_restart(
         self, db_path, config_path, registry
@@ -229,11 +251,11 @@ class TestMetricsJob:
         from engine.metrics import BucketMetrics, write_bucket
 
         current = bucket_of(time.time())
-        write_bucket(db_path, BucketMetrics(current, 777, 777, 777, 777, 777))
+        write_bucket(db_path, BucketMetrics(current, 777, 777, 777, 777))
         insert_run(db_path, "ok", created_at=current, ended_at=current + 1)
 
         # Интервал больше часа: пересчитать бакет может только догон.
-        daemon = make_daemon(db_path, config_path, registry, metrics_interval=3600.0)
+        daemon = make_daemon(db_path, config_path, registry, metrics_interval=15.0)
 
         daemon.start()
         try:
@@ -245,6 +267,107 @@ class TestMetricsJob:
 
         assert len(metric_rows(db_path)) == METRICS_CATCHUP_HOURS + 1
 
+
+class TestMetricsImpulse:
+    """Импульс uptime: живые воркеры, граница часа, продолжение счёта."""
+
+    def test_impulse_adds_elapsed_to_the_current_bucket(self, db_path, config_path, registry):
+        daemon = make_daemon(db_path, config_path, registry, metrics_interval=15.0)
+        hour = bucket_of(time.time())
+        start = hour + 1800
+        daemon._metrics_catchup_tick(now=start)
+        daemon.supervisor.start(1)  # живый воркер в реестре
+
+        daemon._metrics_tick(now=start + 15)
+
+        assert uptime_for(db_path, hour) == 15
+
+    def test_dead_workers_get_no_impulse(self, db_path, config_path, registry):
+        daemon = make_daemon(db_path, config_path, registry, metrics_interval=15.0)
+        hour = bucket_of(time.time())
+        start = hour + 1800
+        daemon._metrics_catchup_tick(now=start)
+        # Реестр пуст: ни одного живого воркера — импульса не бывает.
+
+        daemon._metrics_tick(now=start + 15)
+
+        assert uptime_for(db_path, hour) == 0
+
+    def test_impulse_crossing_the_hour_goes_to_the_new_bucket(
+        self, db_path, config_path, registry
+    ):
+        daemon = make_daemon(db_path, config_path, registry, metrics_interval=15.0)
+        hour = bucket_of(time.time())
+        start = hour + 3540  # за минуту до границы часа
+        daemon._metrics_catchup_tick(now=start)
+        daemon.supervisor.start(1)
+
+        daemon._metrics_tick(now=hour + 3605)  # граница пройдена
+
+        assert uptime_for(db_path, hour) == 0, "старый бакет импульс получать не должен"
+        assert uptime_for(db_path, hour + 3600) == 15, "импульс уходит в новый бакет целиком"
+
+    def test_a_second_daemon_continues_the_uptime_counter(
+        self, db_path, config_path, registry
+    ):
+        hour = bucket_of(time.time())
+        start = hour + 1800
+
+        first = make_daemon(db_path, config_path, registry, metrics_interval=15.0)
+        first._metrics_catchup_tick(now=start)
+        first.supervisor.start(1)
+        first._metrics_tick(now=start + 15)
+        assert uptime_for(db_path, hour) == 15
+
+        # Рестарт демона: новый экземпляр, та же БД, строка уже существует.
+        second = make_daemon(db_path, config_path, registry, metrics_interval=15.0)
+        second._metrics_catchup_tick(now=start + 15)
+        assert uptime_for(db_path, hour) == 15, "догон не сбрасывает накопленный счётчик"
+
+        second.supervisor.start(1)
+        second._metrics_tick(now=start + 30)
+        assert uptime_for(db_path, hour) == 30, "импульс прибавляется, а не перезаписывает"
+
+
+class TestMetricsHistoryCadence:
+    """Исторический пересчёт: барьер в час и сохранность uptime."""
+
+    def test_refresh_is_skipped_until_an_hour_has_passed(self, db_path, config_path, registry):
+        daemon = make_daemon(db_path, config_path, registry, metrics_interval=15.0)
+        hour = bucket_of(time.time())
+        start = hour + 1800
+        daemon._metrics_catchup_tick(now=start)
+        insert_run(db_path, "ok", created_at=start, ended_at=start + 1)
+
+        daemon._metrics_tick(now=start + 60)  # интервал часа не прошёл
+
+        assert row_for(db_path, hour)[1] == 0, "меньше часа — SQL-пересчёт пропускается"
+
+        daemon._metrics_tick(now=start + 3660)
+
+        assert row_for(db_path, hour)[1] == 1, "через час история обязана обновиться"
+
+    def test_hourly_history_refresh_does_not_touch_uptime(
+        self, db_path, config_path, registry
+    ):
+        daemon = make_daemon(db_path, config_path, registry, metrics_interval=15.0)
+        hour = bucket_of(time.time())
+        start = hour + 1800
+        daemon._metrics_catchup_tick(now=start)
+        daemon.supervisor.start(1)
+        daemon._metrics_tick(now=start + 15)
+        assert uptime_for(db_path, hour) == 15
+
+        insert_run(db_path, "ok", created_at=start, ended_at=start + 2)
+        daemon._metrics_history_at = start - 3700  # открываем барьер часа
+        daemon._metrics_tick(now=start + 3615)
+
+        stored = row_for(db_path, hour)
+        assert stored[1] == 1, "исторический пересчёт должен был обновить счётчики"
+        assert stored[5] == 15, "…и обязан был оставить uptime (регрессия)"
+
+
+class TestMetricsJobLifecycle:
     def test_zero_interval_never_starts_the_job(self, db_path, config_path, registry):
         daemon = make_daemon(db_path, config_path, registry, metrics_interval=0.0)
 
@@ -256,28 +379,6 @@ class TestMetricsJob:
             assert metric_rows(db_path) == []
         finally:
             daemon.shutdown()
-
-    def test_tick_recomputes_the_closed_and_the_current_bucket(
-        self, db_path, config_path, registry
-    ):
-        daemon = make_daemon(db_path, config_path, registry, metrics_interval=0.05)
-
-        daemon.start()
-        try:
-            current = bucket_of(time.time())
-            assert wait_until(lambda: row_for(db_path, current) is not None), "догон не записал час"
-
-            insert_request(db_path, time.time())
-            assert wait_until(
-                lambda: (row_for(db_path, current) or (0, 0, 0, 0))[3] == 1
-            ), "тик не пересчитал текущий бакет"
-
-            previous = current - 3600
-            assert row_for(db_path, previous) is not None, "тик обязан держать и закрытый час"
-        finally:
-            daemon.shutdown()
-
-        assert thread_alive(METRICS_THREAD_NAME) is False
 
     def test_failure_is_logged_and_the_job_keeps_ticking(
         self, db_path, config_path, registry, monkeypatch
@@ -291,6 +392,9 @@ class TestMetricsJob:
             raise RuntimeError("база занята")
 
         monkeypatch.setattr(daemon_module, "refresh_range", broken_refresh)
+        # Барьер часа снят: и догон, и каждый тик идут через refresh_range.
+        monkeypatch.setattr(daemon_module, "METRICS_HISTORY_INTERVAL_SECONDS", 0.0)
+
         daemon = make_daemon(db_path, config_path, registry, metrics_interval=0.05)
 
         daemon.start()
@@ -305,7 +409,7 @@ class TestMetricsJob:
 
         assert thread_alive(METRICS_THREAD_NAME) is False
 
-    def test_shutdown_wakes_the_job_instead_of_waiting_a_full_hour(
+    def test_shutdown_wakes_the_job_instead_of_waiting_a_full_interval(
         self, db_path, config_path, registry
     ):
         daemon = make_daemon(db_path, config_path, registry, metrics_interval=3600.0)
@@ -329,18 +433,17 @@ class TestMetricsJob:
         finally:
             daemon.shutdown()
 
-
-def test_health_stays_up_while_the_job_ticks(db_path, config_path, registry):
-    """Метрики не имеют права держать HTTP: тик идёт фоном."""
-    import urllib.request
-
-    daemon = make_daemon(db_path, config_path, registry, metrics_interval=0.05)
-    daemon.start()
-    try:
-        assert wait_until(lambda: len(metric_rows(db_path)) > 0)
-        request = urllib.request.Request(f"http://127.0.0.1:{daemon.port}/health", method="GET")
-        request.add_header(TOKEN_HEADER, TOKEN)
-        with urllib.request.urlopen(request, timeout=5) as response:
-            assert response.status == 200
-    finally:
-        daemon.shutdown()
+    def test_health_stays_up_while_the_job_ticks(self, db_path, config_path, registry):
+        """Метрики не имеют права держать HTTP: тик идёт фоном."""
+        daemon = make_daemon(db_path, config_path, registry, metrics_interval=0.05)
+        daemon.start()
+        try:
+            assert wait_until(lambda: len(metric_rows(db_path)) > 0)
+            request = urllib.request.Request(
+                f"http://127.0.0.1:{daemon.port}/health", method="GET"
+            )
+            request.add_header(TOKEN_HEADER, TOKEN)
+            with urllib.request.urlopen(request, timeout=5) as response:
+                assert response.status == 200
+        finally:
+            daemon.shutdown()

@@ -5,15 +5,30 @@
 это отношение секунд, и от TZ оно не меняется, в отличие от дневного ``day``
 (там локальная дата нужна для экспорта и retention).
 
+Два вида обновлений одной строки бакета:
+
+* **исторические колонки** (``successes``/``failures``/``requests``/
+  ``captchas``) — пересчёт из SQL, идемпотентен: повторный пересчёт
+  заменяет значения;
+* **``uptime_seconds``** — только аддитивные импульсы
+  (:func:`record_uptime_impulse`), монотонный счётчик бакета: исторический
+  пересчёт его не трогает вообще.
+
+Старый механизм «интервалы жизни ``[heartbeat, heartbeat + 15с)``» удалён:
+в ``workers`` хранится только последняя отметка heartbeat, поэтому интервалы
+прошлых часов реконструировать не из чего, а текущий бакет давал бы ≤15 с —
+для NFR «uptime ≥99% за окно» метрика была бесполезна. Живость в момент тика
+берёт реестр супервизора (:meth:`Supervisor.has_live_workers`), а не SQL.
+
 Проверяется:
 
 * границы бакета (полуинтервал ``[bucket, bucket + 3600)``) и его UTC-смысл;
 * классификация статусов ``runs`` — зеркало
   ``ui/src-tauri/src/metrics.rs::classify_run_status``;
-* uptime на краях: ровно на границе бакета, разрыв ровно/больше ``stale_after``,
-  несколько воркеров, ноль воркеров, clamp к бакету;
-* идемпотентная запись: повторный пересчёт перезаписывает строку, а не плодит
-  дубли;
+* импульс uptime: создание строки с нулевой историей, сложение вместо
+  перезаписи, сохранность исторических колонок, потолок в длину бакета;
+* регрессия: исторический пересчёт (``write_bucket``/``refresh_range``)
+  не затирает накопленный uptime;
 * ``uptime_ratio``: пусто → ``None``, доля ровно 99%, пропуски окна входят в
   знаменатель как простой.
 """
@@ -27,16 +42,14 @@ from datetime import datetime, timezone
 
 import pytest
 
-from engine.control_plane.supervisor import DEFAULT_STALE_AFTER_SECONDS
 from engine.db import migrations
 from engine.metrics import (
     BUCKET_SECONDS,
     BucketMetrics,
     aggregate_bucket,
     bucket_of,
-    bucket_uptime_seconds,
     classify_run_status,
-    merge_intervals,
+    record_uptime_impulse,
     refresh_range,
     uptime_ratio,
     write_bucket,
@@ -71,15 +84,6 @@ def insert_request(db_path, ts):
 def insert_captcha(db_path, ts):
     with sqlite3.connect(db_path) as conn:
         conn.execute("INSERT INTO captcha_events (ts) VALUES (?)", (ts,))
-        conn.commit()
-
-
-def insert_worker(db_path, browser_id, heartbeat_at):
-    with sqlite3.connect(db_path) as conn:
-        conn.execute(
-            "INSERT INTO workers (browser_id, heartbeat_at) VALUES (?, ?)",
-            (browser_id, heartbeat_at),
-        )
         conn.commit()
 
 
@@ -199,108 +203,80 @@ class TestAggregateBucket:
         assert metrics.requests == 2
         assert metrics.captchas == 1
 
-    def test_uptime_comes_from_worker_heartbeats(self, db_path):
-        insert_worker(db_path, "br-1", B + 10)
-
-        assert aggregate_bucket(db_path, B).uptime_seconds == int(DEFAULT_STALE_AFTER_SECONDS)
-
-    def test_worker_without_heartbeat_is_not_alive(self, db_path):
-        insert_worker(db_path, "br-1", None)
-
-        assert aggregate_bucket(db_path, B).uptime_seconds == 0
-
     def test_empty_bucket_is_all_zeros(self, db_path):
-        metrics = aggregate_bucket(db_path, B)
-
-        assert metrics == BucketMetrics(B, 0, 0, 0, 0, 0)
+        assert aggregate_bucket(db_path, B) == BucketMetrics(B, 0, 0, 0, 0)
 
 
-class TestMergeIntervals:
-    def test_unsorted_intervals_come_out_ordered(self):
-        assert merge_intervals([(10.0, 20.0), (0.0, 5.0)]) == [(0.0, 5.0), (10.0, 20.0)]
+class TestRecordUptimeImpulse:
+    """Импульс — единственный путь записи ``uptime_seconds``."""
 
-    def test_overlapping_intervals_become_one(self):
-        assert merge_intervals([(0.0, 10.0), (5.0, 15.0)]) == [(0.0, 15.0)]
+    def test_creates_the_bucket_row_with_zeroed_history(self, db_path):
+        record_uptime_impulse(db_path, B, 15)
 
-    def test_adjacent_intervals_are_merged_too(self):
-        assert merge_intervals([(0.0, 10.0), (10.0, 20.0)]) == [(0.0, 20.0)]
+        assert rows(db_path) == [(B, 0, 0, 0, 0, 15)]
 
-    def test_a_real_gap_stays_a_gap(self):
-        assert merge_intervals([(0.0, 10.0), (11.0, 20.0)]) == [(0.0, 10.0), (11.0, 20.0)]
+    def test_impulses_add_up_instead_of_overwriting(self, db_path):
+        record_uptime_impulse(db_path, B, 15)
+        record_uptime_impulse(db_path, B, 15)
 
-    def test_empty_and_degenerate_intervals_disappear(self):
-        assert merge_intervals([]) == []
-        assert merge_intervals([(5.0, 5.0)]) == []
+        assert rows(db_path)[0][5] == 30
+
+    def test_impulse_keeps_the_history_columns_intact(self, db_path):
+        write_bucket(db_path, BucketMetrics(B, 2, 1, 30, 4))
+        record_uptime_impulse(db_path, B, 15)
+        record_uptime_impulse(db_path, B, 15)
+
+        assert rows(db_path) == [(B, 2, 1, 30, 4, 30)]
+
+    def test_zero_and_negative_impulses_write_nothing(self, db_path):
+        record_uptime_impulse(db_path, B, 0)
+        record_uptime_impulse(db_path, B, -15)
+
+        assert rows(db_path) == []
+
+    def test_uptime_never_exceeds_the_bucket_length(self, db_path):
+        record_uptime_impulse(db_path, B, BUCKET_SECONDS + 400)
+        record_uptime_impulse(db_path, B, BUCKET_SECONDS + 400)
+
+        assert rows(db_path)[0][5] == BUCKET_SECONDS, "счётчик обязан упираться в длину часа"
+
+    def test_buckets_do_not_share_the_counter(self, db_path):
+        record_uptime_impulse(db_path, B, 15)
+        record_uptime_impulse(db_path, B + BUCKET_SECONDS, 15)
+
+        assert [row[5] for row in rows(db_path)] == [15, 15]
 
 
-class TestBucketUptimeSeconds:
-    """Края формулы: интервал жизни ``[hb, hb + stale_after)``, clamp к бакету."""
+class TestHistoryRefreshKeepsUptime:
+    """Регрессия: исторический пересчёт не имеет права трогать uptime."""
 
-    STALE = int(DEFAULT_STALE_AFTER_SECONDS)  # 15, как у супервизора
+    def test_refresh_range_preserves_accumulated_uptime(self, db_path):
+        record_uptime_impulse(db_path, B, 300)
+        insert_run(db_path, "ok", created_at=B + 1, ended_at=B + 2)
 
-    def test_no_workers_means_no_uptime(self):
-        assert bucket_uptime_seconds([], B) == 0
+        refresh_range(db_path, B, now=B + 1800)
 
-    def test_default_stale_after_is_taken_from_the_supervisor(self):
-        assert DEFAULT_STALE_AFTER_SECONDS == 15.0
-        assert bucket_uptime_seconds([B], B) == self.STALE
+        stored = {row[0]: row for row in rows(db_path)}[B]
+        assert stored[1] == 1, "исторические колонки должны пересчитаться"
+        assert stored[5] == 300, "…а uptime обязан пережить пересчёт"
 
-    def test_heartbeat_exactly_at_the_bucket_start_counts(self):
-        assert bucket_uptime_seconds([B], B) == self.STALE
+    def test_write_bucket_preserves_accumulated_uptime(self, db_path):
+        record_uptime_impulse(db_path, B, 120)
 
-    def test_heartbeat_before_the_bucket_is_clamped_to_its_start(self):
-        assert bucket_uptime_seconds([B - 10], B) == self.STALE - 10
+        write_bucket(db_path, BucketMetrics(B, 5, 0, 0, 0))
 
-    def test_heartbeat_exactly_stale_before_the_bucket_is_downtime(self):
-        assert bucket_uptime_seconds([B - self.STALE], B) == 0
-
-    def test_heartbeat_exactly_at_the_bucket_end_is_outside(self):
-        assert bucket_uptime_seconds([B + BUCKET_SECONDS], B) == 0
-
-    def test_last_stale_seconds_of_the_bucket_still_count(self):
-        assert bucket_uptime_seconds([B + BUCKET_SECONDS - self.STALE], B) == self.STALE
-
-    def test_interval_spanning_the_whole_bucket_is_clamped_to_it(self):
-        heartbeat = B - 10
-        alive = bucket_uptime_seconds([heartbeat], B, stale_after=BUCKET_SECONDS)
-        assert alive == BUCKET_SECONDS - 10
-
-    def test_regular_heartbeats_cover_the_whole_bucket(self):
-        beats = [B + i * 10 for i in range(360)]  # раз в 10 с при stale 15
-        assert bucket_uptime_seconds(beats, B) == BUCKET_SECONDS
-
-    def test_gap_exactly_equal_to_stale_keeps_the_bucket_covered(self):
-        beats = [B + i * 10 for i in range(101)]  # до B + 1000 включительно
-        beats.append(B + 1015)  # разрыв ровно stale: жив непрерывно
-        beats += [B + i * 10 for i in range(103, 360)]
-        assert bucket_uptime_seconds(beats, B) == BUCKET_SECONDS
-
-    def test_gap_wider_than_stale_is_downtime(self):
-        beats = [B + i * 10 for i in range(101)]  # жив до B + 1015
-        beats += [B + i * 10 for i in range(103, 360)]  # дальше с B + 1030
-        # Простой [B + 1015, B + 1030) — ровно разрыв минус stale.
-        assert bucket_uptime_seconds(beats, B) == BUCKET_SECONDS - 15
-
-    def test_two_workers_are_not_double_counted(self):
-        beats = [B + 10, B + 20]  # интервалы пересекаются на 5 с
-        assert bucket_uptime_seconds(beats, B) == 25
-
-    def test_stale_after_is_configurable(self):
-        assert bucket_uptime_seconds([B], B, stale_after=30) == 30
-
-    def test_zero_stale_after_never_counts_as_alive(self):
-        assert bucket_uptime_seconds([B], B, stale_after=0) == 0
+        assert rows(db_path) == [(B, 5, 0, 0, 0, 120)]
 
 
 class TestWriteBucket:
-    def test_writes_every_column(self, db_path):
-        write_bucket(db_path, BucketMetrics(B, 1, 2, 3, 4, 5))
+    def test_writes_the_history_columns_only(self, db_path):
+        write_bucket(db_path, BucketMetrics(B, 1, 2, 3, 4))
 
-        assert rows(db_path) == [(B, 1, 2, 3, 4, 5)]
+        assert rows(db_path) == [(B, 1, 2, 3, 4, 0)]
 
     def test_second_write_replaces_the_row_instead_of_duplicating(self, db_path):
-        write_bucket(db_path, BucketMetrics(B, 7, 7, 7, 7, 7))
-        write_bucket(db_path, BucketMetrics(B, 1, 0, 0, 0, 0))
+        write_bucket(db_path, BucketMetrics(B, 7, 7, 7, 7))
+        write_bucket(db_path, BucketMetrics(B, 1, 0, 0, 0))
 
         assert rows(db_path) == [(B, 1, 0, 0, 0, 0)]
 
@@ -315,7 +291,7 @@ class TestRefreshRange:
         assert [row[0] for row in rows(db_path)] == written
 
     def test_recompute_overwrites_stale_values(self, db_path):
-        write_bucket(db_path, BucketMetrics(B, 777, 777, 777, 777, 777))
+        write_bucket(db_path, BucketMetrics(B, 777, 777, 777, 777))
         insert_run(db_path, "ok", created_at=B + 1, ended_at=B + 2)
 
         refresh_range(db_path, B, now=B + 1800)
@@ -328,7 +304,6 @@ class TestRefreshRange:
         insert_request(db_path, B + 1)
         insert_captcha(db_path, B + 2)
         insert_run(db_path, "crashed", created_at=B, ended_at=B + 3)
-        insert_worker(db_path, "br-1", B + 10)
 
         refresh_range(db_path, B - 3600, now=B + 1800)
 
@@ -340,9 +315,8 @@ class TestRefreshRange:
             expected.failures,
             expected.requests,
             expected.captchas,
-            expected.uptime_seconds,
+            0,  # uptime историческим пересчётом не записывается
         )
-        assert stored[5] == int(DEFAULT_STALE_AFTER_SECONDS)
 
     def test_window_further_in_the_future_is_empty(self, db_path):
         assert refresh_range(db_path, B + 7200, now=B) == []
@@ -354,44 +328,45 @@ class TestUptimeRatio:
         assert uptime_ratio(db_path, B, now=B + 1800) is None
 
     def test_full_hour_of_uptime_is_one(self, db_path):
-        write_bucket(db_path, BucketMetrics(B, 0, 0, 0, 0, BUCKET_SECONDS))
+        record_uptime_impulse(db_path, B, BUCKET_SECONDS)
 
         assert uptime_ratio(db_path, B, now=B + 1800) == 1.0
 
     def test_exactly_ninety_nine_percent(self, db_path):
-        write_bucket(db_path, BucketMetrics(B, 0, 0, 0, 0, int(BUCKET_SECONDS * 0.99)))
+        record_uptime_impulse(db_path, B, int(BUCKET_SECONDS * 0.99))
 
         assert uptime_ratio(db_path, B, now=B + 1800) == pytest.approx(0.99)
 
     def test_zero_uptime_is_a_number_not_none(self, db_path):
-        write_bucket(db_path, BucketMetrics(B, 0, 0, 0, 0, 0))
+        write_bucket(db_path, BucketMetrics(B, 0, 0, 0, 0))
 
         assert uptime_ratio(db_path, B, now=B + 1800) == 0.0
 
     def test_missing_buckets_count_as_downtime(self, db_path):
-        write_bucket(db_path, BucketMetrics(B, 0, 0, 0, 0, BUCKET_SECONDS))
+        record_uptime_impulse(db_path, B, BUCKET_SECONDS)
 
-        # Окно из трёх часов: записан только последний — два первых простой.
+        # Окно из трёх часов: записан только последний — два первых простой,
+        # включая часы до первого запуска демона (см. docstring uptime_ratio).
         assert uptime_ratio(db_path, B - 2 * BUCKET_SECONDS, now=B + 1800) == pytest.approx(1 / 3)
 
     def test_rows_outside_the_window_are_ignored(self, db_path):
-        write_bucket(db_path, BucketMetrics(B - 10 * BUCKET_SECONDS, 0, 0, 0, 0, BUCKET_SECONDS))
+        record_uptime_impulse(db_path, B - 10 * BUCKET_SECONDS, BUCKET_SECONDS)
 
         # В окне нет ни одного записанного бакета — данных ещё нет, не 0%.
         assert uptime_ratio(db_path, B - 2 * BUCKET_SECONDS, now=B + 1800) is None
 
     def test_window_further_in_the_future_is_none(self, db_path):
-        write_bucket(db_path, BucketMetrics(B, 0, 0, 0, 0, BUCKET_SECONDS))
+        record_uptime_impulse(db_path, B, BUCKET_SECONDS)
 
         assert uptime_ratio(db_path, B + 7200, now=B + 1800) is None
 
     def test_half_of_the_window_sums_over_both_buckets(self, db_path):
-        write_bucket(db_path, BucketMetrics(B - BUCKET_SECONDS, 0, 0, 0, 0, BUCKET_SECONDS))
-        write_bucket(db_path, BucketMetrics(B, 0, 0, 0, 0, 0))
+        record_uptime_impulse(db_path, B - BUCKET_SECONDS, BUCKET_SECONDS)
+        write_bucket(db_path, BucketMetrics(B, 0, 0, 0, 0))
 
         assert uptime_ratio(db_path, B - BUCKET_SECONDS, now=B + 1800) == pytest.approx(0.5)
 
     def test_since_inside_the_bucket_is_still_a_whole_slot(self, db_path):
-        write_bucket(db_path, BucketMetrics(B, 0, 0, 0, 0, BUCKET_SECONDS))
+        record_uptime_impulse(db_path, B, BUCKET_SECONDS)
 
         assert uptime_ratio(db_path, B + 600, now=B + 1800) == 1.0
