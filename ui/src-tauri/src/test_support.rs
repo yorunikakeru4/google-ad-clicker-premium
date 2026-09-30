@@ -137,6 +137,17 @@ pub fn insert_captcha_event(conn: &Connection, ts: f64) {
     .expect("строка captcha_events вставляется");
 }
 
+/// Часовая метрика с заданным uptime — источник uptime-доли дашборда.
+/// Исторические колонки (`successes` и пр.) тестам аптайма не нужны:
+/// `DEFAULT 0` отдаёт их сам.
+pub fn insert_metrics_hourly(conn: &Connection, bucket: i64, uptime_seconds: i64) {
+    conn.execute(
+        "INSERT INTO metrics_hourly (bucket, uptime_seconds) VALUES (?1, ?2)",
+        rusqlite::params![bucket, uptime_seconds],
+    )
+    .expect("строка metrics_hourly вставляется");
+}
+
 /// Строка `workers` для тестов живости: `status` по умолчанию как в схеме.
 pub struct WorkerRow<'a> {
     pub browser_id: &'a str,

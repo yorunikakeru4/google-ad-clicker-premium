@@ -277,8 +277,8 @@ mod tests {
     use super::*;
     use crate::db::DbReader;
     use crate::test_support::{
-        insert_captcha_event, insert_click, insert_network_request, insert_run, seed, RunRow,
-        TempDb, WorkerRow,
+        insert_captcha_event, insert_click, insert_metrics_hourly, insert_network_request,
+        insert_run, seed, RunRow, TempDb, WorkerRow,
     };
 
     // --- runs_summary ----------------------------------------------------
@@ -767,6 +767,235 @@ mod tests {
                 last_error: Some("прокси недоступен".to_string()),
             },
             "строка воркера отдаётся целиком для карточки в дашборде"
+        );
+    }
+
+    // --- uptime_summary --------------------------------------------------
+
+    /// Часовой бакет, содержащий `now`: тот же `floor(ts / 3600) * 3600`,
+    /// что у читалки и у Python `bucket_of`.
+    fn bucket_at(now: f64) -> i64 {
+        ((now / 3600.0).floor() as i64) * 3600
+    }
+
+    /// Приближение до 1e-9: 99% и 1/3 в двоичной точности не ровные.
+    fn assert_ratio(summary: &UptimeSummary, expected: f64, message: &str) {
+        let ratio = summary.ratio.expect("доля должна быть посчитана");
+        assert!(
+            (ratio - expected).abs() < 1e-9,
+            "{message}: ожидалось {expected}, получено {ratio}"
+        );
+    }
+
+    #[test]
+    fn uptime_summary_on_empty_db_is_none_not_zero() {
+        let tmp = TempDb::new();
+        let path = tmp.path();
+        let _writer = seed(&path);
+
+        let reader = DbReader::open(&path).expect("БД открывается");
+        let summary = reader
+            .uptime_summary_at(24, 86_400.0 + 1800.0)
+            .expect("пустая база — это None, а не ошибка");
+
+        assert_eq!(
+            summary.ratio, None,
+            "нет строк в окне — None, «0%» врало бы так же, как «100%»"
+        );
+        assert_eq!(summary.buckets, 0, "строк в окне нет");
+        assert_eq!(summary.uptime_seconds, 0);
+        assert_eq!(
+            summary.window_seconds, 3600 * 25,
+            "окно 24 ч: слоты включительно — 25 часовых позиций"
+        );
+    }
+
+    #[test]
+    fn uptime_summary_public_api_reports_none_on_empty_db() {
+        let tmp = TempDb::new();
+        let path = tmp.path();
+        let _writer = seed(&path);
+
+        let reader = DbReader::open(&path).expect("БД открывается");
+        let summary = reader
+            .uptime_summary(24)
+            .expect("пустая база — это None, а не ошибка");
+
+        assert_eq!(summary.ratio, None, "боевые часы не выдумывают данные");
+        assert_eq!(
+            summary.window_seconds, 3600 * 25,
+            "публичный вход считает окно тем же правилом, что и тесты"
+        );
+    }
+
+    #[test]
+    fn uptime_summary_full_hour_is_one_and_takes_whole_slot() {
+        let tmp = TempDb::new();
+        let path = tmp.path();
+        let writer = seed(&path);
+        let now = 90_000.0 + 600.0;
+        insert_metrics_hourly(&writer, bucket_at(now), 3600);
+
+        let reader = DbReader::open(&path).expect("БД открывается");
+        let summary = reader
+            .uptime_summary_at(0, now)
+            .expect("доля читается");
+
+        assert_ratio(&summary, 1.0, "час прожит целиком");
+        assert_eq!(summary.uptime_seconds, 3600);
+        assert_eq!(summary.buckets, 1);
+        assert_eq!(
+            summary.window_seconds, 3600,
+            "now внутри бакета не укорачивает слот: он целый, как в Python"
+        );
+    }
+
+    #[test]
+    fn uptime_summary_exactly_ninety_nine_percent_passes_the_target() {
+        let tmp = TempDb::new();
+        let path = tmp.path();
+        let writer = seed(&path);
+        let now = 90_000.0 + 1800.0;
+        insert_metrics_hourly(&writer, bucket_at(now), 3564);
+
+        let reader = DbReader::open(&path).expect("БД открывается");
+        let summary = reader
+            .uptime_summary_at(0, now)
+            .expect("доля читается");
+
+        assert_ratio(&summary, 0.99, "ровно 99% — граница цели фазы 12");
+    }
+
+    #[test]
+    fn uptime_summary_zero_uptime_is_a_number_not_none() {
+        let tmp = TempDb::new();
+        let path = tmp.path();
+        let writer = seed(&path);
+        let now = 90_000.0 + 1800.0;
+        insert_metrics_hourly(&writer, bucket_at(now), 0);
+
+        let reader = DbReader::open(&path).expect("БД открывается");
+        let summary = reader
+            .uptime_summary_at(0, now)
+            .expect("доля читается");
+
+        assert_eq!(
+            summary.ratio,
+            Some(0.0),
+            "строка есть, живости нет — это настоящие 0%, а не «нет данных»"
+        );
+        assert_eq!(summary.buckets, 1);
+    }
+
+    #[test]
+    fn uptime_summary_missing_slots_count_as_downtime() {
+        let tmp = TempDb::new();
+        let path = tmp.path();
+        let writer = seed(&path);
+        let now = 90_000.0 + 1800.0;
+        insert_metrics_hourly(&writer, bucket_at(now), 3600);
+
+        let reader = DbReader::open(&path).expect("БД открывается");
+        let summary = reader
+            .uptime_summary_at(2, now)
+            .expect("доля читается");
+
+        assert_eq!(
+            summary.window_seconds,
+            3600 * 3,
+            "два часа до текущего включительно — три слота"
+        );
+        assert_eq!(
+            summary.buckets, 1,
+            "записан только один час, два — простой"
+        );
+        assert_ratio(
+            &summary,
+            1.0 / 3.0,
+            "часы без строк входят в знаменатель как простой",
+        );
+    }
+
+    #[test]
+    fn uptime_summary_window_edges_are_inclusive_slots() {
+        let tmp = TempDb::new();
+        let path = tmp.path();
+        let writer = seed(&path);
+        let now = 90_000.0 + 1800.0;
+        let current = bucket_at(now);
+        insert_metrics_hourly(&writer, current - 7200, 3600);
+        insert_metrics_hourly(&writer, current - 3600, 1800);
+        insert_metrics_hourly(&writer, current, 1800);
+
+        let reader = DbReader::open(&path).expect("БД открывается");
+        let summary = reader
+            .uptime_summary_at(1, now)
+            .expect("доля читается");
+
+        assert_eq!(
+            summary.buckets, 2,
+            "бакет ровно на нижней границе окна включается, старший — нет"
+        );
+        assert_eq!(summary.uptime_seconds, 3600, "сумма только по окну");
+        assert_ratio(&summary, 0.5, "пол окна жив, пол — простой");
+    }
+
+    #[test]
+    fn uptime_summary_clamps_to_the_current_bucket() {
+        let tmp = TempDb::new();
+        let path = tmp.path();
+        let writer = seed(&path);
+        let now = 90_000.0 + 1800.0;
+        let current = bucket_at(now);
+        insert_metrics_hourly(&writer, current, 1800);
+        insert_metrics_hourly(&writer, current + 3600, 3600);
+
+        let reader = DbReader::open(&path).expect("БД открывается");
+        let summary = reader
+            .uptime_summary_at(0, now)
+            .expect("доля читается");
+
+        assert_eq!(
+            summary.buckets, 1,
+            "бакет будущего за текущим не входит в окно"
+        );
+        assert_eq!(
+            summary.uptime_seconds, 1800,
+            "сумма ограничена текущим бакетом"
+        );
+        assert_ratio(&summary, 0.5, "доля считается только по прошедшим часам");
+    }
+
+    #[test]
+    fn uptime_summary_window_lower_edge_is_hour_aligned_since() {
+        let tmp = TempDb::new();
+        let path = tmp.path();
+        let writer = seed(&path);
+        let now = 90_000.0 + 1800.0;
+        let current = bucket_at(now);
+        // Ровно 24 часа назад от текущего бакета: граница окна — целый час,
+        // строка на ней обязана попасть в долю.
+        insert_metrics_hourly(&writer, current - 24 * 3600, 3600);
+        insert_metrics_hourly(&writer, current, 3600);
+
+        let reader = DbReader::open(&path).expect("БД открывается");
+        let summary = reader
+            .uptime_summary_at(24, now)
+            .expect("доля читается");
+
+        assert_eq!(
+            summary.window_seconds,
+            3600 * 25,
+            "24 часа минус часовая сетка: слоты включительно"
+        );
+        assert_eq!(
+            summary.buckets, 2,
+            "обе краевые строки окна учтены"
+        );
+        assert_ratio(
+            &summary,
+            2.0 / 25.0,
+            "две живые строки из 25 слотов окна",
         );
     }
 }
