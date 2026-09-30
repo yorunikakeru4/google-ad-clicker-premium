@@ -27,10 +27,12 @@ import json
 import os
 import threading
 
+from collections.abc import Callable
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
+from engine.cleanup import CleanupService
 from engine.control_plane.config import Config, ConfigError
 from engine.control_plane.supervisor import (
     AlreadyRunningError,
@@ -491,6 +493,44 @@ class ControlPlaneHandler(BaseHTTPRequestHandler):
             request_signal(self.supervisor.store, target)
         self._send_json(200, {"requested": len(targets)})
 
+    # --- очистка профилей (план §5, фаза 10) --------------------------------
+
+    def _handle_cleanup_run(self) -> None:
+        """``POST /control/cleanup/run``: синхронный прогон очистки.
+
+        Тело — объект; ``{"dry_run": true}`` перечисляет кандидатов и пишет
+        каждый в лог, но ничего не удаляет и не двигает метку последнего
+        прогона. Долгая работа внутри сервиса ограничена бюджетом по времени,
+        поэтому ответ приходит за секунды, а не «когда кончится tempdir».
+
+        После реального прогона kv-цель пересчитывается: ручной запуск
+        сдвигает интервал ``cleanup_interval_days``, и статус обязан показать
+        следующий запуск с учётом этого, а не цель, посчитанную до кнопки.
+        """
+        raw = self._read_optional_object()
+        dry_run = raw.get("dry_run", False)
+        if not isinstance(dry_run, bool):
+            raise InvalidRequestError("поле dry_run должно быть true или false")
+        # Сервис и провайдер цели читаются через control (тот же приём, что
+        # у config): подкласс обработчика не должен был бы жить в словаре
+        # биндинга — обычную функцию там Python превратил бы в метод и передал
+        # бы self первым аргументом.
+        service = self.control.cleanup_service
+        report = service.run(self.config, dry_run=dry_run)
+        if not dry_run and self.control.cleanup_next_run is not None:
+            service.set_next_run(self.control.cleanup_next_run())
+        self._send_json(200, {"report": report})
+
+    def _handle_cleanup_status(self) -> None:
+        """``GET /control/cleanup/status``: последний отчёт и ближайший запуск.
+
+        Оба значения из kv: отчёт пишет сервис после каждого реального
+        прогона, цель — нить расписания (и ручной запуск). ``last: null`` —
+        прогона ещё не было, ``next_run: null`` — job выключен. Ответ ровно
+        по контракту, без внутренностей демона.
+        """
+        self._send_json(200, self.control.cleanup_service.status(self.config))
+
     # --- вспомогательное -------------------------------------------------
 
     def _requested_worker_count(self) -> int:
@@ -670,6 +710,8 @@ _ROUTES: dict[tuple[str, str], str] = {
     ("POST", "/control/profiles/unassign"): "_handle_profiles_unassign",
     ("POST", "/control/profiles/status"): "_handle_profiles_status",
     ("POST", "/control/diagnostics/collect"): "_handle_diagnostics_collect",
+    ("POST", "/control/cleanup/run"): "_handle_cleanup_run",
+    ("GET", "/control/cleanup/status"): "_handle_cleanup_status",
 }
 
 
@@ -703,6 +745,8 @@ class ControlPlaneServer:
         proxy_pool: ProxyPool | None = None,
         profile_pool: ProfilePool | None = None,
         proxy_checker: Any = None,
+        cleanup_service: CleanupService | None = None,
+        cleanup_next_run: Callable[[], float | None] | None = None,
     ):
         if not _is_loopback(host):
             raise ValueError(
@@ -740,6 +784,14 @@ class ControlPlaneServer:
             if proxy_checker is not None
             else ProxyHealthChecker(self.proxy_pool)
         )
+        # Очистка профилей: сервис по умолчанию строится на том же store, что
+        # и супервизор (сервер не знает пути к базе иначе, чем через него).
+        # ``cleanup_next_run`` без демона — None: сборка сервера в тестах не
+        # имеет расписания, и ручной запуск тогда не трогает kv-цель.
+        self.cleanup_service = (
+            cleanup_service if cleanup_service is not None else CleanupService(store=supervisor.store)
+        )
+        self.cleanup_next_run = cleanup_next_run
         self.host = host
         self.requested_port = port
         self.port = port

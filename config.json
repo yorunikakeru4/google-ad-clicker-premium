@@ -43,6 +43,8 @@
         "captcha_policy": "stop",
         "captcha_threshold_percent": 5.0,
         "captcha_threshold_action": "warn",
+        "cleanup_time": "04:00",
+        "cleanup_interval_days": 1,
         "log_retention_days": 30,
         "log_file_level": "INFO",
         "db_size_limit_mb": 0

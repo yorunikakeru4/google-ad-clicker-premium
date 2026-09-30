@@ -442,3 +442,36 @@ def test_unknown_file_level_is_reported_and_keeps_the_current_level(
     assert any("log_file_level" in record.getMessage() for record in caplog.records), (
         "причина отказа обязана быть видна в логе"
     )
+
+
+def test_cleanup_defaults_when_the_keys_are_absent(make_config, base_config):
+    """Старый config.json без ключей очистки обязан читаться с дефолтами."""
+
+    assert "cleanup_time" not in base_config["behavior"]
+    assert "cleanup_interval_days" not in base_config["behavior"]
+
+    behavior = make_config(base_config).behavior
+
+    assert behavior.cleanup_time == "04:00"
+    assert behavior.cleanup_interval_days == 1
+
+
+def test_cleanup_defaults_match_the_engine_constants(make_config, base_config):
+    """Дефолт legacy-чтения не должен разъезжаться с engine.cleanup."""
+
+    from engine.cleanup import DEFAULT_CLEANUP_INTERVAL_DAYS, DEFAULT_CLEANUP_TIME
+
+    behavior = make_config(base_config).behavior
+
+    assert behavior.cleanup_time == DEFAULT_CLEANUP_TIME
+    assert behavior.cleanup_interval_days == DEFAULT_CLEANUP_INTERVAL_DAYS
+
+
+def test_cleanup_values_are_read_from_the_config(make_config, base_config):
+    base_config["behavior"]["cleanup_time"] = "05:30"
+    base_config["behavior"]["cleanup_interval_days"] = 7
+
+    behavior = make_config(base_config).behavior
+
+    assert behavior.cleanup_time == "05:30"
+    assert behavior.cleanup_interval_days == 7

@@ -8,6 +8,7 @@ from engine.captcha_threshold import (
     DEFAULT_CAPTCHA_THRESHOLD_ACTION,
     DEFAULT_CAPTCHA_THRESHOLD_PERCENT,
 )
+from engine.cleanup import DEFAULT_CLEANUP_INTERVAL_DAYS, DEFAULT_CLEANUP_TIME
 from engine.log_rotation import (
     DEFAULT_DB_SIZE_LIMIT_MB,
     DEFAULT_LOG_FILE_LEVEL,
@@ -81,6 +82,10 @@ class BehaviorParams:
     log_retention_days: Optional[int] = DEFAULT_LOG_RETENTION_DAYS
     log_file_level: Optional[str] = DEFAULT_LOG_FILE_LEVEL
     db_size_limit_mb: Optional[int] = DEFAULT_DB_SIZE_LIMIT_MB
+    # Очистка профилей (план §5, фаза 10): время ежедневного прогона и период
+    # в днях. Дефолты — из engine.cleanup, там же их проверяет control plane.
+    cleanup_time: Optional[str] = DEFAULT_CLEANUP_TIME
+    cleanup_interval_days: Optional[int] = DEFAULT_CLEANUP_INTERVAL_DAYS
 
 
 class _ConfigSection(dict):
@@ -212,6 +217,12 @@ class ConfigReader:
             log_file_level=config["behavior"].get("log_file_level", DEFAULT_LOG_FILE_LEVEL),
             db_size_limit_mb=config["behavior"].get(
                 "db_size_limit_mb", DEFAULT_DB_SIZE_LIMIT_MB
+            ),
+            # .get, а не []: config.json прошлой версии без ключей очистки
+            # обязан читаться, дефолты приходят из engine.cleanup.
+            cleanup_time=config["behavior"].get("cleanup_time", DEFAULT_CLEANUP_TIME),
+            cleanup_interval_days=config["behavior"].get(
+                "cleanup_interval_days", DEFAULT_CLEANUP_INTERVAL_DAYS
             ),
         )
 

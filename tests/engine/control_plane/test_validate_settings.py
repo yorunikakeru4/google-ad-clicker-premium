@@ -326,3 +326,28 @@ class TestLogSettingsValidation:
         )
 
         assert _fields(problems) == [f"behavior.{field}"]
+
+
+class TestCleanupSettingsValidation:
+    """Поля очистки в публичной валидации: тот же _validate, список проблем."""
+
+    @pytest.mark.parametrize("value", ["25:00", "4:00", ""])
+    def test_reports_cleanup_time_problems(self, tmp_path, value):
+        problems = validate_settings(
+            _raw(behavior__cleanup_time=value), base_dir=_base_dir(tmp_path)
+        )
+
+        assert "behavior.cleanup_time" in _fields(problems)
+
+    @pytest.mark.parametrize("value", [0, 31])
+    def test_reports_cleanup_interval_days_out_of_range(self, tmp_path, value):
+        problems = validate_settings(
+            _raw(behavior__cleanup_interval_days=value), base_dir=_base_dir(tmp_path)
+        )
+
+        assert _fields(problems) == ["behavior.cleanup_interval_days"]
+
+    def test_valid_cleanup_fields_produce_no_problems(self, tmp_path):
+        raw = _raw(behavior__cleanup_time="04:00", behavior__cleanup_interval_days=1)
+
+        assert validate_settings(raw, base_dir=_base_dir(tmp_path)) == []
