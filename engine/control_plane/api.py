@@ -27,10 +27,12 @@ import json
 import os
 import threading
 
+from collections.abc import Callable
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any
 
+from engine.cleanup import CleanupService
 from engine.control_plane.config import Config, ConfigError
 from engine.control_plane.supervisor import (
     AlreadyRunningError,
@@ -193,6 +195,11 @@ class ControlPlaneHandler(BaseHTTPRequestHandler):
     # Any, а не ProxyHealthChecker: тесты подменяют проверяющий объект
     # фейком, а супервизорской нотации для duck-typing здесь не требуется.
     proxy_checker: Any
+    # Очистка профилей: сервис и пересчёт ближайшего запуска приходят от
+    # демона (см. ControlPlaneServer.__init__), чтобы ручной запуск и плановая
+    # нить делили один замок и одну метку в kv.
+    cleanup_service: CleanupService
+    cleanup_next_run: Callable[[], float | None] | None
 
     @property
     def config(self) -> Config:
@@ -703,6 +710,8 @@ class ControlPlaneServer:
         proxy_pool: ProxyPool | None = None,
         profile_pool: ProfilePool | None = None,
         proxy_checker: Any = None,
+        cleanup_service: CleanupService | None = None,
+        cleanup_next_run: Callable[[], float | None] | None = None,
     ):
         if not _is_loopback(host):
             raise ValueError(
@@ -740,6 +749,14 @@ class ControlPlaneServer:
             if proxy_checker is not None
             else ProxyHealthChecker(self.proxy_pool)
         )
+        # Очистка профилей: сервис по умолчанию строится на том же store, что
+        # и супервизор (сервер не знает пути к базе иначе, чем через него).
+        # ``cleanup_next_run`` без демона — None: сборка сервера в тестах не
+        # имеет расписания, и ручной запуск тогда не трогает kv-цель.
+        self.cleanup_service = (
+            cleanup_service if cleanup_service is not None else CleanupService(store=supervisor.store)
+        )
+        self.cleanup_next_run = cleanup_next_run
         self.host = host
         self.requested_port = port
         self.port = port
@@ -810,6 +827,8 @@ class ControlPlaneServer:
                 "proxy_pool": self.proxy_pool,
                 "profile_pool": self.profile_pool,
                 "proxy_checker": self.proxy_checker,
+                "cleanup_service": self.cleanup_service,
+                "cleanup_next_run": self.cleanup_next_run,
             },
         )
         return bound

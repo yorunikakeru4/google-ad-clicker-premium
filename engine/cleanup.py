@@ -430,13 +430,16 @@ class CleanupService:
             }
             self.store.log("INFO", "cleanup", MSG_FINISHED, dict(report))
             if not dry_run:
-                # dry_run — не прогон: метка последнего запуска остаётся прежней,
-                # иначе пробный запуск подавил бы ближайший плановый.
-                self.store.set_flag(CLEANUP_LAST_TS_KEY, str(time.time()))
+                # dry_run — не прогон: метка последнего запуска остаётся
+                # прежней, иначе пробный запуск подавил бы ближайший плановый.
+                # Отчёт пишется раньше метки: читатель, увидевший
+                # CLEANUP_LAST_TS, обязан найти и отчёт — иначе status мелькал
+                # бы пустым ``last`` в микросекунды между двумя записями.
                 self.store.set_flag(
                     CLEANUP_LAST_REPORT_KEY,
                     json.dumps(report, ensure_ascii=False, sort_keys=True),
                 )
+                self.store.set_flag(CLEANUP_LAST_TS_KEY, str(time.time()))
             return report
 
     def status(self, config: Any) -> dict[str, Any]:

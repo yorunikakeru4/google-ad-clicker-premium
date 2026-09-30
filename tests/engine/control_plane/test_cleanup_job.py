@@ -430,22 +430,23 @@ class TestCleanupPeriodicJob:
             cleanup_interval=None,
             cleanup_startup_grace=0.02,
         )
+
+        def broken_schedule(now):
+            raise ValueError("нет")
+
+        # Патч до старта: нить зовёт _cleanup_next_run_at сразу после
+        # стартового прогона, и гонка с patch после start дала бы ей целую
+        # ночь на то, чтобы уснуть до того, как ошибка случится.
+        monkeypatch.setattr(daemon, "_cleanup_next_run_at", broken_schedule)
         daemon.start()
         try:
-            assert wait_until(lambda: kv(daemon.store, CLEANUP_LAST_TS_KEY) is not None)
-            def broken_schedule(now):
-                raise ValueError("нет")
-
-            monkeypatch.setattr(daemon, "_cleanup_next_run_at", broken_schedule)
-            time.sleep(0.3)
+            assert wait_until(
+                lambda: any("cleanup schedule failed" in row[1] for row in log_messages(db_path))
+            ), "ошибка расписания обязана быть видна в логе"
             assert thread_alive("cleanup") is True, "нить обязана пережить ошибку расписания"
             assert get_health(daemon) == 200
-            assert any(
-                "cleanup schedule failed" in row[1] for row in log_messages(db_path)
-            ), "ошибка расписания обязана быть видна в логе"
         finally:
             daemon.shutdown()
-
 
 class TestCleanupIntervalGate:
     """Интервал ``cleanup_interval_days`` — только в штатном режиме."""

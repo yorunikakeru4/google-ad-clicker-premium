@@ -25,6 +25,12 @@ from pathlib import Path
 from typing import Any, Sequence
 
 from engine.captcha_threshold import CaptchaThresholdPolicy
+from engine.cleanup import (
+    CleanupService,
+    is_cleanup_due,
+    last_run_ts,
+    seconds_until_cleanup,
+)
 from engine.control_plane.api import (
     LOOPBACK_HOST,
     ControlPlaneServer,
@@ -93,6 +99,22 @@ CAPTCHA_CHECK_INTERVAL_ENV_VAR = "ADCLICKER_CAPTCHA_CHECK_INTERVAL"
 # Имя нити расписания порога: отдельное от proxy-check, чтобы остановка и
 # диагностика не путали два независимых job'а.
 CAPTCHA_CHECK_THREAD_NAME = "captcha-check"
+
+# Очистка профилей (план §5, фаза 10). Имя нити — как у остальных job'ов,
+# чтобы shutdown и тесты находили её тем же способом.
+CLEANUP_THREAD_NAME = "cleanup"
+
+# Стартовая задержка первого прогона очистки. Сироты после аварийного Kill
+# должны убираться сразу при старте демона, а не копиться до ближайшего
+# cleanup_time, — но не раньше, чем воркеры успеют подняться и браузеры
+# открыть свои каталоги: зачистка в момент спавна конкурировала бы с ним.
+# Поверх грейса по mtime в самом сервисе это даёт две независимые защиты.
+DEFAULT_CLEANUP_STARTUP_GRACE_SECONDS = 30.0
+
+# Пауза после ошибки расписания очистки (нечисловое время в конфиге, сбой
+# чтения kv): нить должна жаловаться и продолжать, а не умирать или крутить
+# горячий цикл.
+CLEANUP_SCHEDULE_RETRY_SECONDS = 60.0
 
 
 def captcha_check_interval_from_environ(environ: dict[str, str] | None = None) -> float:
@@ -233,6 +255,31 @@ def day_close_interval_from_environ(environ: dict[str, str] | None = None) -> fl
     return interval if interval > 0 else 0.0
 
 
+# Очистка профилей (план §5, фаза 10). Пусто/не задано — расписание по
+# ``behavior.cleanup_time`` с интервалом ``behavior.cleanup_interval_days``
+# (это штатный режим); больше нуля — период в секундах вместо расписания
+# (тесты/стенд, при этом интервал в днях не применяется); ноль и отрицательные
+# — job выключен. Нечисловое — ValueError по той же причине, что и у
+# закрытия дня: опечатка не должна молча выключить зачистку сирот.
+CLEANUP_INTERVAL_ENV_VAR = "ADCLICKER_CLEANUP_INTERVAL"
+
+
+def cleanup_interval_from_environ(environ: dict[str, str] | None = None) -> float | None:
+    """Расписание очистки профилей (см. контракт у ``CLEANUP_INTERVAL_ENV_VAR``)."""
+    source = os.environ if environ is None else environ
+    raw = source.get(CLEANUP_INTERVAL_ENV_VAR, "")
+    if not raw.strip():
+        return None
+    try:
+        interval = float(raw)
+    except ValueError as exc:
+        raise ValueError(
+            f"{CLEANUP_INTERVAL_ENV_VAR} должна быть числом секунд, "
+            f"получено {raw.strip()!r}"
+        ) from exc
+    return interval if interval > 0 else 0.0
+
+
 def seconds_until_midnight_reexport(now: float) -> float:
     """Секунд до ближайшей допроводки вчерашнего дня — цель 00:00:05.
 
@@ -287,6 +334,15 @@ class Daemon:
         day_close_interval: float | None = None,
         retention_interval: float = DEFAULT_RETENTION_INTERVAL_SECONDS,
         db_size_interval: float = DEFAULT_DB_SIZE_INTERVAL_SECONDS,
+        # Очистка профилей (план §5, фаза 10): ``0`` — выключено, ``None`` —
+        # расписание по ``behavior.cleanup_time``, больше нуля — период в
+        # секундах. Дефолт намеренно «выключено», а не «расписание»: это
+        # единственный job, который ходит по системному tempdir вне репозитория,
+        # а тесты собирают ``Daemon`` напрямую. Боевой путь (``build_daemon``)
+        # включает расписание, когда окружение не задано.
+        cleanup_interval: float | None = 0.0,
+        cleanup_startup_grace: float = DEFAULT_CLEANUP_STARTUP_GRACE_SECONDS,
+        cleanup_service: Any = None,
     ):
         self.db_path = Path(db_path)
         self.config_path = Path(config_path)
@@ -307,6 +363,16 @@ class Daemon:
         self.day_close_interval = day_close_interval
         self.retention_interval = retention_interval
         self.db_size_interval = db_size_interval
+        # Очистка профилей: сервис один на демон, потому что плановая нить и
+        # HTTP-хендлеры должны ходить по одним корням, по одному замку и к
+        # одной метке последнего прогона в kv — иначе ручной запуск и тик
+        # проходили бы по tempdir одновременно, а status показывал бы то,
+        # что записал из двух последний.
+        self.cleanup_interval = cleanup_interval
+        self.cleanup_startup_grace = cleanup_startup_grace
+        self.cleanup_service = (
+            cleanup_service if cleanup_service is not None else CleanupService(store=self.store)
+        )
         # Пул и проверяющий — свои у демона, а не у HTTP-сервера: та же пара
         # обслуживает и /control/proxies, и расписание, иначе ручная проверка
         # и фоновая не знали бы друг о друге и шли бы параллельно.
@@ -337,6 +403,10 @@ class Daemon:
             proxy_pool=self.proxy_pool,
             profile_pool=self.profile_pool,
             proxy_checker=self.proxy_checker,
+            cleanup_service=self.cleanup_service,
+            # Пересчёт ближайшего запуска после ручного ``/control/cleanup/run``:
+            # статус в kv обязан учитывать, что ручной прогон сдвинул интервал.
+            cleanup_next_run=self._cleanup_next_run_at,
         )
         # Политика порога — своя у демона, как и проверяющий прокси: она
         # работает в своём расписании, а действия (pause/rotate) делает через
@@ -354,6 +424,7 @@ class Daemon:
         self._day_close_thread: threading.Thread | None = None
         self._retention_thread: threading.Thread | None = None
         self._db_size_thread: threading.Thread | None = None
+        self._cleanup_thread: threading.Thread | None = None
         self._shutdown_thread: threading.Thread | None = None
         self._previous_handlers: dict[int, Any] = {}
         self._started = False
@@ -386,6 +457,7 @@ class Daemon:
         self._day_close_thread = self._start_day_close_loop()
         self._retention_thread = self._start_retention_loop()
         self._db_size_thread = self._start_db_size_loop()
+        self._cleanup_thread = self._start_cleanup_loop()
         self._started = True
         # Токен в лог не пишется никогда: логи демона читаются из UI и
         # попадают в отчёты о поддержке.
@@ -450,6 +522,14 @@ class Daemon:
             if db_size_thread is not None:
                 db_size_thread.join(timeout=SHUTDOWN_GRACE_SECONDS)
             self._db_size_thread = None
+
+            # Очистка спит до стартового grace или до следующей цели
+            # расписания, поэтому остановка идёт по взведённому stop_event —
+            # как у остальных четырёх нитей выше.
+            cleanup_thread = self._cleanup_thread
+            if cleanup_thread is not None:
+                cleanup_thread.join(timeout=SHUTDOWN_GRACE_SECONDS)
+            self._cleanup_thread = None
 
             thread = self._supervisor_thread
             if thread is not None:
@@ -826,17 +906,19 @@ class Daemon:
                 return
             self._run_tick(self._day_close_tick, "day close failed")
 
-    def _run_tick(self, tick: Callable[[], None], error_message: str) -> None:
+    def _run_tick(self, tick: Callable[[], None], error_message: str, category: str = "scheduler") -> None:
         """Один тик расписания: сбой уходит в лог и не убивает нить.
 
         Общая обёртка для обоих проходов закрытия дня, чтобы по тексту ошибки
         было видно, упал основной экспорт в 23:59 или полночная допроводка.
+        ``category`` поднимается вызывающим: очистка профилей пишет свои
+        сбои в ``cleanup``, а закрытие дня — в ``scheduler``, как и раньше.
         """
         try:
             tick()
         except Exception as exc:  # noqa: BLE001 - расписание обязано пережить сбой
             self.store.log(
-                "ERROR", "scheduler", error_message, {"error": type(exc).__name__}
+                "ERROR", category, error_message, {"error": type(exc).__name__}
             )
 
     def _start_retention_loop(self) -> threading.Thread | None:
@@ -886,7 +968,7 @@ class Daemon:
         """Ждёт интервал (час по умолчанию), сверяет размер БД, повторяет.
 
         Сам лимит читается из конфига на каждом тике: ``db_size_limit_mb`` —
-        поле config.json, а ``0`` выключает защиту прямо во время работы.
+        поле config.json, и ``0`` выключает защиту прямо во время работы.
         """
         while True:
             if stop_event.wait(self.db_size_interval):
@@ -897,6 +979,122 @@ class Daemon:
                 self.store.log(
                     "ERROR", "cleanup", "db size check failed", {"error": type(exc).__name__}
                 )
+
+    # --- очистка профилей (план §5, фаза 10) -------------------------------
+
+    def _cleanup_tick(self) -> None:
+        """Один прогон очистки: проверка интервала и работа сервиса.
+
+        Интервал ``cleanup_interval_days`` проверяется только в штатном режиме
+        (``cleanup_interval is None``): в env-периодном режиме период в
+        секундах заменяет и расписание, и интервал — иначе ускоренные тесты и
+        стенд не увидели бы повторных прогонов. Ручной запуск через HTTP
+        интервал не проверяет вовсе: кнопка — явное намерение оператора, а
+        сдвинутая метка последнего прогона и так отодвинет следующий
+        плановый запуск.
+
+        Настройки берутся с каждого тика (``_current_config``): и время, и
+        период — поля config.json, меняемые из UI без рестарта.
+        """
+        config = self._current_config()
+        if self.cleanup_interval is None:
+            interval_days = int(config.get("behavior.cleanup_interval_days"))
+            if not is_cleanup_due(time.time(), last_run_ts(self.store), interval_days):
+                self.store.log(
+                    "INFO", "cleanup", "cleanup run skipped", {"reason": "interval"}
+                )
+                return
+        self.cleanup_service.run(config)
+
+    def _cleanup_next_run_at(self, now: float) -> float | None:
+        """Эпоха следующего разрешённого запуска; None — job выключен.
+
+        В расписательном режиме цель считается через ``seconds_until_cleanup``
+        с учётом интервала от последнего прогона — ровно той формулой, по
+        которой нить засыпает, чтобы status и сама нить не разъезжались. В
+        env-периодном режиме цель — ``now + период``: приближение, но и нить
+        пересчитывает её после каждого тика.
+        """
+        if self.cleanup_interval is not None:
+            if self.cleanup_interval <= 0:
+                return None
+            return now + self.cleanup_interval
+        config = self._current_config()
+        return now + seconds_until_cleanup(
+            now,
+            str(config.get("behavior.cleanup_time")),
+            int(config.get("behavior.cleanup_interval_days")),
+            last_run_ts(self.store),
+        )
+
+    def _start_cleanup_loop(self) -> threading.Thread | None:
+        """Поднимает нить очистки; None — job выключен (интервал <= 0)."""
+        if self.cleanup_interval is not None and self.cleanup_interval <= 0:
+            # Выключенный job не имеет права показывать расписание в
+            # /control/cleanup/status: пустое значение в kv — это «null».
+            self.cleanup_service.set_next_run(None)
+            return None
+        thread = threading.Thread(
+            target=self._run_cleanup_loop,
+            kwargs={"stop_event": self._stop_event},
+            name=CLEANUP_THREAD_NAME,
+            daemon=True,
+        )
+        thread.start()
+        return thread
+
+    def _run_cleanup_loop(self, stop_event: threading.Event) -> None:
+        """Стартовая зачистка через grace, затем расписание, пока жив демон.
+
+        **Первый прогон.** Осиротевшие после аварийного Kill профили не должны
+        копиться до ближайшего ``cleanup_time``: через ``cleanup_startup_grace``
+        нить делает полный прогон и только потом засыпает до цели. Прогон
+        записывает метку в kv, поэтому он ограничен и общим
+        ``cleanup_interval_days``: перезапуск демона сразу после чистки не
+        даёт второго прогона. ``next_run`` пишется дважды и честно: сначала
+        «прогон через grace», потом — реальная цель расписания.
+
+        Сбой тика уходит в лог и не роняет ни нить, ни демон — тот же
+        паттерн, что у проверки прокси. Сбой расписания (невалидное время в
+        конфиге, отказ чтения kv) логируется и ждёт
+        ``CLEANUP_SCHEDULE_RETRY_SECONDS``: нить обязана пережить ошибку, но
+        не крутить горячий цикл.
+        """
+        try:
+            self.cleanup_service.set_next_run(time.time() + self.cleanup_startup_grace)
+        except Exception as exc:  # noqa: BLE001 - запись в kv не должна убивать нить
+            self.store.log(
+                "ERROR", "cleanup", "cleanup schedule failed", {"error": type(exc).__name__}
+            )
+        if stop_event.wait(self.cleanup_startup_grace):
+            return
+        self._run_tick(self._cleanup_tick, "cleanup failed", category="cleanup")
+
+        while True:
+            try:
+                target = self._cleanup_next_run_at(time.time())
+            except Exception as exc:  # noqa: BLE001 - расписание обязано пережить сбой
+                self.store.log(
+                    "ERROR", "cleanup", "cleanup schedule failed", {"error": type(exc).__name__}
+                )
+                if stop_event.wait(CLEANUP_SCHEDULE_RETRY_SECONDS):
+                    return
+                continue
+            if target is None:
+                # Расписание выключили после старта нити (единственный путь —
+                # перезапуск демона): ждём и пересчитываем, не умирая молча.
+                if stop_event.wait(CLEANUP_SCHEDULE_RETRY_SECONDS):
+                    return
+                continue
+            try:
+                self.cleanup_service.set_next_run(target)
+            except Exception as exc:  # noqa: BLE001 - см. выше
+                self.store.log(
+                    "ERROR", "cleanup", "cleanup schedule failed", {"error": type(exc).__name__}
+                )
+            if stop_event.wait(max(target - time.time(), 0.001)):
+                return
+            self._run_tick(self._cleanup_tick, "cleanup failed", category="cleanup")
 
 
 def supervisor_settings_from_config(config: Config) -> SupervisorSettings:
@@ -927,6 +1125,7 @@ def build_daemon(
     day_close_interval: float | None = None,
     retention_interval: float | None = None,
     db_size_interval: float | None = None,
+    cleanup_interval: float | None = None,
 ) -> Daemon:
     """Собирает демона для запуска как самостоятельного процесса.
 
@@ -938,10 +1137,11 @@ def build_daemon(
     соответствующий интервал из окружения; явное значение важнее окружения
     (так тесты и встраиваемый запуск задают своё, не меняя environ). Нечисловое
     значение окружения — ``ValueError``: молчаливый дефолт при опечатке включил
-    бы таймер, который никто не заказывал. То же для трёх интервалов ротации
-    логов (``day_close_interval``, ``retention_interval``,
-    ``db_size_interval``); у закрытия дня ``None`` из окружения означает
-    расписание в 23:59, а не выключенный job.
+    бы таймер, который никто не заказывал. То же для четырёх интервалов:
+    трёх job'ов ротации логов (``day_close_interval``, ``retention_interval``,
+    ``db_size_interval``) и очистки профилей (``cleanup_interval``); у закрытия
+    дня и у очистки ``None`` из окружения означает расписание (23:59 и
+    ``behavior.cleanup_time`` соответственно), а не выключенный job.
 
     Конфиг читается один раз здесь и передаётся демону: из него же
     применяется уровень файлового лога (``behavior.log_file_level``) — до
@@ -969,6 +1169,9 @@ def build_daemon(
     resolved_db_size = (
         db_size_interval_from_environ() if db_size_interval is None else db_size_interval
     )
+    resolved_cleanup = (
+        cleanup_interval_from_environ() if cleanup_interval is None else cleanup_interval
+    )
     migrations.migrate(db_path)
     config = Config.load(config_path)
     # Уровень файлового лога — поле config.json, и читается конфиг именно
@@ -992,6 +1195,7 @@ def build_daemon(
         day_close_interval=resolved_day_close,
         retention_interval=resolved_retention,
         db_size_interval=resolved_db_size,
+        cleanup_interval=resolved_cleanup,
     )
 
 
