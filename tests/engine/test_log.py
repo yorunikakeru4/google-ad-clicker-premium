@@ -573,3 +573,63 @@ class TestRecordCaptchaEvent:
 
         assert len(_captcha_events(db_path)) == 1
         assert [r for r in caplog.records if r.name == legacy.__name__] == []
+
+
+def _clicks(db_path):
+    with sqlite3.connect(db_path) as conn:
+        conn.row_factory = sqlite3.Row
+        return conn.execute(
+            "SELECT ts, browser_id, url, query, category FROM clicks"
+        ).fetchall()
+
+
+class TestRecordClickFacade:
+    """Дуал-write клика в общую таблицу ``clicks``.
+
+    ``clicklogs_db.save_click`` до этого писал только в legacy-журнал —
+    дашборд (клики/час, графики) читал пустую таблицу, хотя клики реально
+    происходили (поймано живым e2e-прогоном: 2 клика в clicklogs.db и 0 в
+    clicks).
+    """
+
+    def test_uses_bound_browser_id_and_writes_a_row(self, writer, db_path):
+        logger = StructuredLogger(writer, browser_id="br-1")
+
+        logger.record_click(
+            url="https://www.google.com/goto?url=x", query="kette gold", category="Ad"
+        )
+        writer.flush()  # клики батчатся в отличие от diagnostic/captcha
+
+        rows = _clicks(db_path)
+        assert [(r["browser_id"], r["query"], r["category"]) for r in rows] == [
+            ("br-1", "kette gold", "Ad")
+        ]
+        assert rows[0]["url"].startswith("https://www.google.com")
+
+    def test_explicit_browser_id_overrides_bound_one(self, writer, db_path):
+        logger = StructuredLogger(writer, browser_id="br-1")
+
+        logger.record_click(url="https://example.com/", browser_id="br-2")
+        writer.flush()
+
+        assert [r["browser_id"] for r in _clicks(db_path)] == ["br-2"]
+
+    def test_without_browser_id_writes_a_null_row(self, writer, db_path):
+        """CLI-прогон без --id: клик ценнее пустой привязки — пишется с NULL."""
+
+        logger = StructuredLogger(writer)
+
+        logger.record_click(url="https://example.com/", query="q", category="Ad")
+        writer.flush()
+
+        rows = _clicks(db_path)
+        assert len(rows) == 1
+        assert rows[0]["browser_id"] is None
+
+    def test_broken_store_never_raises(self, db_path):
+        logger = StructuredLogger(_BrokenStore())
+
+        logger.record_click(url="https://example.com/")
+
+        assert logger.dropped >= 1
+        assert logger.last_error is not None

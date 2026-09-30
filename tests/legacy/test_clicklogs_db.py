@@ -156,3 +156,31 @@ def test_database_connection_failure_should_raise_runtime_error(isolated_cwd):
         ClickLogsDB().save_click("http://a.example", "Ad", "usb hub", "10:00:00")
 
     assert "Failed to connect to clicklogs database!" in str(excinfo.value)
+
+
+def test_save_click_also_records_into_shared_clicks(make_db, monkeypatch):
+    """Дуал-write: клик уходит и в общую таблицу ``clicks`` общей БД.
+
+    Дашборд фазы 4 читает ``clicks``; без этой записи реальные клики
+    оставались только в legacy-журнале (поймано живым e2e-прогоном).
+    """
+    import clicklogs_db
+
+    recorded: dict = {}
+
+    class Facade:
+        def debug(self, *args, **kwargs):
+            pass  # legacy-сообщение в журнал тоже пишется через этот объект
+
+        def record_click(self, **kwargs):
+            recorded.update(kwargs)
+
+    monkeypatch.setattr(clicklogs_db, "log", Facade())
+
+    db = make_db()
+    db.save_click("http://a.example", "Ad", "usb hub", "10:30:15")
+
+    assert recorded["url"].startswith("http://a.example")
+    assert recorded["query"] == "usb hub"
+    assert recorded["category"] == "Ad"
+    assert isinstance(recorded["ts"], float)

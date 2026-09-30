@@ -229,6 +229,9 @@ class _UnavailableStore:
     def record_captcha_event(self, **kwargs: Any) -> None:
         raise RuntimeError(self._error)
 
+    def record_click(self, **kwargs: Any) -> None:
+        raise RuntimeError(self._error)
+
     def flush(self) -> None:
         raise RuntimeError(self._error)
 
@@ -381,6 +384,27 @@ class StructuredLogger:
             target = self._browser_id if browser_id is None else browser_id
         try:
             self._store.record_captcha_event(browser_id=target, **fields)
+        except Exception as exc:
+            with self._lock:
+                self._dropped += 1
+                self._last_error = str(exc)
+
+    def record_click(self, browser_id: str | None = None, **fields: Any) -> None:
+        """Записать клик в общую таблицу ``clicks``.
+
+        Дуал-write из ``clicklogs_db.save_click``: legacy-журнал остаётся
+        источником для отчётов, а ``clicks`` кормит дашборд (клики/час,
+        графики) — до этого реальные клики оставались только в журнале
+        (поймано живым e2e-прогоном). Контракт как у
+        :meth:`record_captcha_event`: немедленная запись, ошибки в
+        ``dropped``/``last_error``, NULL-``browser_id`` допустим (CLI-прогон
+        без ``--id``), явный аргумент перебивает биндинг, без зеркалирования
+        в legacy-лог.
+        """
+        with self._lock:
+            target = self._browser_id if browser_id is None else browser_id
+        try:
+            self._store.record_click(browser_id=target, **fields)
         except Exception as exc:
             with self._lock:
                 self._dropped += 1

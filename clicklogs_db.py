@@ -60,6 +60,17 @@ class ClickLogsDB:
                         "category": category,
                     },
                 )
+                # Дуал-write в общую таблицу clicks (дашборд/метрики фазы 4).
+                # Ошибки фасада не бросаются — клик уже сохранён в журнале.
+                try:
+                    click_ts = datetime.strptime(
+                        f"{click_date} {click_time}", "%d-%m-%Y %H:%M:%S"
+                    ).timestamp()
+                except ValueError:
+                    click_ts = None
+                log.record_click(
+                    url=site_url, query=query, category=category, ts=click_ts
+                )
 
         except sqlite3.Error as exp:
             raise RuntimeError(exp) from exp
