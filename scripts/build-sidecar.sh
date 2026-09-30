@@ -35,7 +35,17 @@ if [[ -z "${triple}" ]]; then
 fi
 
 if ! command -v "${PYTHON_BIN}" >/dev/null 2>&1; then
-    echo "ошибка: интерпретатор ${PYTHON_BIN} не найден (нужен pyinstaller, см. flake.nix)" >&2
+    echo "ошибка: интерпретатор ${PYTHON_BIN} не найден" >&2
+    echo "  linux (dev-shell): nix develop — pyinstaller приходит из flake.nix" >&2
+    echo "  macOS (без nix):    scripts/bootstrap-venv.sh && .venv/bin/pip install pyinstaller," >&2
+    echo "                     затем PYTHON_BIN=.venv/bin/python $0" >&2
+    exit 1
+fi
+
+if ! "${PYTHON_BIN}" -m PyInstaller --version >/dev/null 2>&1; then
+    echo "ошибка: у ${PYTHON_BIN} нет модуля PyInstaller" >&2
+    echo "  linux (dev-shell): nix develop — pyinstaller приходит из flake.nix" >&2
+    echo "  macOS (без nix):    ${PYTHON_BIN} -m pip install pyinstaller" >&2
     exit 1
 fi
 
