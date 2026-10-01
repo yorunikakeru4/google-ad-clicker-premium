@@ -1039,6 +1039,17 @@ class TestProfileSettings:
 
         assert "--user-agent=Profile-UA" in driver.options.arguments
 
+    def test_without_a_user_agent_no_override_reaches_chrome(
+        self, isolated_tempdir, fake_chrome, no_geolocation, transport
+    ):
+        transport("direct")
+
+        driver, _ = webdriver.create_webdriver(PROXY, None, "abcde")
+
+        assert not any(
+            argument.startswith("--user-agent") for argument in driver.options.arguments
+        ), "без профильного UA Chrome обязан отдавать честную строку (Sec-CH-UA сходится)"
+
 
 class TestProfileSettingsSeleniumBase:
     """Те же настройки в режиме use_seleniumbase: хук не привязан к UC."""
@@ -1112,6 +1123,17 @@ class TestProfileSettingsSeleniumBase:
         driver, _ = webdriver.create_webdriver(PROXY, "Profile-UA", "abcde")
 
         assert driver.init_kwargs["user_agent"] == "Profile-UA"
+
+    def test_without_a_user_agent_seleniumbase_gets_none(
+        self, isolated_tempdir, seleniumbase_mode, seleniumbase_stub, no_geolocation, transport
+    ):
+        transport("direct")
+
+        driver, _ = webdriver.create_webdriver(PROXY, None, "abcde")
+
+        assert driver.init_kwargs["user_agent"] is None, (
+            "без профильного UA подмены нет — честная строка браузера"
+        )
 
     def test_profile_timezone_replaces_the_geo_one(
         self,

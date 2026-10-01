@@ -328,8 +328,23 @@ class FakeElement:
     def send_keys(self, keys):
         self.recorded_keys.append(keys)
 
+    def clear(self):
+        self.recorded_keys.clear()
+
     def click(self):
         return None
+
+    # Видимость/включённость: их читает ожидание кликабельности в
+    # _type_humanlike (и EC.element_to_be_clickable). Настоящий WebElement
+    # обязан их иметь, поэтому и двойник отдаёт «элемент в порядке»;
+    # отказ в тестах задаётся подклассом. Аннотация -> bool обязательна:
+    # без неё pyright сужает базовый метод до Literal[True], и любой
+    # отказывающий подкласс становится несовместимым override.
+    def is_displayed(self) -> bool:
+        return True
+
+    def is_enabled(self) -> bool:
+        return True
 
 
 class FakeDriver:

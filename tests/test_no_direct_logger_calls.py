@@ -62,6 +62,7 @@ SKIP_DIRS = frozenset(
         ".git",
         ".worktrees",
         ".venv",
+        ".venv-sb",
         ".pytest_cache",
         "__pycache__",
         "build",

@@ -1,6 +1,7 @@
 import json
 import platform
 import random
+import re
 import sys
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
@@ -80,6 +81,25 @@ def get_random_user_agent_string() -> str:
     log.debug("browser", "user_agent", fields={"user_agent": user_agent_string})
 
     return user_agent_string
+
+
+# Мобильная строка: Android/iOS-токены, которые никогда не встречаются в
+# десктопном Chrome. Нужен для проверки UA профиля — мобильная строка под
+# десктопным окном (1920x1080) отдаёт Google мобильную вёрстку, а селекторы
+# результата (tads/appbar/q) написаны под десктоп.
+_MOBILE_USER_AGENT = re.compile(r"Android|iPhone|iPad|iPod|CriOS|\bMobile\b")
+
+
+def is_mobile_user_agent(user_agent: str) -> bool:
+    """Мобильный ли User-Agent (Android/iOS).
+
+    :type user_agent: str
+    :param user_agent: User agent string
+    :rtype: bool
+    :returns: True для мобильной строки, False для десктопной
+    """
+
+    return bool(_MOBILE_USER_AGENT.search(user_agent))
 
 
 def _get_user_agents(user_agent_file: Path) -> list[str]:

@@ -309,6 +309,22 @@ class TestProfileUserAgent:
 
         assert capture_user_agent["user_agent"] is None
 
+    def test_mobile_profile_user_agent_is_dropped(self, assign_profile, capture_user_agent):
+        assign_profile(
+            user_agent=(
+                "Mozilla/5.0 (Linux; Android 13; SM-S901B) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/112.0.0.0 Mobile Safari/537.36"
+            )
+        )
+
+        with pytest.raises(StopBeforeBrowser):
+            ad_clicker.run_scenario(query="usb hub")
+
+        assert capture_user_agent["user_agent"] is None, (
+            "мобильный UA под десктопным окном отдаёт мобильную вёрстку "
+            "под десктопными селекторами — только честная строка Chrome"
+        )
+
 
 class TestDiagnosticsCheckpoint:
     """Снимок диагностики в сценарии: две точки входа и защита от сбоев.

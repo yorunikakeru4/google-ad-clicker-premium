@@ -10,12 +10,19 @@ from datetime import datetime
 from pathlib import Path
 
 import pytest
+from selenium.common.exceptions import (
+    ElementNotInteractableException,
+    NoSuchElementException,
+    WebDriverException,
+)
+from selenium.webdriver.common.by import By
+from selenium.webdriver.common.keys import Keys
 
 import search_controller
 from clicklogs_db import ClickLogsDB
 from conftest import FakeDriver, FakeElement
 from engine.profile_apply import load_profile_cookies, profile_cookies_path
-from search_controller import SearchController
+from search_controller import SearchController, SearchRoundError
 from stats import SearchStats
 
 
@@ -975,3 +982,217 @@ class TestProfileCookiesSave:
         assert not Path("profile_data").exists(), (
             "без профиля файл cookies профиля не появляется"
         )
+
+
+# --- cookie-баннер: кликается только кнопка согласия ------------------------------
+
+
+class ConsentButton:
+    """Кнопка баннера: текст и запись кликов в общий список."""
+
+    def __init__(self, label, clicks):
+        self.text = label
+        self._clicks = clicks
+
+    def get_attribute(self, name):
+        return None
+
+    def click(self):
+        self._clicks.append(self.text)
+
+
+class ConsentDriver(FakeDriver):
+    """Признак баннера (policies-ссылка) + набор кнопок в порядке DOM."""
+
+    def __init__(self, buttons=(), consent_link=True):
+        super().__init__()
+        self.clicks = []
+        self._buttons = [ConsentButton(label, self.clicks) for label in buttons]
+        self._consent_link = consent_link
+
+    def find_elements(self, by, value=None):
+        if by == By.TAG_NAME and value == "a":
+            if self._consent_link:
+                return [FakeElement(attributes={"href": "https://policies.google.com/terms"})]
+            return []
+        if by == By.TAG_NAME and value == "button":
+            return list(self._buttons)
+        return []
+
+
+class TestCloseCookieDialog:
+    """Один клик по согласию; прежний спам «все кнопки подряд» удалён."""
+
+    def test_only_the_accept_button_is_clicked(self, make_search_controller):
+        driver = ConsentDriver(
+            buttons=["Manage your data", "Alle akzeptieren", "Reject all"]
+        )
+        controller = make_search_controller(driver=driver)
+
+        controller._close_cookie_dialog()
+
+        assert driver.clicks == ["Alle akzeptieren"]
+
+    def test_unknown_button_texts_are_left_alone(self, make_search_controller):
+        driver = ConsentDriver(buttons=["Manage your data", "More options"])
+        controller = make_search_controller(driver=driver)
+
+        controller._close_cookie_dialog()
+
+        assert driver.clicks == [], "без известного текста согласия — ноль кликов"
+
+    def test_without_the_policies_link_nothing_is_touched(self, make_search_controller):
+        driver = ConsentDriver(buttons=["Alle akzeptieren"], consent_link=False)
+        controller = make_search_controller(driver=driver)
+
+        controller._close_cookie_dialog()
+
+        assert driver.clicks == [], "нет признака баннера — кнопки не ищутся"
+
+
+# --- _type_humanlike: лестница вместо молчаливого глотания -------------------------
+
+
+class BrokenTypingElement(FakeElement):
+    """Элемент, на который send_keys никогда не сработает."""
+
+    def send_keys(self, keys):
+        raise ElementNotInteractableException("поле перекрыто")
+
+
+class HiddenElement(FakeElement):
+    """Элемент есть, но не виден — кликабельным не станет."""
+
+    def is_displayed(self):
+        return False
+
+
+class DeadScriptDriver(FakeDriver):
+    """execute_script всегда падает: и JS-фолбэк обязан отказать."""
+
+    def execute_script(self, script, *args):
+        super().execute_script(script, *args)
+        raise WebDriverException("renderer dead")
+
+
+class TestTypeHumanlike:
+    """Набор → JS-фолбэк → явный отказ; тишина в лог.debug больше не вариант."""
+
+    def test_types_the_query_char_by_char_and_sends_enter(self, make_search_controller):
+        controller = make_search_controller()
+        element = FakeElement()
+
+        controller._type_humanlike(element, "usb hub")
+
+        assert element.recorded_keys == list("usb hub") + [Keys.ENTER]
+        assert not any("dispatchEvent" in s for s in controller._driver.scripts), (
+            "без сбоев JS-фолбэк не запускается"
+        )
+
+    def test_send_keys_failure_falls_back_to_js(self, make_search_controller):
+        controller = make_search_controller()
+
+        controller._type_humanlike(BrokenTypingElement(), "usb hub")
+
+        assert any("dispatchEvent" in s for s in controller._driver.scripts), (
+            "после сбоя send_keys запрос уходит через JS-фолбэк"
+        )
+
+    def test_failed_js_fallback_raises_search_round_error(self, make_search_controller):
+        driver = DeadScriptDriver()
+        controller = make_search_controller(driver=driver)
+
+        with pytest.raises(SearchRoundError):
+            controller._type_humanlike(BrokenTypingElement(), "usb hub")
+
+    def test_never_clickable_box_raises_search_round_error(
+        self, make_search_controller, monkeypatch
+    ):
+        monkeypatch.setattr(search_controller, "SEARCH_BOX_WAIT_TIMEOUT_S", 0.01)
+        controller = make_search_controller()
+
+        with pytest.raises(SearchRoundError):
+            controller._type_humanlike(HiddenElement(), "usb hub")
+
+
+# --- search_for_ads: явный отказ вместо тихого «успеха» ------------------------------
+
+
+class FlakyBoxDriver(FakeDriver):
+    """Поле поиска: find #1 и #3 падают ENI, find #2 отдаёт готовый элемент."""
+
+    def __init__(self):
+        super().__init__()
+        self.calls = 0
+
+    def find_element(self, by, value=None):
+        if by == By.NAME and value == "q":
+            self.calls += 1
+            if self.calls in (1, 3):
+                raise ElementNotInteractableException("поле ещё не готово")
+            return FakeElement()
+        if by == By.ID and value == "recaptcha":
+            raise NoSuchElementException("капчи нет")
+        return FakeElement()
+
+
+class NeverReadyBoxDriver(FakeDriver):
+    """Первый find падает ENI, дальше поле есть, но скрыто — так и не готово."""
+
+    def __init__(self):
+        super().__init__()
+        self.calls = 0
+
+    def find_element(self, by, value=None):
+        if by == By.NAME and value == "q":
+            self.calls += 1
+            if self.calls == 1:
+                raise ElementNotInteractableException("поле ещё не готово")
+            return HiddenElement()
+        if by == By.ID and value == "recaptcha":
+            raise NoSuchElementException("капчи нет")
+        return FakeElement()
+
+
+class NoResultsDriver(FakeDriver):
+    """Набор запроса проходит, но #appbar не появляется никогда."""
+
+    def find_element(self, by, value=None):
+        if by == By.ID and value == "appbar":
+            raise NoSuchElementException("результатов нет")
+        if by == By.ID and value == "recaptcha":
+            raise NoSuchElementException("капчи нет")
+        return FakeElement()
+
+
+class TestSearchRoundFailures:
+    """Отказы поиска — SearchRoundError (run_scenario → completed=False).
+
+    Раньше эти ветки возвращали пустой результат, и воркер записывал раунд
+    как успех «No ads found» с нулём кликов (живой прогон на маке).
+    """
+
+    def test_still_not_interactable_after_recovery_raises(self, make_search_controller):
+        driver = FlakyBoxDriver()
+        controller = make_search_controller(driver=driver)
+
+        with pytest.raises(SearchRoundError):
+            controller.search_for_ads(non_ad_domains=[])
+
+    def test_search_box_never_ready_raises(self, make_search_controller, monkeypatch):
+        monkeypatch.setattr(search_controller, "SEARCH_BOX_WAIT_TIMEOUT_S", 0.01)
+        driver = NeverReadyBoxDriver()
+        controller = make_search_controller(driver=driver)
+
+        with pytest.raises(SearchRoundError):
+            controller.search_for_ads(non_ad_domains=[])
+
+    def test_results_timeout_raises_instead_of_returning_empty(
+        self, make_search_controller, monkeypatch
+    ):
+        monkeypatch.setattr(search_controller, "RESULTS_WAIT_TIMEOUT_S", 0.05)
+        driver = NoResultsDriver()
+        controller = make_search_controller(driver=driver)
+
+        with pytest.raises(SearchRoundError):
+            controller.search_for_ads(non_ad_domains=[])

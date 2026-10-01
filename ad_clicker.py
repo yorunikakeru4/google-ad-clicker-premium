@@ -20,6 +20,7 @@ from proxy import get_proxies
 from search_controller import SearchController
 from utils import (
     get_domains,
+    is_mobile_user_agent,
     take_screenshot,
     generate_click_report,
 )
@@ -170,6 +171,20 @@ def run_scenario(
     # вместе с Sec-CH-UA и считает браузером подделкой.
     profile = current_profile()
     user_agent = resolve_user_agent(profile, None)
+    if user_agent and is_mobile_user_agent(user_agent):
+        # Мобильная строка под десктопным окном: Google отдаёт мобильную
+        # вёрстку, а селекторы результата (tads/appbar/q) писаны под десктоп —
+        # раунд неизбежно умирает на element not interactable. Честный
+        # десктопный Chrome лучше сломанного прогона.
+        log.warning(
+            "browser",
+            "Profile user agent is mobile; using the honest desktop UA",
+            fields={
+                "profile_id": profile["id"] if profile else None,
+                "user_agent": user_agent,
+            },
+        )
+        user_agent = None
     if profile is not None:
         log.debug("browser", "Profile applied", fields={"profile_id": profile["id"]})
 

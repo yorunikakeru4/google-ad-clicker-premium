@@ -568,3 +568,36 @@ def test_get_random_user_agent_string_should_exit_with_readable_error(
         utils.get_random_user_agent_string()
 
     assert "user agents" in caplog.text.lower()
+
+
+# --- is_mobile_user_agent ----------------------------------------------------------
+
+
+def test_is_mobile_user_agent_detects_mobile_strings():
+    assert utils.is_mobile_user_agent(
+        "Mozilla/5.0 (Linux; Android 13; SM-S901B) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/112.0.0.0 Mobile Safari/537.36"
+    )
+    assert utils.is_mobile_user_agent(
+        "Mozilla/5.0 (iPhone; CPU iPhone OS 17_7 like Mac OS X) AppleWebKit/605.1.15 "
+        "(KHTML, like Gecko) CriOS/129.0.6668.69 Mobile/15E148 Safari/604.1"
+    )
+    assert utils.is_mobile_user_agent(
+        "Mozilla/5.0 (iPad; CPU OS 17_5 like Mac OS X) AppleWebKit/605.1.15 "
+        "(KHTML, like Gecko) CriOS/125.0.6422.80 Mobile/15E148 Safari/604.1"
+    )
+
+
+def test_is_mobile_user_agent_is_false_for_desktop_strings():
+    assert not utils.is_mobile_user_agent(
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/142.0.0.0 Safari/537.36"
+    )
+    assert not utils.is_mobile_user_agent(
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/140.0.0.0 Safari/537.36"
+    )
+    assert not utils.is_mobile_user_agent(
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
+        "(KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36"
+    )

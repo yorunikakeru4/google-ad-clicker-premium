@@ -630,6 +630,10 @@ def create_webdriver(
         if profile_timezone:
             _override_timezone(driver, profile_timezone)
 
+    # Обе ветки (с прокси и без): в лог должна идти строка, которую реально
+    # видит страница, — честная, если override не применялся, или профильная.
+    _log_actual_user_agent(driver)
+
     if config.webdriver.window_size:
         width, height = config.webdriver.window_size.split(",")
         log.debug("browser", "Setting window size", fields={"width": width, "height": height})
@@ -754,8 +758,6 @@ def create_seleniumbase_driver(
         )
         if manager is not None:
             attach_proxy_auth(driver, manager)
-
-    _log_actual_user_agent(driver)
 
     # set geolocation and timezone if available
     if proxy and lat and long:

@@ -110,6 +110,24 @@ if (el.form) {
 }
 """
 
+# --- явное падение раунда -----------------------------------------------------
+
+# Раунд не удалось выполнить: поле поиска не интерактивно, запрос не отправился
+# или результаты не появились. Ловится ``ad_clicker.run_scenario`` (→ completed=False,
+# воркер пишет ошибку), а не превращается в пустой возврат «No ads found» —
+# прежние ветки «Timed out waiting for search box/results» возвращали ([], [], [])
+# и прогон записывался как успех с нулём кликов (живой прогон на маке).
+class SearchRoundError(RuntimeError):
+    """Явный отказ раунда поиска с причиной в логе."""
+
+
+# Ожидание поля поиска (набор запроса): WebDriverWait-ветка восстановления
+# и лестница ``_type_humanlike``. Константа, чтобы тесты могли сжать ожидание.
+SEARCH_BOX_WAIT_TIMEOUT_S = 7
+
+# Ожидание контейнера результатов (#appbar) после отправки запроса.
+RESULTS_WAIT_TIMEOUT_S = 5
+
 
 LinkElement = selenium.webdriver.remote.webelement.WebElement
 AdList = list[tuple[LinkElement, str, str]]
@@ -260,23 +278,22 @@ class SearchController:
             try:
                 log.debug("click", "Waiting for search box to be ready...")
 
-                wait = WebDriverWait(self._driver, timeout=7)
+                wait = WebDriverWait(self._driver, timeout=SEARCH_BOX_WAIT_TIMEOUT_S)
                 searchbox_ready = wait.until(EC.element_to_be_clickable(self.SEARCH_INPUT))
 
                 if searchbox_ready:
                     log.debug("click", "Search box is ready...")
 
-                    try:
-                        search_input_box = self._driver.find_element(*self.SEARCH_INPUT)
-                        self._type_humanlike(search_input_box, self._search_query)
-                    except ElementNotInteractableException:
-                        pass
+                    search_input_box = self._driver.find_element(*self.SEARCH_INPUT)
+                    self._type_humanlike(search_input_box, self._search_query)
 
-            except TimeoutException:
+            except TimeoutException as exp:
                 log.error("click", "Timed out waiting for search box!")
-                self.end_search()
+                raise SearchRoundError("поле поиска не готово: таймаут ожидания") from exp
 
-                return (None, None, None)
+            except ElementNotInteractableException as exp:
+                log.error("click", "Search box is still not interactable after recovery")
+                raise SearchRoundError("поле поиска неинтерактивно после восстановления") from exp
 
         self._check_captcha()
 
@@ -303,7 +320,7 @@ class SearchController:
         shopping_ad_links = []
 
         try:
-            wait = WebDriverWait(self._driver, timeout=5)
+            wait = WebDriverWait(self._driver, timeout=RESULTS_WAIT_TIMEOUT_S)
             results_loaded = wait.until(EC.presence_of_element_located(self.RESULTS_CONTAINER))
 
             if results_loaded:
@@ -323,9 +340,12 @@ class SearchController:
                 ad_links = self._get_ad_links()
                 non_ad_links = self._get_non_ad_links(ad_links, non_ad_domains)
 
-        except TimeoutException:
+        except TimeoutException as exp:
+            # Явный отказ, а не пустой возврат: раньше ветка закрывала
+            # браузер и отдавала ([], [], []), и run_scenario записывал
+            # раунд как успех «No ads found» с нулём кликов.
             log.error("click", "Timed out waiting for results!")
-            self.end_search()
+            raise SearchRoundError("результаты поиска не появились (#appbar)") from exp
 
         return (ad_links, non_ad_links, shopping_ad_links)
 
@@ -1054,6 +1074,15 @@ class SearchController:
                 sleep(get_random_sleep(0.5, 1) * config.behavior.wait_factor)
                 button.click()
                 sleep(get_random_sleep(1, 1.5) * config.behavior.wait_factor)
+
+                # Согласие ведёт на навигацию (consent.google.com → назад к
+                # поиску): дождаться поля поиска, иначе вызывающий find_element
+                # поймает stale/NotFound посреди перезагрузки.
+                WebDriverWait(self._driver, timeout=SEARCH_BOX_WAIT_TIMEOUT_S).until(
+                    EC.presence_of_element_located(self.SEARCH_INPUT)
+                )
+            except TimeoutException:
+                log.debug("browser", "Search box not back yet after consent")
             except (
                 ElementNotInteractableException,
                 ElementClickInterceptedException,
@@ -1874,12 +1903,13 @@ class SearchController:
         «Timed out waiting for results!» вместо «поле неинтерактивно»
         (живой прогон на маке). Теперь:
 
-        1. поле доводится до кликабельного (скролл/ожидание внутри EC);
+        1. поле доводится до кликабельного (``_wait_element_clickable``)
+           и подскролливается в центр экрана (best effort);
         2. обычный набор посимвольно + ENTER;
         3. при сбое — JS-фолбэк: value + события input/change + сабмит
            формы (``_JS_TYPE_FALLBACK``);
-        4. если и это не вышло — явное исключение, чтобы в логе сценария
-           стояла настоящая причина.
+        4. если и это не вышло — явное :class:`SearchRoundError`, чтобы
+           в логе сценария стояла настоящая причина.
 
         :type element: selenium.webdriver.remote.webelement.WebElement
         :param element: Element to type into
@@ -1887,9 +1917,21 @@ class SearchController:
         :param text: Text to type
         """
 
-        if not self._wait_element_clickable(element, timeout_s=7):
+        if not self._wait_element_clickable(element, timeout_s=SEARCH_BOX_WAIT_TIMEOUT_S):
             log.error("click", "Search box never became clickable")
-            raise RuntimeError("поле поиска не стало кликабельным за 7 с")
+            raise SearchRoundError(
+                f"поле поиска не стало кликабельным за {SEARCH_BOX_WAIT_TIMEOUT_S} с"
+            )
+
+        # Скролл — best effort: send_keys сам доводит элемент до вьюпорта,
+        # а отказ скролла (например, элемент уже вне DOM-дерева) не должен
+        # убивать набор раньше попытки.
+        try:
+            self._driver.execute_script(
+                "arguments[0].scrollIntoView({block: 'center'});", element
+            )
+        except Exception as exp:
+            log.debug("click", "scrollIntoView failed", fields={"error": str(exp)})
 
         try:
             element.clear()
@@ -1913,7 +1955,7 @@ class SearchController:
             log.debug("click", "Query submitted via JS fallback")
         except Exception as exp:
             log.error("click", "Typing the query failed", fields={"error": str(exp)})
-            raise RuntimeError(f"не удалось ввести запрос: {exp}") from exp
+            raise SearchRoundError(f"не удалось ввести запрос: {exp}") from exp
 
     def set_browser_id(self, browser_id: Optional[int] = None) -> None:
         """Set browser id in stats if multiple browsers are used
