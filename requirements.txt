@@ -1,7 +1,7 @@
 openpyxl==3.1.2
-PyAutoGUI==0.9.53
+PyAutoGUI==0.9.54
 python-telegram-bot==20.6
-selenium==4.35.0
-seleniumbase==4.41.1
+selenium==4.40.0
+seleniumbase==4.46.0
 undetected-chromedriver==3.5.5
 websocket-client==1.9.2

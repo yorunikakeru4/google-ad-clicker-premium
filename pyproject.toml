@@ -9,9 +9,11 @@ requires-python = ">=3.11"
 dependencies = [
     "selenium>=4.35",
     "undetected-chromedriver>=3.5.5",
-    "websocket-client>=1.8",  # CDP-авторизация прокси, см. план.md §2.1
+    # CDP-авторизация прокси, см. план.md §2.1. Верхняя граница нужна:
+    # seleniumbase пинует websocket-client~=1.9.0.
+    "websocket-client>=1.9,<2",
     "openpyxl>=3.1.2",
-    "pyautogui>=0.9.53",
+    "pyautogui>=0.9.54",  # seleniumbase>=4.46 требует 0.9.54 на Linux
     "psutil>=5.9",
 ]
 
@@ -25,7 +27,7 @@ dev = [
 ]
 # Нет в nixpkgs, ставится в venv поверх dev-shell. Нужен только для
 # webdriver.use_seleniumbase и интеграционных тестов на стенде.
-seleniumbase = ["seleniumbase>=4.41.1"]
+seleniumbase = ["seleniumbase>=4.46"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
