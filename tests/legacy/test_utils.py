@@ -283,8 +283,30 @@ def test_get_locale_language_falls_back_to_english_for_unknown_country():
     assert utils.get_locale_language("ZZ") == ["en"]
 
 
-def test_get_locale_language_raises_when_mapping_file_is_missing(isolated_cwd):
+def test_get_locale_language_falls_back_to_module_dir_when_cwd_has_no_file(
+    isolated_cwd,
+):
+    # Упакованный запуск: cwd — каталог данных без этого файла, локали
+    # обязаны браться из каталога модуля (в frozen это _MEIPASS, где файл
+    # лежит в бандле sidecar).
     (isolated_cwd / "country_to_locale.json").unlink()
+
+    assert utils.get_locale_language("US") == ["en-US", "es-US"], (
+        "значения должны прийти из настоящего country_to_locale.json рядом с utils.py"
+    )
+
+
+def test_get_locale_language_raises_when_mapping_file_is_missing(
+    isolated_cwd, monkeypatch
+):
+    # «Пропал» в обоих местах: нет в cwd и нет рядом с модулем — иначе
+    # фолбэк спрятал бы отсутствие файла, которое здесь и проверяем.
+    import engine.diagnostics as diagnostics
+
+    (isolated_cwd / "country_to_locale.json").unlink()
+    monkeypatch.setattr(
+        diagnostics, "COUNTRY_LOCALES_FILE", isolated_cwd / "absent.json"
+    )
 
     with pytest.raises(FileNotFoundError):
         utils.get_locale_language("US")

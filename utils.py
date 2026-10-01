@@ -712,7 +712,19 @@ def get_locale_language(country_code: str) -> str:
 
     log.debug("browser", "Getting locale language...", fields={"country_code": country_code})
 
-    with open("country_to_locale.json", "r") as locales_file:
+    # Файл ищется сначала в cwd (legacy-песочница и юзерский override), иначе
+    # — рядом с модулем-владельцем: в упакованном запуске cwd — каталог данных
+    # без этого файла, а сам он лежит внутри бинарника sidecar (_MEIPASS,
+    # bundle.spec кладёт его в корень). Путь модуля общий с
+    # engine.diagnostics — одна точка правды; импорт ленивый, чтобы
+    # legacy-модуль не тянул engine при своём собственном импорте.
+    from engine.diagnostics import COUNTRY_LOCALES_FILE
+
+    locales_path = Path.cwd() / "country_to_locale.json"
+    if not locales_path.is_file():
+        locales_path = COUNTRY_LOCALES_FILE
+
+    with open(locales_path, "r", encoding="utf-8") as locales_file:
         locales = json.load(locales_file)
 
     locale_language = locales.get(country_code, ["en"])
