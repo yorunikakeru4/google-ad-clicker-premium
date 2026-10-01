@@ -9,6 +9,16 @@ import type { Health, StateSnapshot } from "./types";
 
 export type PollPhase = "idle" | "inflight" | "online" | "offline";
 
+/**
+ * Сколько неудачных тиков подряд, прежде чем считать демон офлайным.
+ *
+ * Один сбой (рестарт демона, опоздавший ответ, заминка на старте) раньше
+ * рисовал баннер «нет связи» почти сразу и тут же гасил его при
+ * восстановлении — секундное моргание, на которое не посмотреть. Три тика
+ * при интервале в секунду — это уже три секунды недоступности.
+ */
+export const OFFLINE_AFTER_FAILURES = 3;
+
 export interface PollState {
   phase: PollPhase;
   /** Номер последнего начатого тика. */
@@ -16,6 +26,8 @@ export interface PollState {
   /** Эпоха в мс последнего успешного ответа; хранится и после офлайна. */
   lastOkAt: number | null;
   lastError: string | null;
+  /** Неудачных тиков подряд; сбрасывается успешным ответом. */
+  failures: number;
   health: Health | null;
   snapshot: StateSnapshot | null;
 }
@@ -37,6 +49,7 @@ export function createPollState(): PollState {
     seq: 0,
     lastOkAt: null,
     lastError: null,
+    failures: 0,
     health: null,
     snapshot: null,
   };
@@ -57,6 +70,7 @@ export function reducePoll(state: PollState, event: PollEvent): PollState {
         phase: "online",
         lastOkAt: event.at,
         lastError: null,
+        failures: 0,
         health: event.health,
         snapshot: event.snapshot,
       };
@@ -64,15 +78,19 @@ export function reducePoll(state: PollState, event: PollEvent): PollState {
 
     case "failure": {
       if (event.seq !== state.seq || state.phase !== "inflight") return state;
+      const failures = state.failures + 1;
+      const failed = { ...state, failures, lastError: event.error };
+
+      // Ниже порога офлайн не объявляем: данные и вид остаются прежними,
+      // меняются только счётчик и текст ошибки. phase при этом обязан
+      // покинуть inflight, иначе следующий begin зависнет на старом тике.
+      if (failures < OFFLINE_AFTER_FAILURES) {
+        return { ...failed, phase: state.lastOkAt !== null ? "online" : "offline" };
+      }
+
       // Явный off-стан: данные чистим, чтобы не показывать устаревшее как
       // живое. lastOkAt сохраняется — по нему живёт «последний ответ».
-      return {
-        ...state,
-        phase: "offline",
-        lastError: event.error,
-        health: null,
-        snapshot: null,
-      };
+      return { ...failed, phase: "offline", health: null, snapshot: null };
     }
   }
 }

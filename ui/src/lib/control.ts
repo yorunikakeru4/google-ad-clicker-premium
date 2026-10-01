@@ -364,3 +364,22 @@ export function errorMessage(error: unknown): string {
   if (error instanceof Error) return error.message;
   return String(error);
 }
+
+/**
+ * Текст баннера «нет связи с демоном».
+ *
+ * Причина из супервизора (`daemon_status.last_error`) сильнее симптома из
+ * опроса: «порт занят чужим демоном» / «не найден config.json» объясняют
+ * ситуацию, а «неверный токен» и «нет соединения» — лишь следствие. Без
+ * причины баннер говорил одно и то же и не вёл к первопричине.
+ */
+export function offlineBannerText(
+  supervisorError: string | null,
+  pollError: string | null,
+): string {
+  const reason = (supervisorError ?? pollError)?.trim().replace(/\.$/, "");
+  const head = reason
+    ? `Нет связи с демоном: ${reason}`
+    : "Нет связи с демоном";
+  return `${head}. Данные на экранах могут быть устаревшими.`;
+}

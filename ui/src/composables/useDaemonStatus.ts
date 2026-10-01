@@ -5,6 +5,7 @@
 // из lib/poll — параллельные тики и опоздавшие ответы отсекаются там.
 
 import { computed, ref, type ComputedRef, type Ref } from "vue";
+import { invoke } from "@tauri-apps/api/core";
 import {
   errorMessage,
   toStatusView,
@@ -20,11 +21,31 @@ import { createPollState, reducePoll, type PollState } from "../lib/poll";
 
 export const POLL_INTERVAL_MS = 1000;
 
+/**
+ * Статус супервизора из Rust-команды `daemon_status` (ui/src-tauri/src/lib.rs).
+ *
+ * Нужен для причины в баннере «нет связи»: сам опрос даёт только симптом
+ * («неверный токен», «нет соединения»), а почему демон не поднят — «порт
+ * занят чужим демоном», «не найден config.json», «перезапуски прекращены» —
+ * знает только супервизор, у которого упавшие старты и падения пишутся в
+ * `last_error`.
+ */
+export interface SupervisorInfo {
+  running: boolean;
+  pid: number | null;
+  restarts: number;
+  consecutive_failures: number;
+  gave_up: boolean;
+  last_error: string | null;
+}
+
 export interface DaemonStatus {
   state: Ref<PollState>;
   view: ComputedRef<StatusView>;
   busy: Ref<boolean>;
   controlError: Ref<string | null>;
+  /** Последний статус супервизора; null — вне Tauri или ещё не читали. */
+  supervisor: Ref<SupervisorInfo | null>;
   /** Один тик опроса; повторный вызов во время тика — no-op. */
   tick(): Promise<void>;
   startPolling(intervalMs?: number): void;
@@ -40,13 +61,27 @@ export function createDaemonStatus(
   const state = ref<PollState>(createPollState());
   const busy = ref(false);
   const controlError = ref<string | null>(null);
+  const supervisor = ref<SupervisorInfo | null>(null);
   let timer: ReturnType<typeof setInterval> | null = null;
+
+  // Команда живёт вне HTTP-опроса: она читает состояние самого Rust-хоста.
+  // За его пределами (тесты, dev-веб) вызов отклоняется — молча и без
+  // обнуления: однажды полученная причина не должна пропадать из баннера
+  // из-за одного неудачного чтения.
+  async function refreshSupervisor(): Promise<void> {
+    try {
+      supervisor.value = (await invoke("daemon_status")) as SupervisorInfo;
+    } catch {
+      // вне Tauri или команда упала — баннер покажет причину из ошибки опроса
+    }
+  }
 
   async function tick(): Promise<void> {
     const begun = reducePoll(state.value, { kind: "begin" });
     if (begun === state.value) return; // тик уже в полёте
     state.value = begun;
     const seq = begun.seq;
+    void refreshSupervisor();
 
     try {
       const [health, snapshot] = await Promise.all([
@@ -108,7 +143,17 @@ export function createDaemonStatus(
     }),
   );
 
-  return { state, view, busy, controlError, tick, startPolling, stop, send };
+  return {
+    state,
+    view,
+    busy,
+    controlError,
+    supervisor,
+    tick,
+    startPolling,
+    stop,
+    send,
+  };
 }
 
 // Единственный экземпляр на приложение: панель статуса, кнопки и будущие

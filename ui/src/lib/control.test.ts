@@ -7,6 +7,7 @@ import {
   diagnosticsRequest,
   disabledReason,
   errorMessage,
+  offlineBannerText,
   profilesRequest,
   proxiesRequest,
   toStatusView,
@@ -420,5 +421,39 @@ describe("errorMessage", () => {
 
   it("прочие значения не роняют форму", () => {
     expect(errorMessage(42)).toBe("42");
+  });
+});
+
+describe("offlineBannerText", () => {
+  it("причина супервизора важнее симптома опроса", () => {
+    const text = offlineBannerText(
+      "на http://127.0.0.1:8787 уже работает демон с другим токеном",
+      "неверный токен",
+    );
+
+    expect(text).toContain("уже работает демон с другим токеном");
+    expect(text).not.toContain("неверный токен");
+    expect(text).toContain("Данные на экранах могут быть устаревшими");
+  });
+
+  it("без причины супервизора показывается текст ошибки опроса", () => {
+    expect(offlineBannerText(null, "нет соединения с демоном на 127.0.0.1:8787")).toContain(
+      "Нет связи с демоном: нет соединения с демоном на 127.0.0.1:8787",
+    );
+  });
+
+  it("без обеих причин остаётся базовый текст", () => {
+    expect(offlineBannerText(null, null)).toBe(
+      "Нет связи с демоном. Данные на экранах могут быть устаревшими.",
+    );
+  });
+
+  it("точка в конце причины не складывается в двойную", () => {
+    const text = offlineBannerText("не найден config.json.", null);
+
+    expect(text).toBe(
+      "Нет связи с демоном: не найден config.json. Данные на экранах могут быть устаревшими.",
+    );
+    expect(text).not.toContain("..");
   });
 });

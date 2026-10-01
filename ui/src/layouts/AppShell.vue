@@ -6,14 +6,15 @@ import HeartbeatIndicator from "../components/status/HeartbeatIndicator.vue";
 import DaemonControls from "../components/layout/DaemonControls.vue";
 import ThemeToggle from "../components/layout/ThemeToggle.vue";
 import { useDaemonStatus } from "../composables/useDaemonStatus";
-import { disabledReason, type ControlAction } from "../lib/control";
+import { disabledReason, offlineBannerText, type ControlAction } from "../lib/control";
 import type { DaemonState } from "../constants/daemon";
 import { NAV_ITEMS } from "../router";
 
 const HEARTBEAT_INTERVAL_SECONDS = 5;
 const HEARTBEAT_OFFLINE_FACTOR = 4;
 
-const { state, view, controlError, startPolling, stop, send } = useDaemonStatus();
+const { state, view, controlError, supervisor, startPolling, stop, send } =
+  useDaemonStatus();
 
 onMounted(() => startPolling());
 onUnmounted(() => stop());
@@ -49,6 +50,14 @@ const offline = computed(() => {
   }
   return !view.value.online && state.value.lastOkAt !== null;
 });
+
+// Причина в баннере: сначала то, что знает супервизор (почему демон не
+// поднят), иначе — текст ошибки самого опроса («неверный токен», «нет
+// соединения»). Без этого баннер говорил только «нет связи» и не вёл к
+// первопричине.
+const offlineText = computed(() =>
+  offlineBannerText(supervisor.value?.last_error ?? null, state.value.lastError),
+);
 
 const activeTasks = computed(() => view.value.workersAlive);
 
@@ -133,7 +142,7 @@ function onSnackChange(open: boolean) {
         variant="tonal"
         density="comfortable"
         class="ma-4 mb-0"
-        text="Нет связи с демоном. Данные на экранах могут быть устаревшими."
+        :text="offlineText"
       />
       <router-view />
     </v-main>

@@ -305,6 +305,46 @@ fn missing_project_marker(start_dir: &Path, data_dir: Option<&Path>) -> String {
     }
 }
 
+/// Рабочий каталог демона: явный env → корень проекта от ``start_dir`` →
+/// каталог данных приложения (только если маркер в нём уже лежит).
+///
+/// Одна точка правды для трёх мест, которым нужен один каталог: спавн
+/// демона ([`DaemonSpec::resolve`]), путь боевой БД в `commands` (иначе UI
+/// читал бы файл не там, где его пишет демон) и перенос ресурсов бандла
+/// ([`seed_target`]).
+pub fn working_dir(vars: &HashMap<String, String>, start_dir: &Path) -> Result<PathBuf, String> {
+    if let Some(raw) = env_value(vars, "ADCLICKER_DAEMON_CWD") {
+        return Ok(PathBuf::from(raw));
+    }
+    let data_dir = app_data_dir(vars, cfg!(target_os = "macos"));
+    find_project_root_from(start_dir)
+        .or_else(|| {
+            data_dir
+                .as_ref()
+                .filter(|dir| dir.join(PROJECT_MARKER).is_file())
+                .cloned()
+        })
+        .ok_or_else(|| missing_project_marker(start_dir, data_dir.as_deref()))
+}
+
+/// Куда переносить ресурсы бандла при старте (см. `resources`).
+///
+/// Это каталог, из которого демон будет читать файлы, но без проверки
+/// маркера: в первый запуск каталог данных ещё пуст, и именно перенос
+/// делает его рабочим — [`working_dir`] здесь ещё не пройдёт.
+///
+/// `None` — перенос не нужен: корень проекта найден от cwd, файлы уже на
+/// месте (dev-запуск из исходников).
+pub fn seed_target(vars: &HashMap<String, String>, start_dir: &Path) -> Option<PathBuf> {
+    if let Some(raw) = env_value(vars, "ADCLICKER_DAEMON_CWD") {
+        return Some(PathBuf::from(raw));
+    }
+    if find_project_root_from(start_dir).is_some() {
+        return None;
+    }
+    app_data_dir(vars, cfg!(target_os = "macos"))
+}
+
 /// Токен control API из окружения.
 ///
 /// Обязателен: параллельный источник значений (отдельное поле спецификации)
@@ -366,20 +406,9 @@ impl DaemonSpec {
         exe: Option<&Path>,
     ) -> Result<Self, String> {
         let project_root = find_project_root_from(&start_dir);
-        let data_dir = app_data_dir(vars, cfg!(target_os = "macos"));
-
-        let cwd = match env_value(vars, "ADCLICKER_DAEMON_CWD") {
-            Some(raw) => PathBuf::from(raw),
-            None => project_root
-                .clone()
-                .or_else(|| {
-                    data_dir
-                        .as_ref()
-                        .filter(|dir| dir.join(PROJECT_MARKER).is_file())
-                        .cloned()
-                })
-                .ok_or_else(|| missing_project_marker(&start_dir, data_dir.as_deref()))?,
-        };
+        // Общий с commands/resources резолв каталога: один каталог на
+        // «спавн демона», «где лежит БД» и «куда класть ресурсы бандла».
+        let cwd = working_dir(vars, &start_dir)?;
 
         let (program, default_args) = match env_value(vars, "ADCLICKER_DAEMON_PYTHON") {
             Some(program) => (program.to_string(), python_args()),
@@ -475,6 +504,20 @@ impl DaemonSupervisor {
             gave_up: inner.gave_up,
             last_error: inner.last_error.clone(),
         }
+    }
+
+    /// Записывает причину, по которой демон не запущен.
+    ///
+    /// Нужна UI: ``start`` пишет ``last_error`` только при упавшем спавне, а
+    /// отказы **до** спавна (нет токена, нет каталога с config.json, порт
+    /// занят чужим демоном) уходили в stderr — а у GUI-приложения, запущенного
+    /// из Finder, stderr никто не читает, и «демон не виден» оставалось без
+    /// объяснения.
+    pub fn note_launch_error(&self, message: &str) {
+        let mut inner = self.shared.inner.lock().expect("mutex poisoned");
+        inner.last_error = Some(message.to_string());
+        inner.running = false;
+        inner.pid = None;
     }
 
     /// Порождает демона и запускает фоновый монитор. Повторный вызов — no-op.
@@ -1095,6 +1138,63 @@ mod tests {
             None,
             "без HOME каталога данных не вычислить"
         );
+    }
+
+    #[test]
+    fn seed_target_points_at_where_the_daemon_will_read() {
+        // dev: корень проекта найден от cwd — файлы на месте, перенос не нужен.
+        let root = env::temp_dir().join(format!("adclicker-seed-dev-{}", std::process::id()));
+        fs::create_dir_all(&root).expect("каталог создаётся");
+        fs::write(root.join(PROJECT_MARKER), "{}").expect("маркер пишется");
+        assert_eq!(
+            seed_target(&HashMap::new(), &root),
+            None,
+            "dev-запуск не переносит ресурсы"
+        );
+
+        // Явный каталог — туда и переносим (свежий каталог установки).
+        let explicit =
+            HashMap::from([("ADCLICKER_DAEMON_CWD".to_string(), "/srv/app".to_string())]);
+        assert_eq!(
+            seed_target(&explicit, &root),
+            Some(PathBuf::from("/srv/app"))
+        );
+
+        // Запуск из Finder: корня нет — цель каталог данных приложения.
+        let orphan = env::temp_dir().join(format!("adclicker-seed-finder-{}", std::process::id()));
+        fs::create_dir_all(&orphan).expect("каталог создаётся");
+        let vars = HashMap::from([(
+            "HOME".to_string(),
+            env::temp_dir()
+                .join("adclicker-seed-home")
+                .display()
+                .to_string(),
+        )]);
+        assert_eq!(
+            seed_target(&vars, &orphan),
+            app_data_dir(&vars, cfg!(target_os = "macos")),
+            "без корня цель — каталог данных, даже если маркера там ещё нет"
+        );
+
+        let _ = fs::remove_dir_all(&root);
+        let _ = fs::remove_dir_all(&orphan);
+    }
+
+    #[test]
+    fn note_launch_error_is_visible_in_status() {
+        // Отказ до спавна (нет токена, порт занят чужим демоном) обязан
+        // дойти до UI — иначе «демон не виден» остаётся без причины.
+        let supervisor = DaemonSupervisor::new(fast_options());
+
+        supervisor.note_launch_error("порт занят демоном с другим токеном");
+
+        let status = supervisor.status();
+        assert!(!status.running);
+        assert_eq!(
+            status.last_error.as_deref(),
+            Some("порт занят демоном с другим токеном")
+        );
+        supervisor.stop();
     }
 
     /// Бумажный .app-бандл с бинарником приложения и sidecar рядом с ним.

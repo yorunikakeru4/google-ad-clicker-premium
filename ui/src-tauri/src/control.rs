@@ -188,6 +188,49 @@ pub fn request(
     )
 }
 
+/// Что уже стоит на порту демона: проверка перед спавном.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DaemonProbe {
+    /// Порт свободен — демон можно спавнить.
+    Free,
+    /// Уже работает демон, принимающий наш токен: второй не нужен.
+    AlreadyRunning,
+    /// На порту отвечает демон с другим токеном. Спавнить бессмысленно
+    /// (порт занят), а UI без этой проверки получил бы 401 на каждый
+    /// запрос и показал «неверный токен» без объяснения причины.
+    ForeignDaemon { detail: String },
+}
+
+/// Проверяет control API своим токеном до спавна демона.
+///
+/// Логика ответов: 401 — токен не подошёл, значит чужой демон; любой другой
+/// статус — демон жив и принимает наши запросы (проверка токена идёт раньше
+/// тела запроса); сетевая ошибка — на порту никого, можно спавнить.
+pub fn probe_daemon() -> DaemonProbe {
+    probe(
+        std::env::var(TOKEN_ENV).ok().as_deref(),
+        std::env::var(BASE_URL_ENV).ok().as_deref(),
+    )
+}
+
+/// Ядро проверки с явными параметрами: тесты не трогают env и реальный порт.
+pub fn probe(token: Option<&str>, base_url: Option<&str>) -> DaemonProbe {
+    match request(token, base_url, "GET", "/health", None) {
+        Ok(reply) if reply.status == 401 => DaemonProbe::ForeignDaemon {
+            detail: format!(
+                "на {} уже работает демон с другим токеном — остановите его либо \
+                 задайте тот же {TOKEN_ENV} приложению",
+                base_url.unwrap_or(DEFAULT_BASE_URL)
+            ),
+        },
+        Ok(_) => DaemonProbe::AlreadyRunning,
+        // «Нет соединения» — обычный путь перед первым спавном. Сюда же
+        // падают ошибки, до сети не дошедшие (нет токена, кривой base_url):
+        // их отдельно отчитает сам старт демона.
+        Err(_) => DaemonProbe::Free,
+    }
+}
+
 /// Разбор базового URL. Только `http://` — демон не умеет TLS, и молча
 /// стучаться по https на порт демона бессмысленно.
 pub fn parse_endpoint(base_url: &str) -> Result<Endpoint, String> {
@@ -590,6 +633,61 @@ mod tests {
         assert!(!allowed_path("/control/proxies/import/../../state"));
         assert!(!allowed_path("/control/proxies?all=1"));
         assert!(!allowed_path("/control/proxies/delete\r\nX-Injected: 1"));
+    }
+
+    #[test]
+    fn probe_reports_a_free_port_when_nothing_listens() {
+        let endpoint = closed_endpoint();
+        let base_url = format!("http://{}:{}", endpoint.host, endpoint.port);
+
+        assert_eq!(probe(Some(TOKEN), Some(&base_url)), DaemonProbe::Free);
+    }
+
+    #[test]
+    fn probe_recognises_a_running_daemon_with_our_token() {
+        let (endpoint, _received, handle) = serve_once(response(
+            "HTTP/1.1 200 OK",
+            r#"{"status":"ok","version":1}"#,
+        ));
+        let base_url = format!("http://{}:{}", endpoint.host, endpoint.port);
+
+        let result = probe(Some(TOKEN), Some(&base_url));
+        handle.join().unwrap();
+
+        assert_eq!(result, DaemonProbe::AlreadyRunning);
+    }
+
+    #[test]
+    fn probe_flags_a_daemon_that_rejects_our_token() {
+        let (endpoint, received, handle) = serve_once(response(
+            "HTTP/1.1 401 Unauthorized",
+            r#"{"error":{"code":"unauthorized","message":"неверный токен"}}"#,
+        ));
+        let base_url = format!("http://{}:{}", endpoint.host, endpoint.port);
+
+        let result = probe(Some("our-token"), Some(&base_url));
+        handle.join().unwrap();
+
+        match result {
+            DaemonProbe::ForeignDaemon { detail } => {
+                assert!(detail.contains("другим токеном"), "{detail}");
+                assert!(detail.contains(TOKEN_ENV), "{detail}");
+                assert!(
+                    !detail.contains("our-token"),
+                    "токен не должен попадать в текст: {detail}"
+                );
+            }
+            other => panic!("ожидался ForeignDaemon, получено {other:?}"),
+        }
+        let request = received.recv().unwrap();
+        assert!(request.contains("X-Auth-Token: our-token"));
+    }
+
+    #[test]
+    fn probe_without_a_token_reports_free_port() {
+        // Без токена request() не доходит до сети — это «не знаю», а не
+        // «порт занят»: иначе старт демона решал бы по нечестному признаку.
+        assert_eq!(probe(None, Some("http://127.0.0.1:1")), DaemonProbe::Free);
     }
 
     #[test]

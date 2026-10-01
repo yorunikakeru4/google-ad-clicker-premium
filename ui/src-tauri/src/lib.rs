@@ -3,6 +3,9 @@ pub mod control;
 pub mod daemon;
 pub mod db;
 pub mod metrics;
+pub mod resources;
+
+use std::collections::HashMap;
 
 use tauri::Manager;
 
@@ -40,16 +43,50 @@ pub fn run() {
         .manage(DbState::default())
         .manage(supervisor)
         .setup(|app| {
-            // Ошибка подъёма демона не роняет приложение: UI обязан открыться,
-            // чтобы показать причину, а не исчезнуть без объяснений.
-            let supervisor = app.state::<DaemonSupervisor>();
-            match DaemonSpec::from_env() {
-                Ok(spec) => {
-                    if let Err(error) = supervisor.start(spec) {
-                        eprintln!("демон не поднялся: {error}");
-                    }
+            // Порядок важен и ошибки обязаны дойти до UI (команда
+            // daemon_status читает last_error, баннер показывает его в
+            // тексте «нет связи»): stderr у приложения из Finder никто не
+            // читает, и без этого «демон не виден» оставалось без причины.
+            let vars: HashMap<String, String> = std::env::vars().collect();
+            let start_dir =
+                std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+
+            // 1. Файлы бандла в каталог демона — без config.json рабочий
+            //    каталог не соберётся вообще.
+            if let Some(target) = daemon::seed_target(&vars, &start_dir) {
+                match resources::seed(app.path(), &target) {
+                    Ok(copied) if !copied.is_empty() => eprintln!(
+                        "ресурсы бандла перенесены в {target:?}: {}",
+                        copied.join(", ")
+                    ),
+                    Ok(_) => {}
+                    Err(error) => eprintln!("ресурсы бандла не перенеслись: {error}"),
                 }
-                Err(error) => eprintln!("демон не поднялся: {error}"),
+            }
+
+            // 2. Порт: чужой демон (401) или уже запущенный с нашим токеном —
+            //    второй не спавним, иначе получим цикл падений на занятом
+            //    порту плюс 401 на каждый запрос UI.
+            let supervisor = app.state::<DaemonSupervisor>();
+            match control::probe_daemon() {
+                control::DaemonProbe::AlreadyRunning => {
+                    eprintln!("на порту уже работает демон с этим же токеном — второй не спавним");
+                }
+                control::DaemonProbe::ForeignDaemon { detail } => {
+                    eprintln!("{detail}");
+                    supervisor.note_launch_error(&detail);
+                }
+                control::DaemonProbe::Free => match DaemonSpec::from_env() {
+                    Ok(spec) => {
+                        if let Err(error) = supervisor.start(spec) {
+                            eprintln!("демон не поднялся: {error}");
+                        }
+                    }
+                    Err(error) => {
+                        eprintln!("демон не поднялся: {error}");
+                        supervisor.note_launch_error(&error);
+                    }
+                },
             }
             Ok(())
         })

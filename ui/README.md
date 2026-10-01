@@ -104,7 +104,8 @@ scripts/bootstrap-venv.sh && PYTHON_BIN=.venv/bin/python \
   scripts/build-sidecar.sh                                   # without nix
 ```
 
-What the packaged launch resolves on its own (see `src-tauri/src/daemon.rs`):
+What the packaged launch resolves on its own (see `src-tauri/src/daemon.rs`
+and `src-tauri/src/resources.rs`):
 
 - control token — generated at startup if the variable is unset;
 - daemon program — the `engine` sidecar next to the app binary inside
@@ -113,7 +114,23 @@ What the packaged launch resolves on its own (see `src-tauri/src/daemon.rs`):
   frozen sidecar next to the dev binary;
 - working directory — project tree above the launch directory, otherwise the
   app data dir (`~/Library/Application Support/Google Ad Clicker` on macOS,
-  the same path as `WorkingDirectory` in the launchd plist).
+  the same path as `WorkingDirectory` in the launchd plist);
+- data files — `config.json`, `queries.txt`, `proxies.txt`,
+  `user_agents.txt`, `domains.txt`, `domain_mapping.json`, `cookies.txt` are
+  bundled via `bundle.resources` and copied into that directory on first
+  launch, missing files only (user edits win over the bundle). `queries.txt`
+  and `proxies.txt` are local, untracked files: the bundle step needs them on
+  the build machine;
+- the port — before spawning, the app probes `:8787` with its token: a
+  daemon already answering is adopted instead of duplicated, and a daemon
+  with a foreign token is reported («порт занят демоном с другим токеном»)
+  instead of spawning a child that cannot bind;
+- database path — `adclicker.db` is read from the same working directory
+  where the daemon writes it (`ADCLICKER_DB` still overrides).
+
+Startup failures (no token, no `config.json`, foreign daemon) are stored in
+`daemon_status.last_error` and shown in the top banner together with the
+polling error, because stderr of a Finder-launched app goes nowhere.
 
 ## Theming
 

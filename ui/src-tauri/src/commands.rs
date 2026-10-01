@@ -1,9 +1,11 @@
 //! Tauri-команды для фронта: открытие боевой БД и все read-only чтения.
 //!
 //! Путь к базе резолвится так же, как `engine/log.py::resolve_db_path`:
-//! явный аргумент → env `ADCLICKER_DB` → `adclicker.db` в каталоге запуска.
-//! Ни один путь не захардкожен — его всегда передаёт вызывающий.
+//! явный аргумент → env `ADCLICKER_DB` → `adclicker.db` в рабочем каталоге
+//! демона (`daemon::working_dir`). Ни один путь не захардкожен — его всегда
+//! передаёт вызывающий.
 
+use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
 
@@ -29,32 +31,56 @@ pub const DEFAULT_DB_NAME: &str = "adclicker.db";
 #[derive(Debug, Default)]
 pub struct DbState(pub Mutex<Option<DbReader>>);
 
-/// Резолвит путь к БД: явный аргумент → env `ADCLICKER_DB` → `adclicker.db`.
+/// Резолвит путь к БД: явный аргумент → env `ADCLICKER_DB` → `adclicker.db`
+/// в рабочем каталоге демона.
+///
+/// Дефолт ищется не в cwd процесса, а там, где файл создаёт демон
+/// (`daemon::working_dir`): из Finder у приложения cwd — `/`, а демон пишет
+/// базу в свой каталог (корень репозитория в dev, каталог данных в
+/// упакованном запуске). Без этого UI смотрел бы не на тот файл и честно
+/// отчитывался «база не найдена».
 ///
 /// `~` разворачивается в HOME, относительный путь — в абсолютный от cwd,
 /// как `Path(...).expanduser().resolve()` в Python.
 pub fn resolve_db_path(explicit: Option<&str>) -> PathBuf {
+    let vars: HashMap<String, String> = std::env::vars().collect();
+    let home = std::env::var("HOME").ok();
+    let cwd = std::env::current_dir().ok();
+    let workdir = cwd
+        .as_deref()
+        .and_then(|dir| crate::daemon::working_dir(&vars, dir).ok());
+
     resolve_db_path_in(
         explicit,
         std::env::var(DB_ENV_VAR).ok().as_deref(),
-        std::env::var("HOME").ok().as_deref(),
-        std::env::current_dir().ok().as_deref(),
+        home.as_deref(),
+        cwd.as_deref(),
+        workdir.as_deref(),
     )
 }
 
 /// Чистое ядро резолва: параметры окружения приходят аргументами, чтобы
-/// тесты не трогали состояние процесса.
+/// тесты не трогали состояние процесса. `workdir` — каталог демона, куда
+/// база и пишется; `None` — fallback на каталог запуска.
 fn resolve_db_path_in(
     explicit: Option<&str>,
     env: Option<&str>,
     home: Option<&str>,
     cwd: Option<&Path>,
+    workdir: Option<&Path>,
 ) -> PathBuf {
     let raw = explicit
         .filter(|value| !value.is_empty())
-        .or_else(|| env.filter(|value| !value.is_empty()))
-        .unwrap_or(DEFAULT_DB_NAME);
-    absolutize(&expand_home(raw, home), cwd)
+        .or_else(|| env.filter(|value| !value.is_empty()));
+    if let Some(raw) = raw {
+        return absolutize(&expand_home(raw, home), cwd);
+    }
+
+    let base = workdir
+        .map(Path::to_path_buf)
+        .or_else(|| cwd.map(Path::to_path_buf))
+        .unwrap_or_default();
+    absolutize(&base.join(DEFAULT_DB_NAME), cwd)
 }
 
 /// `~` и `~/...` — в HOME. Без HOME путь остаётся как есть, как и в Python.
@@ -331,6 +357,7 @@ mod tests {
             Some("/env/adclicker.db"),
             Some("/home/runner"),
             Some(Path::new("/cwd")),
+            None,
         );
 
         assert_eq!(
@@ -347,6 +374,7 @@ mod tests {
             Some("/env/adclicker.db"),
             None,
             Some(Path::new("/cwd")),
+            None,
         );
         assert_eq!(from_env, PathBuf::from("/env/adclicker.db"));
 
@@ -355,6 +383,7 @@ mod tests {
             Some("/env/adclicker.db"),
             None,
             Some(Path::new("/cwd")),
+            None,
         );
         assert_eq!(
             empty_arg,
@@ -362,19 +391,43 @@ mod tests {
             "пустой аргумент эквивалентен отсутствующему, как `or` в Python"
         );
 
-        let empty_env = resolve_db_path_in(None, Some(""), None, Some(Path::new("/cwd")));
+        let empty_env = resolve_db_path_in(None, Some(""), None, Some(Path::new("/cwd")), None);
         assert_eq!(
             empty_env,
             PathBuf::from("/cwd/adclicker.db"),
             "пустой env — дефолтное имя adclicker.db"
         );
 
-        let default = resolve_db_path_in(None, None, None, Some(Path::new("/cwd")));
+        let default = resolve_db_path_in(None, None, None, Some(Path::new("/cwd")), None);
         assert_eq!(
             default,
             PathBuf::from("/cwd/adclicker.db"),
-            "дефолт — adclicker.db в каталоге запуска"
+            "без каталога демона — adclicker.db в каталоге запуска"
         );
+    }
+
+    #[test]
+    fn resolve_db_path_defaults_to_the_daemon_working_dir() {
+        // Боевой путь: демон пишет базу в свой каталог, UI обязан читать
+        // оттуда же, а не из cwd графического приложения.
+        let default = resolve_db_path_in(
+            None,
+            None,
+            Some("/home/runner"),
+            Some(Path::new("/")),
+            Some(Path::new("/data/adclicker")),
+        );
+        assert_eq!(default, PathBuf::from("/data/adclicker/adclicker.db"));
+
+        // Явный путь и env сильнее каталога демона.
+        let explicit = resolve_db_path_in(
+            Some("/explicit/adclicker.db"),
+            None,
+            None,
+            None,
+            Some(Path::new("/data/adclicker")),
+        );
+        assert_eq!(explicit, PathBuf::from("/explicit/adclicker.db"));
     }
 
     #[test]
@@ -384,6 +437,7 @@ mod tests {
             None,
             Some("/home/runner"),
             Some(Path::new("/cwd")),
+            None,
         );
         assert_eq!(
             home,
@@ -391,7 +445,7 @@ mod tests {
             "тильда разворачивается в HOME"
         );
 
-        let tilde_only = resolve_db_path_in(Some("~"), None, Some("/home/runner"), None);
+        let tilde_only = resolve_db_path_in(Some("~"), None, Some("/home/runner"), None, None);
         assert_eq!(tilde_only, PathBuf::from("/home/runner"));
 
         let dotted = resolve_db_path_in(
@@ -399,6 +453,7 @@ mod tests {
             None,
             None,
             Some(Path::new("/cwd")),
+            None,
         );
         assert_eq!(
             dotted,

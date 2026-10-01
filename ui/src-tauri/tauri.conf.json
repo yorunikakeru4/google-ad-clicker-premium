@@ -32,6 +32,15 @@
     "category": "Utility",
     "shortDescription": "Google Ad Clicker Premium desktop app",
     "longDescription": "Desktop UI for the Google Ad Clicker automation tool.",
+    "resources": [
+      "../../config.json",
+      "../../queries.txt",
+      "../../proxies.txt",
+      "../../user_agents.txt",
+      "../../domains.txt",
+      "../../domain_mapping.json",
+      "../../cookies.txt"
+    ],
     "externalBin": [
       "binaries/engine"
     ],
