@@ -17,9 +17,11 @@
     приложения переменная не задана, оно генерирует свой токен на каждый
     запуск и с этим демоном общей подписи не будет (401) — тогда задайте
     токен и в окружении приложения; без совпадения control API отвечает 401.
-  - Путь к бинарнику sidecar: внутри .app это Contents/MacOS/<имя бинарника>;
-    имя зависит от сборки (Tauri кладёт sidecar с учётом триплета) — сверьтесь
-    с фактическим содержимым Contents/MacOS после `tauri build`.
+  - Путь к бинарнику sidecar: внутри .app это Contents/MacOS/engine — триплет
+    остаётся в имени только в ui/src-tauri/binaries/, в бандл Tauri кладёт
+    файл без суффикса. Имя самого .app повторяет productName из
+    tauri.conf.json, сверьтесь с содержимым Contents/MacOS после
+    `tauri build`.
 
   KeepAlive + ThrottleInterval дают автозапуск при логине и рестарт при падении
   (план §11: «launchd plist: автозапуск при логине, KeepAlive, рестарт демона»).
@@ -31,7 +33,7 @@
 
     <key>ProgramArguments</key>
     <array>
-        <string>/Applications/Google Ad Clicker.app/Contents/MacOS/engine</string>
+        <string>/Applications/Google Ad Clicker Premium.app/Contents/MacOS/engine</string>
     </array>
 
     <key>WorkingDirectory</key>

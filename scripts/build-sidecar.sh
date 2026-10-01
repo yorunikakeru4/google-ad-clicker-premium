@@ -49,6 +49,17 @@ if ! "${PYTHON_BIN}" -m PyInstaller --version >/dev/null 2>&1; then
     exit 1
 fi
 
+# Preflight: PyInstaller пакует только то, что видит окружение сборки. Если
+# импорт демона здесь падает (например, в .venv нет psutil из
+# requirements.txt), бинарник всё равно соберётся — и упадёт на первом же
+# старте с ModuleNotFoundError. Ловим до 40 секунд сборки, а не после.
+if ! "${PYTHON_BIN}" -c "import engine.control_plane.daemon"; then
+    echo "ошибка: ${PYTHON_BIN} не может импортировать engine.control_plane.daemon" >&2
+    echo "  (собранный бинарник упал бы с той же ошибкой — см. выше)" >&2
+    echo "  для venv: .venv/bin/pip install -r requirements.txt" >&2
+    exit 1
+fi
+
 echo "==> triple:  ${triple}"
 echo "==> python:  $(${PYTHON_BIN} --version 2>&1) (${PYTHON_BIN})"
 echo "==> сборка:  PyInstaller bundle.spec (onefile, точка входа engine/bundle.py)"
