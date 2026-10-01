@@ -126,7 +126,11 @@ export function dbErrorMessage(error: unknown): string {
       const message = (error as { message?: unknown }).message;
       switch (kind) {
         case "DatabaseNotFound":
-          return `База данных не найдена: ${errorField(message, "path") ?? "путь неизвестен"}. Запустите движок — он создаст файл при первом запуске.`;
+          return (
+            `База данных не найдена: ${errorField(message, "path") ?? "путь неизвестен"} — ` +
+            "файл создаёт демон при первом запуске, а он стартует вместе с приложением. " +
+            "Если файла нет и через минуту, причина в баннере «нет связи»."
+          );
         case "OpenFailed":
           return `Не удалось открыть базу ${errorField(message, "path") ?? ""}: ${errorField(message, "reason") ?? "неизвестная причина"}`;
         case "ReadFailed":

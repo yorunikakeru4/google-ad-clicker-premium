@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import { createDaemonStatus } from "./useDaemonStatus";
+import { createDaemonStatus, type DaemonStatus } from "./useDaemonStatus";
+import { OFFLINE_AFTER_FAILURES } from "../lib/poll";
 import type { DaemonApi } from "../lib/daemonApi";
 import type { Health, StateSnapshot } from "../lib/types";
 
@@ -98,6 +99,20 @@ function fakeApi() {
 }
 
 describe("createDaemonStatus: тик опроса", () => {
+  /** Прогоняет `times` падающих тиков подряд — столько же нужно и бою. */
+  async function failTicks(
+    fake: ReturnType<typeof fakeApi>,
+    status: DaemonStatus,
+    times: number,
+    message: string,
+  ): Promise<void> {
+    for (let attempt = 0; attempt < times; attempt += 1) {
+      const tick = status.tick();
+      fake.failAll(message);
+      await tick;
+    }
+  }
+
   it("успешный тик переводит в online и отдаёт воркеров", async () => {
     const fake = fakeApi();
     const status = createDaemonStatus({ api: fake.api });
@@ -115,13 +130,28 @@ describe("createDaemonStatus: тик опроса", () => {
     status.stop();
   });
 
-  it("ошибка тика переводит в offline с читаемым текстом", async () => {
+  it("один сбой не объявляет офлайн: баннер не моргает при кратком сбое", async () => {
     const fake = fakeApi();
     const status = createDaemonStatus({ api: fake.api });
 
-    const tick = status.tick();
-    fake.failAll("не удалось подключиться к демону на 127.0.0.1:8787");
-    await tick;
+    await failTicks(fake, status, 1, "не удалось подключиться к демону на 127.0.0.1:8787");
+
+    expect(status.state.value.phase).not.toBe("offline");
+    expect(status.state.value.lastError).toContain("не удалось подключиться");
+
+    status.stop();
+  });
+
+  it(`${OFFLINE_AFTER_FAILURES} неудачных тика подряд переводят в offline`, async () => {
+    const fake = fakeApi();
+    const status = createDaemonStatus({ api: fake.api });
+
+    await failTicks(
+      fake,
+      status,
+      OFFLINE_AFTER_FAILURES,
+      "не удалось подключиться к демону на 127.0.0.1:8787",
+    );
 
     expect(status.state.value.phase).toBe("offline");
     expect(status.state.value.lastError).toContain("не удалось подключиться");
@@ -131,14 +161,16 @@ describe("createDaemonStatus: тик опроса", () => {
     status.stop();
   });
 
-  it("частичный ответ (жив health, упал state) — всё равно offline", async () => {
+  it("частичный ответ (жив health, упал state) — всё равно офлайн", async () => {
     const fake = fakeApi();
     const status = createDaemonStatus({ api: fake.api });
 
-    const tick = status.tick();
-    fake.failPath("/state", "таймаут ответа демона");
-    fake.settle();
-    await tick;
+    for (let attempt = 0; attempt < OFFLINE_AFTER_FAILURES; attempt += 1) {
+      const tick = status.tick();
+      fake.failPath("/state", "таймаут ответа демона");
+      fake.settle();
+      await tick;
+    }
 
     expect(status.state.value.phase).toBe("offline");
     expect(status.state.value.health).toBeNull();
@@ -171,13 +203,11 @@ describe("createDaemonStatus: тик опроса", () => {
     status.stop();
   });
 
-  it("восстановление после ошибки возвращает online", async () => {
+  it("восстановление после офлайна возвращает online", async () => {
     const fake = fakeApi();
     const status = createDaemonStatus({ api: fake.api });
 
-    const failing = status.tick();
-    fake.failAll("connection refused");
-    await failing;
+    await failTicks(fake, status, OFFLINE_AFTER_FAILURES, "connection refused");
     expect(status.state.value.phase).toBe("offline");
 
     const recovering = status.tick();

@@ -49,6 +49,7 @@ describe("createPollState", () => {
     const state = createPollState();
 
     expect(state.phase).toBe("idle");
+    expect(state.inflight).toBe(false);
     expect(state.seq).toBe(0);
     expect(state.lastOkAt).toBeNull();
     expect(state.lastError).toBeNull();
@@ -59,10 +60,11 @@ describe("createPollState", () => {
 });
 
 describe("reducePoll: begin", () => {
-  it("первый begin переводит в inflight и нумерует тик", () => {
+  it("первый begin поднимает inflight, не трогая фазу", () => {
     const state = reducePoll(createPollState(), { kind: "begin" });
 
-    expect(state.phase).toBe("inflight");
+    expect(state.inflight).toBe(true);
+    expect(state.phase).toBe("idle");
     expect(state.seq).toBe(1);
   });
 
@@ -86,8 +88,41 @@ describe("reducePoll: begin", () => {
 
     const next = reducePoll(done, { kind: "begin" });
 
-    expect(next.phase).toBe("inflight");
+    expect(next.inflight).toBe(true);
+    expect(next.phase).toBe("online");
     expect(next.seq).toBe(2);
+  });
+
+  it("тик в полёте не меняет фазу: баннер и чип не моргают на каждом опросе", () => {
+    // Регрессия: раньше «inflight» был фазой, и каждый успешный опрос на
+    // время запроса выглядел как «нет связи» — баннер мигал раз в секунду.
+    const online = reducePoll(reducePoll(createPollState(), { kind: "begin" }), {
+      kind: "success",
+      seq: 1,
+      health: health(),
+      snapshot: snapshot(),
+      at: 10,
+    });
+
+    const begun = reducePoll(online, { kind: "begin" });
+    expect(begun.inflight).toBe(true);
+    expect(begun.phase).toBe("online");
+
+    // И в офлайне повторная попытка не гасит баннер на время запроса.
+    let offline = online;
+    for (let seq = 2; seq <= 1 + OFFLINE_AFTER_FAILURES; seq += 1) {
+      offline = reducePoll(reducePoll(offline, { kind: "begin" }), {
+        kind: "failure",
+        seq,
+        error: "down",
+        at: seq * 10,
+      });
+    }
+    expect(offline.phase).toBe("offline");
+
+    const retry = reducePoll(offline, { kind: "begin" });
+    expect(retry.inflight).toBe(true);
+    expect(retry.phase).toBe("offline");
   });
 });
 
@@ -130,7 +165,8 @@ describe("reducePoll: success", () => {
     });
 
     expect(late).toBe(started);
-    expect(late.phase).toBe("inflight");
+    expect(late.inflight).toBe(true);
+    expect(late.phase).toBe("online");
     expect(late.health?.workers_total).toBe(2);
   });
 });
@@ -159,6 +195,7 @@ describe("reducePoll: failure", () => {
     const failed = failOneTick(onlineOnce(), 2);
 
     expect(failed.phase).toBe("online");
+    expect(failed.inflight).toBe(false);
     expect(failed.failures).toBe(1);
     // текст ошибки уже записан — он появится в баннере, если сбой продлится
     expect(failed.lastError).toBe("connection refused");
@@ -205,13 +242,16 @@ describe("reducePoll: failure", () => {
     expect(state.failures).toBe(1);
   });
 
-  it("первый тик без успешных ответов уходит в offline, но баннер всё равно скрыт", () => {
-    // баннер требует lastOkAt !== null, поэтому «offline до первого ответа»
-    // не мигает — фаза лишь разрешает следующий begin
+  it("первый тик без успешных ответов не рисует офлайн", () => {
+    // До первого ответа lastOkAt === null, и баннер скрыт в любом случае;
+    // фаза остаётся idle, чтобы «нет связи» не появлялось раньше первого
+    // же измерения.
     const failed = failOneTick(createPollState(), 1);
 
-    expect(failed.phase).toBe("offline");
+    expect(failed.phase).toBe("idle");
+    expect(failed.inflight).toBe(false);
     expect(failed.lastOkAt).toBeNull();
+    expect(failed.failures).toBe(1);
   });
 
   it("опоздавшая ошибка с чужим seq не трогает текущий тик", () => {
@@ -224,14 +264,15 @@ describe("reducePoll: failure", () => {
     });
 
     expect(lateFailure).toBe(started);
-    expect(lateFailure.phase).toBe("inflight");
+    expect(lateFailure.inflight).toBe(true);
+    expect(lateFailure.phase).toBe("idle");
   });
 
   it("после ошибки опрос продолжается", () => {
-    const offline = failOneTick(createPollState(), 1, "boom");
-    const next = reducePoll(offline, { kind: "begin" });
+    const failed = failOneTick(createPollState(), 1, "boom");
+    const next = reducePoll(failed, { kind: "begin" });
 
-    expect(next.phase).toBe("inflight");
+    expect(next.inflight).toBe(true);
     expect(next.seq).toBe(2);
   });
 });

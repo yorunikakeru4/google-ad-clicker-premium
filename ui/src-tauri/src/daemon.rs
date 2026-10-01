@@ -621,8 +621,18 @@ impl DaemonSupervisor {
     }
 }
 
+/// Это sidecar — замороженный onefile PyInstaller. Его запуск всегда
+/// состоит из двух процессов: обёртки, которая распаковывает и следит, и
+/// реального демона внутри (он и держит порт).
+fn is_sidecar_program(program: &str) -> bool {
+    Path::new(program)
+        .file_stem()
+        .is_some_and(|stem| stem == SIDECAR_NAME)
+}
+
 fn spawn_daemon(spec: &DaemonSpec) -> Result<Child, String> {
-    Command::new(&spec.program)
+    let mut command = Command::new(&spec.program);
+    command
         .args(&spec.args)
         .current_dir(&spec.cwd)
         .envs(spec.env.iter().cloned())
@@ -630,9 +640,45 @@ fn spawn_daemon(spec: &DaemonSpec) -> Result<Child, String> {
         .stdout(Stdio::null())
         // stderr наследуется намеренно: демон печатает туда только ошибки
         // конфигурации, и в dev-запуске их видно сразу.
-        .stderr(Stdio::inherit())
+        .stderr(Stdio::inherit());
+
+    // Sidecar получает собственную группу процессов: обёртка PyInstaller и
+    // реальный демон живут в одной группе, и остановка гасит её целиком.
+    // Без этого SIGTERM убивал только обёртку, реальный демон оставался
+    // сиротой с занятым портом, и следующий запуск падал с
+    // «Address already in use» (проверено живым прогоном).
+    //
+    // `python -m` в группу не уходит: процесс один, а выход из
+    // foreground-группы отрезал бы ему Ctrl-C в dev-запуске.
+    #[cfg(unix)]
+    if is_sidecar_program(&spec.program) {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+
+    command
         .spawn()
         .map_err(|error| format!("не удалось запустить {}: {error}", spec.program))
+}
+
+/// SIGTERM/SIGKILL процессу: его группе, если он её возглавляет, иначе ему.
+///
+/// Лидер группы — это sidecar (см. [`spawn_daemon`]): сигнал обязан дойти и
+/// до обёртки, и до реального демона. Для обычного python лидерства нет —
+/// `getpgid` вернёт группу приложения, и сигнал уходит только процессу,
+/// как и раньше.
+#[cfg(unix)]
+fn signal_process(pid: u32, signal: i32) {
+    let pid = pid as libc::pid_t;
+    // SAFETY: корректный pid у живого процесса; невалидные значения дают
+    // -1 с errno, а не неопределённое поведение.
+    unsafe {
+        if libc::getpgid(pid) == pid {
+            libc::kill(-pid, signal);
+        } else {
+            libc::kill(pid, signal);
+        }
+    }
 }
 
 /// Снятие флага ``monitor_alive`` при выходе монитора (в любом исходе).
@@ -799,13 +845,7 @@ fn apply(shared: &Shared, decision: ExitDecision) -> bool {
 /// ``cfg(unix)`` работает.
 fn terminate(child: &mut Child, grace: Duration) {
     #[cfg(unix)]
-    {
-        // SAFETY: корректный pid у живого процесса и сигнал SIGTERM.
-        // Невалидный pid даёт -1 и errno, а не неопределённое поведение.
-        unsafe {
-            libc::kill(child.id() as i32, libc::SIGTERM);
-        }
-    }
+    signal_process(child.id(), libc::SIGTERM);
 
     let deadline = Instant::now() + grace;
     loop {
@@ -820,6 +860,11 @@ fn terminate(child: &mut Child, grace: Duration) {
         thread::sleep(Duration::from_millis(10));
     }
 
+    // Дожили до выдержки: упреждающий SIGKILL группе (обёртка могла умереть
+    // от SIGTERM раньше реального демона), потом обычный kill на самого
+    // ребёнка — он же и репит статус.
+    #[cfg(unix)]
+    signal_process(child.id(), libc::SIGKILL);
     let _ = child.kill();
     let _ = child.wait();
 }
@@ -1195,6 +1240,79 @@ mod tests {
             Some("порт занят демоном с другим токеном")
         );
         supervisor.stop();
+    }
+
+    #[test]
+    fn sidecar_programs_are_recognized_by_name() {
+        // От имени зависит решение о собственной группе процессов.
+        assert!(is_sidecar_program(
+            "/Applications/App.app/Contents/MacOS/engine"
+        ));
+        assert!(is_sidecar_program(
+            "/repo/ui/src-tauri/target/release/engine"
+        ));
+        assert!(is_sidecar_program("engine.exe"));
+        assert!(!is_sidecar_program("python3"));
+        assert!(!is_sidecar_program("/nix/store/xyz-python3/bin/python3"));
+        assert!(!is_sidecar_program("/usr/bin/engined"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stopping_a_sidecar_kills_the_process_inside_it() {
+        use std::os::unix::fs::PermissionsExt;
+
+        // Имитация onefile PyInstaller: обёртка запускает реальный процесс
+        // и ждёт его. Именно так устроена боевая связка, и раньше SIGTERM
+        // одной обёртке оставлял сироту с занятым портом.
+        let dir = env::temp_dir().join(format!("adclicker-sidecar-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).expect("каталог создаётся");
+        let inner_pid_file = dir.join("inner.pid");
+        let wrapper = dir.join(SIDECAR_NAME);
+        fs::write(
+            &wrapper,
+            format!(
+                "#!/bin/sh\nsleep 60 & echo $! > {}\nwait\n",
+                inner_pid_file.display()
+            ),
+        )
+        .expect("скрипт пишется");
+        let mut mode = fs::metadata(&wrapper)
+            .expect("метаданные читаются")
+            .permissions();
+        mode.set_mode(0o755);
+        fs::set_permissions(&wrapper, mode).expect("chmod +x");
+
+        let path = env::var("PATH").unwrap_or_default();
+        let spec = DaemonSpec {
+            program: wrapper.display().to_string(),
+            args: Vec::new(),
+            cwd: dir.clone(),
+            env: vec![("PATH".to_string(), path)],
+        };
+
+        let mut child = spawn_daemon(&spec).expect("обёртка стартует");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let inner_pid: u32 = loop {
+            if let Ok(raw) = fs::read_to_string(&inner_pid_file) {
+                if let Ok(pid) = raw.trim().parse() {
+                    break pid;
+                }
+            }
+            assert!(Instant::now() < deadline, "внутренний процесс не появился");
+            thread::sleep(Duration::from_millis(20));
+        };
+
+        terminate(&mut child, Duration::from_secs(3));
+
+        assert!(!pid_alive(child.id()), "обёртка должна умереть");
+        assert!(
+            wait_until(Duration::from_secs(3), || !pid_alive(inner_pid)),
+            "внутренний демон обязан умереть вместе с обёрткой — иначе он займёт порт"
+        );
+
+        let _ = fs::remove_dir_all(&dir);
     }
 
     /// Бумажный .app-бандл с бинарником приложения и sidecar рядом с ним.

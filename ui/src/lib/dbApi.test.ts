@@ -28,7 +28,7 @@ describe("dbErrorMessage", () => {
     expect(dbErrorMessage(new Error("net down"))).toBe("net down");
   });
 
-  it("DatabaseNotFound: виден путь и подсказка про движок", () => {
+  it("DatabaseNotFound: виден путь и подсказка, кто создаёт файл", () => {
     const text = dbErrorMessage({
       kind: "DatabaseNotFound",
       message: { path: "/home/user/adclicker.db" },
@@ -36,6 +36,8 @@ describe("dbErrorMessage", () => {
 
     expect(text).toContain("/home/user/adclicker.db");
     expect(text).toContain("не найдена");
+    expect(text).toContain("демон");
+    expect(text).toContain("нет связи");
   });
 
   it("OpenFailed: видны путь и причину", () => {

@@ -4,10 +4,17 @@
 // отклоняется, а ответ с чужим seq (опоздавший после смены тика) игнорируется.
 // Без этого два тика в полёте перетирали бы состояние в произвольном порядке
 // и индикатор heartbeat мерцал бы между разными срезами.
+//
+// `inflight` и `phase` разделены намеренно. Раньше «тик в полёте» сам по себе
+// был фазой, из-за чего каждый успешный опрос на время сетевого запроса
+// выглядел как «нет связи»: баннер мигал ~раз в секунду, чип сбрасывался в
+// «нет данных», кнопки гасли с «демон недоступен». Теперь фаза — это последнее
+// **известное** состояние (idle | online | offline), а inflight — просто флаг
+// «ждём ответ», который ничего не говорит о доступности.
 
 import type { Health, StateSnapshot } from "./types";
 
-export type PollPhase = "idle" | "inflight" | "online" | "offline";
+export type PollPhase = "idle" | "online" | "offline";
 
 /**
  * Сколько неудачных тиков подряд, прежде чем считать демон офлайным.
@@ -20,7 +27,10 @@ export type PollPhase = "idle" | "inflight" | "online" | "offline";
 export const OFFLINE_AFTER_FAILURES = 3;
 
 export interface PollState {
+  /** Последнее известное состояние: idle — ответа ещё не было. */
   phase: PollPhase;
+  /** Ждём ответ текущего тика. Не влияет на phase. */
+  inflight: boolean;
   /** Номер последнего начатого тика. */
   seq: number;
   /** Эпоха в мс последнего успешного ответа; хранится и после офлайна. */
@@ -46,6 +56,7 @@ export type PollEvent =
 export function createPollState(): PollState {
   return {
     phase: "idle",
+    inflight: false,
     seq: 0,
     lastOkAt: null,
     lastError: null,
@@ -59,15 +70,16 @@ export function reducePoll(state: PollState, event: PollEvent): PollState {
   switch (event.kind) {
     case "begin":
       // Тик уже в полёте — второй не запускаем, состояние не трогаем.
-      if (state.phase === "inflight") return state;
-      return { ...state, phase: "inflight", seq: state.seq + 1 };
+      if (state.inflight) return state;
+      return { ...state, inflight: true, seq: state.seq + 1 };
 
     case "success": {
       // Ответ старого тика: не перетираем актуальное состояние.
-      if (event.seq !== state.seq || state.phase !== "inflight") return state;
+      if (event.seq !== state.seq || !state.inflight) return state;
       return {
         ...state,
         phase: "online",
+        inflight: false,
         lastOkAt: event.at,
         lastError: null,
         failures: 0,
@@ -77,20 +89,22 @@ export function reducePoll(state: PollState, event: PollEvent): PollState {
     }
 
     case "failure": {
-      if (event.seq !== state.seq || state.phase !== "inflight") return state;
+      if (event.seq !== state.seq || !state.inflight) return state;
       const failures = state.failures + 1;
-      const failed = { ...state, failures, lastError: event.error };
+      const failed = { ...state, inflight: false, failures, lastError: event.error };
 
-      // Ниже порога офлайн не объявляем: данные и вид остаются прежними,
-      // меняются только счётчик и текст ошибки. phase при этом обязан
-      // покинуть inflight, иначе следующий begin зависнет на старом тике.
-      if (failures < OFFLINE_AFTER_FAILURES) {
-        return { ...failed, phase: state.lastOkAt !== null ? "online" : "offline" };
-      }
+      // Ниже порога фазу не меняем: «online» значит «был на связи секунду
+      // назад», и баннер/чип/кнопки не должны моргать из-за одного сбоя.
+      if (failures < OFFLINE_AFTER_FAILURES) return failed;
 
       // Явный off-стан: данные чистим, чтобы не показывать устаревшее как
       // живое. lastOkAt сохраняется — по нему живёт «последний ответ».
-      return { ...failed, phase: "offline", health: null, snapshot: null };
+      return {
+        ...failed,
+        phase: "offline",
+        health: null,
+        snapshot: null,
+      };
     }
   }
 }

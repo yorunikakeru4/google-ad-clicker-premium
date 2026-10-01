@@ -194,13 +194,13 @@ describe("WorkersTable: состояния без строк", () => {
   });
 
   it("первый ответ ещё не пришёл — ожидание, а не «воркеров нет»", async () => {
-    for (const phase of ["idle", "inflight"] as const) {
-      const html = await table({ phase, snapshot: null });
+    // «в полёте» теперь не фаза: пока тик идёт, phase остаётся idle —
+    // таблица показывает ожидание, а не мигает между состояниями.
+    const html = await table({ phase: "idle", snapshot: null });
 
-      expect(html).toContain('data-test="workers-empty"');
-      expect(html).toContain("Ожидание первого ответа демона");
-      expect(html).not.toContain("Воркеров нет");
-      expect(html).not.toContain("NaN");
-    }
+    expect(html).toContain('data-test="workers-empty"');
+    expect(html).toContain("Ожидание первого ответа демона");
+    expect(html).not.toContain("Воркеров нет");
+    expect(html).not.toContain("NaN");
   });
 });
