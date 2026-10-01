@@ -893,11 +893,12 @@ class TestProfileSettings:
 
         driver, _ = webdriver.create_webdriver(PROXY, "Mozilla/5.0", "abcde")
 
-        # Квирк legacy зафиксирован намеренно: get_locale_language возвращает
-        # список, и в prefs/--lang он уходит через str() целиком.
+        # Квирк со списком убран осознанно: get_locale_language возвращает
+        # первую локаль, поэтому в prefs уходит чистое значение, а --lang —
+        # обрезанный до языка (раньше сюда уходил str() от списка).
         prefs = driver.options.experimental_options["prefs"]
-        assert prefs["intl.accept_languages"] == str(["de-DE", "en-US"])
-        assert "--lang=['de-DE', 'en-US']" in driver.options.arguments
+        assert prefs["intl.accept_languages"] == "de-DE"
+        assert "--lang=de" in driver.options.arguments
 
     def test_empty_profile_locale_keeps_the_geo_one(
         self,
@@ -915,8 +916,10 @@ class TestProfileSettings:
 
         driver, _ = webdriver.create_webdriver(PROXY, "Mozilla/5.0", "abcde")
 
+        # geo-локаль теперь строка (get_locale_language отдаёт первую),
+        # пустое поле профиля её не отменяет — как и раньше.
         prefs = driver.options.experimental_options["prefs"]
-        assert prefs["intl.accept_languages"] == str(["de-DE", "en-US"])
+        assert prefs["intl.accept_languages"] == "de-DE"
 
     def test_profile_locale_is_applied_without_the_geo_flag(
         self,
@@ -1074,7 +1077,8 @@ class TestProfileSettingsSeleniumBase:
 
         driver, _ = webdriver.create_webdriver(PROXY, "Mozilla/5.0", "abcde")
 
-        assert driver.init_kwargs["locale_code"] == str(["de-DE", "en-US"])
+        # та же правка, что в UC-ветке: geo-локаль — строка, а не список
+        assert driver.init_kwargs["locale_code"] == "de-DE"
 
     def test_without_the_geo_flag_and_without_profile_locale_code_is_none(
         self,

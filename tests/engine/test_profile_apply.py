@@ -166,7 +166,7 @@ class TestProfileIdFromEnviron:
 
 
 class TestResolveUserAgent:
-    """UA: профильный строкой, иначе случайный из user_agents.txt."""
+    """UA: профильный строкой, иначе фолбэк (дефолт прогона — None)."""
 
     def test_profile_value_wins_over_the_fallback(self):
         assert resolve_user_agent({"user_agent": "UA/Profile"}, "UA/Random") == "UA/Profile"
@@ -180,6 +180,13 @@ class TestResolveUserAgent:
 
     def test_no_profile_keeps_the_fallback(self):
         assert resolve_user_agent(None, "UA/Random") == "UA/Random"
+
+    @pytest.mark.parametrize("value", [None, "", "   "])
+    def test_empty_profile_value_with_none_fallback_means_no_override(self, value):
+        assert resolve_user_agent({"user_agent": value}, None) is None
+
+    def test_no_profile_with_none_fallback_means_no_override(self):
+        assert resolve_user_agent(None, None) is None
 
     def test_whitespace_around_the_profile_value_is_trimmed(self):
         assert resolve_user_agent({"user_agent": " UA/Profile "}, "x") == "UA/Profile"

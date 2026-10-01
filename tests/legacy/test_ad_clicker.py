@@ -265,51 +265,49 @@ def assign_profile(tmp_path, monkeypatch):
 
 
 class TestProfileUserAgent:
-    """UA прогона: назначенный профиль главнее случайного user-agent."""
+    """UA прогона: подмена только явная — строка профиля.
 
-    def test_profile_user_agent_wins_over_the_random_one(
-        self, assign_profile, capture_user_agent, monkeypatch
+    Без профиля в create_webdriver уходит None, и Chrome отдаёт честную
+    строку: прежний подбор ставил в --user-agent устаревшие и мобильные
+    UA («Chrome/136 при браузере 153»), которые сервер читает вместе с
+    Sec-CH-UA и считает браузером подделкой.
+    """
+
+    def test_profile_user_agent_reaches_the_browser(
+        self, assign_profile, capture_user_agent
     ):
         assign_profile(user_agent="UA/Profile")
-        monkeypatch.setattr(ad_clicker, "get_random_user_agent_string", lambda: "UA/Random")
 
         with pytest.raises(StopBeforeBrowser):
             ad_clicker.run_scenario(query="usb hub")
 
         assert capture_user_agent["user_agent"] == "UA/Profile"
 
-    def test_without_a_profile_the_random_user_agent_is_used(
-        self, capture_user_agent, monkeypatch
-    ):
-        monkeypatch.delenv("ADCLICKER_PROFILE_ID", raising=False)
-        monkeypatch.setattr(ad_clicker, "get_random_user_agent_string", lambda: "UA/Random")
-
+    def test_without_a_profile_no_user_agent_is_passed(self, capture_user_agent):
         with pytest.raises(StopBeforeBrowser):
             ad_clicker.run_scenario(query="usb hub")
 
-        assert capture_user_agent["user_agent"] == "UA/Random"
+        assert capture_user_agent["user_agent"] is None
 
-    def test_empty_profile_user_agent_falls_back_to_the_random_one(
-        self, assign_profile, capture_user_agent, monkeypatch
+    def test_empty_profile_user_agent_means_no_override(
+        self, assign_profile, capture_user_agent
     ):
         assign_profile(user_agent="   ")
-        monkeypatch.setattr(ad_clicker, "get_random_user_agent_string", lambda: "UA/Random")
 
         with pytest.raises(StopBeforeBrowser):
             ad_clicker.run_scenario(query="usb hub")
 
-        assert capture_user_agent["user_agent"] == "UA/Random"
+        assert capture_user_agent["user_agent"] is None
 
-    def test_profile_without_a_user_agent_keeps_the_random_one(
-        self, assign_profile, capture_user_agent, monkeypatch
+    def test_profile_without_a_user_agent_means_no_override(
+        self, assign_profile, capture_user_agent
     ):
         assign_profile(locale="de-DE")
-        monkeypatch.setattr(ad_clicker, "get_random_user_agent_string", lambda: "UA/Random")
 
         with pytest.raises(StopBeforeBrowser):
             ad_clicker.run_scenario(query="usb hub")
 
-        assert capture_user_agent["user_agent"] == "UA/Random"
+        assert capture_user_agent["user_agent"] is None
 
 
 class TestDiagnosticsCheckpoint:
@@ -401,9 +399,6 @@ class TestScenarioCheckpoints:
     ):
         monkeypatch.setattr(
             ad_clicker, "create_webdriver", lambda *args, **kwargs: (fake_driver, None)
-        )
-        monkeypatch.setattr(
-            ad_clicker, "get_random_user_agent_string", lambda: "UA/Random"
         )
 
         completed = ad_clicker.run_scenario(query="usb hub")

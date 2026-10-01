@@ -150,18 +150,24 @@ def current_profile() -> dict[str, Any] | None:
 # --- приоритеты настроек ------------------------------------------------------
 
 
-def resolve_user_agent(profile: Mapping[str, Any] | None, fallback: str) -> str:
-    """UA профиля, если задан, иначе фолбэк (случайный UA как раньше)."""
+def resolve_user_agent(profile: Mapping[str, Any] | None, fallback: str | None) -> str | None:
+    """UA профиля, если задан, иначе фолбэк.
+
+    Фолбэк ``None`` — дефолт прогона: без профиля UA не подменяется вовсе
+    и Chrome отдаёт честную строку, согласованную с Sec-CH-UA (см.
+    ``create_webdriver``). Непустой фолбэк — осознанная подмена (строка
+    профиля, ручной запуск).
+    """
     return _profile_field(profile, "user_agent") or fallback
 
 
 def resolve_locale(profile: Mapping[str, Any] | None, geo_locale: Any) -> Any:
     """Локаль профиля, если задана, иначе гео-значение.
 
-    Фолбэк возвращается как есть, в том числе списком локалей из
-    ``utils.get_locale_language``: legacy складывает его в ``str()`` для
-    ``intl.accept_languages``, и менять тип здесь значило бы менять его
-    поведение.
+    Гео-значение приходит строкой (``utils.get_locale_language`` возвращает
+    первую локаль); ``Any`` сохранён, чтобы пропускать как есть и списки из
+    старых источников — ``str()`` в ``_apply_locale`` обрабатывает оба
+    формата, и менять это значило бы менять поведение для старых конфигов.
     """
     return _profile_field(profile, "locale") or geo_locale
 

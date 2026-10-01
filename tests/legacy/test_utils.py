@@ -271,16 +271,16 @@ def test_get_user_agents_exits_when_file_is_missing(tmp_path):
 # --- get_locale_language ----------------------------------------------------------
 
 
-def test_get_locale_language_returns_list_for_known_country():
-    assert utils.get_locale_language("US") == ["en-US", "en"]
+def test_get_locale_language_returns_primary_locale_for_known_country():
+    assert utils.get_locale_language("US") == "en-US"
 
 
-def test_get_locale_language_keeps_all_locales_for_multilingual_country():
-    assert utils.get_locale_language("AF") == ["ps-AF", "uz-AF"]
+def test_get_locale_language_returns_first_locale_for_multilingual_country():
+    assert utils.get_locale_language("AF") == "ps-AF"
 
 
 def test_get_locale_language_falls_back_to_english_for_unknown_country():
-    assert utils.get_locale_language("ZZ") == ["en"]
+    assert utils.get_locale_language("ZZ") == "en"
 
 
 def test_get_locale_language_falls_back_to_module_dir_when_cwd_has_no_file(
@@ -291,7 +291,7 @@ def test_get_locale_language_falls_back_to_module_dir_when_cwd_has_no_file(
     # лежит в бандле sidecar).
     (isolated_cwd / "country_to_locale.json").unlink()
 
-    assert utils.get_locale_language("US") == ["en-US", "es-US"], (
+    assert utils.get_locale_language("US") == "en-US", (
         "значения должны прийти из настоящего country_to_locale.json рядом с utils.py"
     )
 

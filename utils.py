@@ -709,7 +709,7 @@ def get_locale_language(country_code: str) -> str:
     :type country_code: str
     :param country_code: Country code for proxy IP
     :rtype: str
-    :returns: Locale language for the given country code
+    :returns: Primary locale for the given country code (напр. ``"de-DE"``)
     """
 
     log.debug("browser", "Getting locale language...", fields={"country_code": country_code})
@@ -729,15 +729,18 @@ def get_locale_language(country_code: str) -> str:
     with open(locales_path, "r", encoding="utf-8") as locales_file:
         locales = json.load(locales_file)
 
-    locale_language = locales.get(country_code, ["en"])
+    # Список → первая локаль: str(list) уходил в prefs и в --lang как
+    # "['de-DE']" (и в --lang=['de-DE'] при срезе [:2]), а поле Accept-Language
+    # в снимке диагностики выглядело как массив. Пустой список — английский.
+    locales_list = locales.get(country_code) or ["en"]
 
     log.debug(
         "browser",
         "Locale language code",
-        fields={"country_code": country_code, "language": locale_language[0]},
+        fields={"country_code": country_code, "language": locales_list[0]},
     )
 
-    return locale_language
+    return locales_list[0]
 
 
 def resolve_redirect(url: str) -> str:

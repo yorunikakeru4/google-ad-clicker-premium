@@ -77,6 +77,39 @@ CAPTCHA_SOLVE_SESSION_LIMIT = 5
 # legacy-ввод/вывод: config.json, logs/, clicklogs.db), уже в .gitignore.
 CAPTCHA_SCREENSHOT_DIR = Path("engine/screenshots")
 
+# --- cookie-баннер: только кнопка согласия -----------------------------------
+
+# Подстроки текста кнопки согласия Google (сравнение casefold). Старое
+# поведение кликало все <button> подряд — в логе живого прогона были видны
+# клики по голосовому поиску, выбору языка и дудлам, после чего страница
+# оставалась в непредсказуемом состоянии и поле поиска становилось
+# неинтерактивным (element not interactable на By.NAME 'q').
+_CONSENT_TEXT_HINTS = (
+    "akzeptieren",  # de: "Alle akzeptieren"
+    "accept",  # en: "Accept all"
+    "accepter",  # fr: "Tout accepter"
+    "aceptar",  # es: "Aceptar todo"
+    "aceitar",  # pt: "Aceitar todos"
+    "accetta",  # it: "Accetta tutto"
+    "aanvaarden",  # nl
+    "akcept",  # pl
+    "priimti",  # lt: "Priimti viską"
+)
+
+# JS-фолбэк ввода запроса: значение + события input/change + сабмит формы.
+# Срабатывает, когда send_keys упал (неинтерактивное/перекрытое поле) —
+# иначе поиск не отправляется никогда, а раунд умирает без причины.
+_JS_TYPE_FALLBACK = """
+const el = arguments[0];
+el.focus();
+el.value = arguments[1];
+el.dispatchEvent(new Event('input', {bubbles: true}));
+el.dispatchEvent(new Event('change', {bubbles: true}));
+if (el.form) {
+  if (el.form.requestSubmit) { el.form.requestSubmit(); } else { el.form.submit(); }
+}
+"""
+
 
 LinkElement = selenium.webdriver.remote.webelement.WebElement
 AdList = list[tuple[LinkElement, str, str]]
@@ -987,64 +1020,56 @@ class SearchController:
         return non_ad_links
 
     def _close_cookie_dialog(self) -> None:
-        """If cookie dialog is opened, close it by accepting"""
+        """Закрыть cookie-баннер кнопкой согласия — и только ею.
+
+        Кликнется ровно одна кнопка с текстом согласия (см.
+        ``_CONSENT_TEXT_HINTS``); никакого обхода «все кнопки подряд».
+        Старое поведение кликало голосовой поиск, выбор языка и дудлы
+        (видно в логе живого прогона), после чего поле поиска становилось
+        неинтерактивным и запрос никогда не отправлялся.
+        """
 
         log.debug("browser", "Waiting for cookie dialog...")
 
         sleep(get_random_sleep(3, 3.5) * config.behavior.wait_factor)
 
-        all_links = [
+        links = (
             element.get_attribute("href")
             for element in self._driver.find_elements(By.TAG_NAME, "a")
-            if isinstance(element.get_attribute("href"), str)
-        ]
-
-        for link in all_links:
-            if "policies.google.com" in link:
-                buttons = self._driver.find_elements(*self.COOKIE_DIALOG_BUTTON)[6:-2]
-                if len(buttons) < 6:
-                    buttons = self._driver.find_elements(*self.COOKIE_DIALOG_BUTTON)
-
-                for button in buttons:
-                    try:
-                        if (
-                            button.get_attribute("role") != "link"
-                            and button.get_attribute("style") != "display:none"
-                        ):
-                            log.debug(
-                                "browser",
-                                "Clicking button",
-                                fields={"html": button.get_attribute("outerHTML")},
-                            )
-                            self._driver.execute_script(
-                                "arguments[0].scrollIntoView(true);", button
-                            )
-                            sleep(get_random_sleep(0.5, 1) * config.behavior.wait_factor)
-                            button.click()
-                            sleep(get_random_sleep(1, 1.5) * config.behavior.wait_factor)
-
-                            try:
-                                search_input_box = self._driver.find_element(*self.SEARCH_INPUT)
-                                if not search_input_box.get_attribute("value"):
-                                    self._type_humanlike(search_input_box, self._search_query)
-                                    break
-                            except (
-                                ElementNotInteractableException,
-                                StaleElementReferenceException,
-                            ):
-                                pass
-
-                    except (
-                        ElementNotInteractableException,
-                        ElementClickInterceptedException,
-                        StaleElementReferenceException,
-                    ):
-                        pass
-
-                sleep(get_random_sleep(1, 1.5) * config.behavior.wait_factor)
-                break
-        else:
+        )
+        if not any(isinstance(link, str) and "policies.google.com" in link for link in links):
             log.debug("browser", "No cookie dialog found! Continue with search...")
+            return
+
+        for button in self._driver.find_elements(*self.COOKIE_DIALOG_BUTTON):
+            text = (button.text or "").strip().casefold()
+            if not text or not any(hint in text for hint in _CONSENT_TEXT_HINTS):
+                continue
+            if button.get_attribute("role") == "link":
+                continue
+
+            try:
+                log.debug("browser", "Accepting cookies", fields={"button": text})
+                self._driver.execute_script("arguments[0].scrollIntoView(true);", button)
+                sleep(get_random_sleep(0.5, 1) * config.behavior.wait_factor)
+                button.click()
+                sleep(get_random_sleep(1, 1.5) * config.behavior.wait_factor)
+            except (
+                ElementNotInteractableException,
+                ElementClickInterceptedException,
+                StaleElementReferenceException,
+            ) as exp:
+                log.debug(
+                    "browser",
+                    "Consent button is not clickable",
+                    fields={"button": text, "error": str(exp)},
+                )
+            # Одна попытка на весь баннер: остальные кнопки не трогаем ни
+            # при успехе, ни при неудаче — страница не должна меняться в
+            # непредсказуемом виде.
+            return
+
+        log.debug("browser", "No consent button seen; dialog left untouched")
 
     def _is_scroll_at_the_end(self) -> bool:
         """Check if scroll is at the end
@@ -1817,16 +1842,54 @@ class SearchController:
             # if no not now or continue button exists, send ESC to page to close the dialog
             self._driver.find_element(By.TAG_NAME, "body").send_keys(Keys.ESCAPE)
 
+    def _wait_element_clickable(self, element, timeout_s: float) -> bool:
+        """Ждать, пока элемент станет видимым и включённым.
+
+        Свой цикл вместо ``EC.element_to_be_clickable``: тот принимает
+        настоящий WebElement, а здесь элемент приходит извне (и в тестах —
+        заглушка), и попытка трактовать его как локатор кончается TypeError.
+        Нет методов видимости — считаем элемент кликабельным и отдаём
+        инициативу ``send_keys``; протухший элемент — отказ.
+        """
+        deadline = time.monotonic() + timeout_s
+        while True:
+            try:
+                if element.is_displayed() and element.is_enabled():
+                    return True
+            except StaleElementReferenceException:
+                return False
+            except AttributeError:
+                return True
+            if time.monotonic() >= deadline:
+                return False
+            sleep(0.2)
+
     def _type_humanlike(
         self, element: selenium.webdriver.remote.webelement.WebElement, text: str
     ) -> None:
-        """Type text slowly like a human
+        """Ввести запрос и отправить его; отказ — исключением, а не молчанием.
+
+        Раньше любой сбой здесь глотался в ``log.debug``, запрос не
+        отправлялся никогда, а раунд умирал дальше без причины — с
+        «Timed out waiting for results!» вместо «поле неинтерактивно»
+        (живой прогон на маке). Теперь:
+
+        1. поле доводится до кликабельного (скролл/ожидание внутри EC);
+        2. обычный набор посимвольно + ENTER;
+        3. при сбое — JS-фолбэк: value + события input/change + сабмит
+           формы (``_JS_TYPE_FALLBACK``);
+        4. если и это не вышло — явное исключение, чтобы в логе сценария
+           стояла настоящая причина.
 
         :type element: selenium.webdriver.remote.webelement.WebElement
         :param element: Element to type into
         :type text: str
         :param text: Text to type
         """
+
+        if not self._wait_element_clickable(element, timeout_s=7):
+            log.error("click", "Search box never became clickable")
+            raise RuntimeError("поле поиска не стало кликабельным за 7 с")
 
         try:
             element.clear()
@@ -1836,9 +1899,21 @@ class SearchController:
                 sleep(get_random_sleep(0.05, 0.15) * config.behavior.wait_factor)
 
             element.send_keys(Keys.ENTER)
+            return
 
         except Exception as exp:
-            log.debug("click", "Error while typing", fields={"error": str(exp)})
+            log.debug(
+                "click",
+                "Direct typing failed, falling back to JS",
+                fields={"error": str(exp)},
+            )
+
+        try:
+            self._driver.execute_script(_JS_TYPE_FALLBACK, element, text)
+            log.debug("click", "Query submitted via JS fallback")
+        except Exception as exp:
+            log.error("click", "Typing the query failed", fields={"error": str(exp)})
+            raise RuntimeError(f"не удалось ввести запрос: {exp}") from exp
 
     def set_browser_id(self, browser_id: Optional[int] = None) -> None:
         """Set browser id in stats if multiple browsers are used

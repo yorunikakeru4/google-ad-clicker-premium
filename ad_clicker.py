@@ -19,7 +19,6 @@ from logger import update_log_formats
 from proxy import get_proxies
 from search_controller import SearchController
 from utils import (
-    get_random_user_agent_string,
     get_domains,
     take_screenshot,
     generate_click_report,
@@ -165,10 +164,12 @@ def run_scenario(
 
     domains = get_domains()
 
-    # UA назначённого профиля главнее случайного; без профиля (и с пустым
-    # полем) фолбэк ровно тот же, что и раньше — get_random_user_agent_string.
+    # UA применяется только из профиля. Без профиля фолбэк None: Chrome
+    # отдаёт честную строку — прежний подбор ставил в --user-agent устаревшие
+    # и мобильные UA («Chrome/136 при браузере 153»), которые сервер читает
+    # вместе с Sec-CH-UA и считает браузером подделкой.
     profile = current_profile()
-    user_agent = resolve_user_agent(profile, get_random_user_agent_string())
+    user_agent = resolve_user_agent(profile, None)
     if profile is not None:
         log.debug("browser", "Profile applied", fields={"profile_id": profile["id"]})
 

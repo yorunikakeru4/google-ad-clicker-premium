@@ -327,16 +327,17 @@ def _debugger_address_of(driver) -> str | None:
 def _apply_locale(chrome_options, lang: Optional[object]) -> None:
     """Поставить локаль в опции Chrome. None — нечего применять.
 
-    Форма строк сохранена до буквы: legacy складывает список локалей из
-    ``get_locale_language`` через ``str()`` в prefs и обрезает его в ``--lang``
-    как есть, а профильная локаль приходит строкой. Менять это значило бы
-    менять поведение для старых конфигов (см. тесты паритета).
+    Основной вход — строка (``"de-DE"``): ``get_locale_language`` возвращает
+    первую локаль, поэтому в prefs уходит чистое значение, а ``--lang``
+    обрезается до языка (``lang[:2]``). ``str()`` и обработка списка
+    сохранены для старых форматов (профильные значения, legacy-конфиги;
+    см. тесты паритета).
     """
 
     if lang is None:
         return
     chrome_options.add_experimental_option("prefs", {"intl.accept_languages": str(lang)})
-    chrome_options.add_argument(f"--lang={lang[:2]}")
+    chrome_options.add_argument(f"--lang={str(lang)[:2]}")
 
 
 def _override_timezone(driver, timezone: object, fields: Optional[dict] = None) -> None:
@@ -393,6 +394,21 @@ def _maximize_with_fallback(driver) -> None:
         )
 
 
+def _log_actual_user_agent(driver) -> None:
+    """Залогировать UA, который реально видит страница.
+
+    Override без профиля больше не применяется, поэтому в лог должна идти
+    честная строка Chrome — подобранный (и не используемый) кандидат из
+    ``get_random_user_agent_string`` противоречил бы снимку диагностики.
+    """
+    try:
+        actual = driver.execute_script("return navigator.userAgent")
+    except Exception as exp:
+        log.debug("browser", "user_agent unavailable", fields={"error": str(exp)})
+        return
+    log.debug("browser", "user_agent", fields={"user_agent": actual})
+
+
 def create_webdriver(
     proxy: str, user_agent: Optional[str] = None, plugin_folder_name: Optional[str] = None
 ) -> tuple[undetected_chromedriver.Chrome, Optional[str]]:
@@ -401,7 +417,10 @@ def create_webdriver(
     :type proxy: str
     :param proxy: Proxy to use in ip:port or user:pass@host:port format
     :type user_agent: str
-    :param user_agent: User agent string
+    :param user_agent: Явная подмена UA (только строка профиля). ``None`` —
+        Chrome отдаёт честную строку: безусловный override давал
+        «Chrome/136 при браузере 153» и мобильные CriOS-строки на
+        десктопе, оба случая читаются сервером уже по Sec-CH-UA-*
     :type plugin_folder_name: str
     :param plugin_folder_name: Plugin folder name for proxy
     :rtype: tuple
@@ -448,7 +467,10 @@ def create_webdriver(
     chrome_options.add_argument("--dns-prefetch-disable")
     chrome_options.add_argument("--allow-running-insecure-content")
     chrome_options.add_argument("--disable-search-engine-choice-screen")
-    chrome_options.add_argument(f"--user-agent={user_agent}")
+    if user_agent:
+        # Подмена только явная (профиль): дефолт None → честная строка
+        # браузера, согласованная с клиентскими подсказками Sec-CH-UA.
+        chrome_options.add_argument(f"--user-agent={user_agent}")
 
     if IS_POSIX:
         chrome_options.add_argument("--disable-setuid-sandbox")
@@ -718,6 +740,7 @@ def create_seleniumbase_driver(
         locale_code=str(lang) if lang is not None else None,
         user_data_dir=str(profile_dir),
     )
+    _log_actual_user_agent(driver)
 
     if proxy and transport == PROXY_TRANSPORT_CDP_AUTH and credentials is not None:
         # Тот же механизм, что и в UC-ветке: DevTools-порт берётся из
@@ -731,6 +754,8 @@ def create_seleniumbase_driver(
         )
         if manager is not None:
             attach_proxy_auth(driver, manager)
+
+    _log_actual_user_agent(driver)
 
     # set geolocation and timezone if available
     if proxy and lat and long:
