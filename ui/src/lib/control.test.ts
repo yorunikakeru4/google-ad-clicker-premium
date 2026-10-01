@@ -404,6 +404,18 @@ describe("apiErrorMessage", () => {
   it("пустое тело — только HTTP-код", () => {
     expect(apiErrorMessage(500, "")).toBe("HTTP 500");
   });
+
+  it("401 объясняет, что на порту демон с другим токеном", () => {
+    const body = JSON.stringify({
+      error: { code: "unauthorized", message: "неверный токен" },
+    });
+
+    const message = apiErrorMessage(401, body);
+
+    expect(message).toContain("неверный токен");
+    expect(message).toContain("другим ADCLICKER_CONTROL_TOKEN");
+    expect(message).toContain("lsof -nP -iTCP:8787");
+  });
 });
 
 describe("errorMessage", () => {

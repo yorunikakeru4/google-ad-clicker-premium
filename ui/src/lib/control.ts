@@ -331,6 +331,19 @@ export function disabledReason(
  * код и начало тела для диагностики.
  */
 export function apiErrorMessage(status: number, body: string): string {
+  const base = describeApiError(status, body);
+  // 401 на первом запуске — самая частая и самая непонятная ситуация: токен
+  // у приложения есть, но на порту стоит демон с другим (терминальный,
+  // launchd, сирота от прежнего запуска). Без подсказки остаётся только
+  // «неверный токен», а при этом приложение вовсе не показывает демон.
+  return status === 401
+    ? `${base} — на порту демон с другим ADCLICKER_CONTROL_TOKEN: найдите его` +
+        " (lsof -nP -iTCP:8787 -sTCP:LISTEN) и остановите либо задайте тот же токен приложению"
+    : base;
+}
+
+/** Текст ошибки без пояснения для 401 — тело демона или HTTP-код. */
+function describeApiError(status: number, body: string): string {
   if (body) {
     try {
       const parsed: unknown = JSON.parse(body);
