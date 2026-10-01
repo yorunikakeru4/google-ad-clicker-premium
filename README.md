@@ -99,6 +99,17 @@ See [here](https://github.com/coskundeniz/ad_clicker/wiki/Setup-for-Windows) for
     The daemon supervises `python -m engine.worker` processes itself; start a worker by hand only for debugging.
 * Run `python ad_clicker.py` for a single run with a single browser, outside the daemon.
 * Run the Tauri desktop UI (settings, control buttons) with `cd ui && pnpm tauri dev`.
+* Build the installable desktop app (`.app`/`.dmg` on macOS, `.deb`/`.rpm`/
+  AppImage on Linux): build the sidecar first (`nix develop --command bash
+  scripts/build-sidecar.sh`, or `scripts/bootstrap-venv.sh` + `PYTHON_BIN=.venv/bin/python
+  scripts/build-sidecar.sh` without nix), then `cd ui && pnpm tauri build`.
+  The bundle lands in `ui/src-tauri/target/release/bundle/`.
+
+    The packaged app needs no environment: on launch it generates the control
+    token itself, spawns the bundled `engine` sidecar, and looks for
+    `config.json` in the app data directory
+    (`~/Library/Application Support/Google Ad Clicker` on macOS) because a
+    Finder launch has no project tree above its working directory.
 * Run `python ad_clicker.py --report_clicks` for generating click report.
 * Run `python ad_clicker.py --report_clicks --date` for generating click report for the given date in DD-MM-YYYY format.
 * Run `python ad_clicker.py --report_clicks --excel` for generating click report and writing results to an Excel file.

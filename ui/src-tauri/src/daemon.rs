@@ -25,8 +25,17 @@
 //!    детерминированно: либо `stop()` забрал и гасит сам, либо монитор увидел
 //!    флаг остановки ещё до регистрации и убил ребёнка сам.
 //!
-//! Сборка демона как Tauri sidecar (`bundle.externalBin` + PyInstaller)
-//! отложена в фазу 11; здесь работает dev-путь — команда из окружения.
+//! Две точки входа, и выбор между ними делается при сборке спецификации:
+//!
+//! - dev-путь (`pnpm tauri dev`) спавнит `python3 -m engine.control_plane.daemon`
+//!   из исходников — рядом с бинарником лежит скопированный tauri sidecar, но
+//!   он заморожен, и правки в `engine/` до него не доходят;
+//! - упакованный .app спавнит сам sidecar (`bundle.externalBin` + PyInstaller):
+//!   исходников рядом нет, а `python3` из минимального PATH Finder'а — заглушка
+//!   Command Line Tools.
+//!
+//! Рабочий каталог ищется так же, как раньше, но с фолбэком на каталог данных
+//! приложения: из Finder `cwd` — это `/`, и подниматься оттуда некуда.
 
 use std::collections::HashMap;
 use std::env;
@@ -37,8 +46,17 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-/// Python, которым стартует демон. Переопределяется `ADCLICKER_DAEMON_PYTHON`.
+/// Python, которым стартует демон в dev-режиме. Переопределяется
+/// `ADCLICKER_DAEMON_PYTHON`; в упакованном запуске его заменяет sidecar
+/// ([`SIDECAR_NAME`]), если бинарник лежит рядом с приложением.
 pub const DEFAULT_PYTHON: &str = "python3";
+
+/// Имя sidecar-бинарника движка рядом с исполняемым файлом приложения.
+///
+/// В .app это `Contents/MacOS/engine`: Tauri снимает target-triple-суффикс
+/// с файла из `bundle.externalBin` при укладке в бандл (то же имя, что в
+/// launchd plist).
+pub const SIDECAR_NAME: &str = "engine";
 
 /// Аргументы по умолчанию — модуль control plane из корня репозитория.
 pub const DEFAULT_ARGS: &[&str] = &["-m", "engine.control_plane.daemon"];
@@ -46,6 +64,11 @@ pub const DEFAULT_ARGS: &[&str] = &["-m", "engine.control_plane.daemon"];
 /// Файл, по которому ищется корень проекта: демону нужен каталог, в котором
 /// лежат `config.json` и `queries.txt`.
 const PROJECT_MARKER: &str = "config.json";
+
+/// Каталог данных приложения: куда установка кладёт `config.json` и
+/// остальные файлы, которые legacy читает из cwd. macOS-имя совпадает с
+/// `WorkingDirectory` в launchd plist.
+const APP_DATA_DIR_NAME: &str = "Google Ad Clicker";
 
 /// Сколько уровней вверх разрешается подниматься при поиске корня проекта.
 const MAX_ROOT_SEARCH_UP: usize = 8;
@@ -194,6 +217,94 @@ pub fn find_project_root_within(start: &Path, max_up: usize) -> Option<PathBuf> 
     None
 }
 
+/// Значение переменной: без окаймляющих пробелов и без пустых строк.
+///
+/// Одна точка для всех `ADCLICKER_DAEMON_*` и путей: разные ветки читали бы
+/// env по-разному, а «пробелы вокруг» не должны менять поведение.
+fn env_value<'a>(vars: &'a HashMap<String, String>, key: &str) -> Option<&'a str> {
+    vars.get(key)
+        .map(|value| value.trim())
+        .filter(|value| !value.is_empty())
+}
+
+/// Каталог данных приложения — фолбэк рабочего каталога демона.
+///
+/// Установка кладёт туда `config.json`/`queries.txt` (в macOS-установке это
+/// `~/Library/Application Support/Google Ad Clicker`, тот же каталог, что
+/// `WorkingDirectory` в launchd plist). Без фолбэка запуск из Finder падал
+/// бы с «не найден config.json»: cwd графического приложения — `/`, и
+/// подниматься оттуда некуда.
+///
+/// `macos` — параметр, а не `cfg!`: ветки различаются только базовым
+/// каталогом, иначе тест на Linux не проверил бы macOS-путь.
+fn app_data_dir(vars: &HashMap<String, String>, macos: bool) -> Option<PathBuf> {
+    let home = env_value(vars, "HOME");
+    if macos {
+        return Some(
+            Path::new(home?)
+                .join("Library/Application Support")
+                .join(APP_DATA_DIR_NAME),
+        );
+    }
+    let base = match env_value(vars, "XDG_DATA_HOME") {
+        Some(xdg) => PathBuf::from(xdg),
+        None => Path::new(home?).join(".local/share"),
+    };
+    Some(base.join(APP_DATA_DIR_NAME))
+}
+
+/// Путь к sidecar-бинарнику рядом с исполняемым файлом приложения, если файл
+/// там лежит. В macOS-бандле это `Contents/MacOS/engine`.
+fn sidecar_next_to(exe: &Path) -> Option<PathBuf> {
+    let mut candidate = exe.parent()?.join(SIDECAR_NAME);
+    if cfg!(windows) {
+        candidate.set_extension("exe");
+    }
+    candidate.is_file().then_some(candidate)
+}
+
+/// Упакованный запуск: бинарник лежит внутри .app-бандла macOS.
+fn in_macos_bundle(exe: &Path) -> bool {
+    exe.to_string_lossy().contains(".app/Contents/MacOS/")
+}
+
+/// Программа и её аргументы по умолчанию, когда `ADCLICKER_DAEMON_PYTHON`
+/// не задан.
+///
+/// sidecar выбирается только если он рядом с бинарником **и** запуск идёт из
+/// .app (или исходников не видно). Второе условие обязательно: рядом с
+/// dev-бинарником лежит скопированный tauri'ем замороженный sidecar, и если
+/// пустить его в ход, правки в `engine/` перестанут доходить до демона.
+fn default_launch(exe: Option<&Path>, source_root_found: bool) -> (String, Vec<String>) {
+    let sidecar = exe
+        .and_then(sidecar_next_to)
+        .filter(|_| exe.is_some_and(in_macos_bundle) || !source_root_found);
+    match sidecar {
+        Some(path) => (path.to_string_lossy().into_owned(), Vec::new()),
+        None => (DEFAULT_PYTHON.to_string(), python_args()),
+    }
+}
+
+/// Аргументы python-запуска: модуль control plane из корня репозитория.
+fn python_args() -> Vec<String> {
+    DEFAULT_ARGS
+        .iter()
+        .map(|item| (*item).to_string())
+        .collect()
+}
+
+/// Понятная причина отказа, когда ни cwd, ни каталог данных не содержат маркер.
+fn missing_project_marker(start_dir: &Path, data_dir: Option<&Path>) -> String {
+    match data_dir {
+        Some(data_dir) => format!(
+            "не найден {PROJECT_MARKER}: искали выше {start_dir:?} и в {data_dir:?} \
+             (каталог данных приложения). Положите {PROJECT_MARKER} туда либо задайте \
+             ADCLICKER_DAEMON_CWD"
+        ),
+        None => format!("не найден {PROJECT_MARKER} выше {start_dir:?}"),
+    }
+}
+
 /// Токен control API из окружения.
 ///
 /// Обязателен: параллельный источник значений (отдельное поле спецификации)
@@ -235,37 +346,48 @@ impl DaemonSpec {
         let vars: HashMap<String, String> = env::vars().collect();
         let cwd =
             env::current_dir().map_err(|error| format!("не удалось определить cwd: {error}"))?;
-        Self::resolve(&vars, cwd)
+        // Путь к собственному бинарнику нужен, чтобы найти рядом sidecar.
+        // Не определился — остаёмся на python3 из окружения, это не повод
+        // отказывать в запуске.
+        let exe = env::current_exe().ok();
+        Self::resolve(&vars, cwd, exe.as_deref())
     }
 
     /// Сборка спецификации из произвольного набора переменных.
     ///
     /// Вынесена отдельно от ``from_env`` не ради красоты: чтение глобального
     /// окружения в тестах гонялось бы параллельно с чужими тестами и делало
-    /// бы результат зависимым от порядка выполнения.
-    pub fn resolve(vars: &HashMap<String, String>, start_dir: PathBuf) -> Result<Self, String> {
-        let program = vars
-            .get("ADCLICKER_DAEMON_PYTHON")
-            .map(|value| value.trim())
-            .filter(|value| !value.is_empty())
-            .unwrap_or(DEFAULT_PYTHON)
-            .to_string();
+    /// бы результат зависимым от порядка выполнения. ``exe`` — путь к
+    /// бинарнику самого приложения (для поиска рядом sidecar'а), ``None`` —
+    /// «бинарник неизвестен», тогда остаётся python3.
+    pub fn resolve(
+        vars: &HashMap<String, String>,
+        start_dir: PathBuf,
+        exe: Option<&Path>,
+    ) -> Result<Self, String> {
+        let project_root = find_project_root_from(&start_dir);
+        let data_dir = app_data_dir(vars, cfg!(target_os = "macos"));
 
-        let args = match vars.get("ADCLICKER_DAEMON_ARGS") {
-            Some(raw) if !raw.trim().is_empty() => raw
-                .split_whitespace()
-                .map(str::to_string)
-                .collect::<Vec<_>>(),
-            _ => DEFAULT_ARGS
-                .iter()
-                .map(|item| (*item).to_string())
-                .collect(),
+        let cwd = match env_value(vars, "ADCLICKER_DAEMON_CWD") {
+            Some(raw) => PathBuf::from(raw),
+            None => project_root
+                .clone()
+                .or_else(|| {
+                    data_dir
+                        .as_ref()
+                        .filter(|dir| dir.join(PROJECT_MARKER).is_file())
+                        .cloned()
+                })
+                .ok_or_else(|| missing_project_marker(&start_dir, data_dir.as_deref()))?,
         };
 
-        let cwd = match vars.get("ADCLICKER_DAEMON_CWD") {
-            Some(raw) if !raw.trim().is_empty() => PathBuf::from(raw),
-            _ => find_project_root_from(&start_dir)
-                .ok_or_else(|| format!("не найден {PROJECT_MARKER} выше {start_dir:?}"))?,
+        let (program, default_args) = match env_value(vars, "ADCLICKER_DAEMON_PYTHON") {
+            Some(program) => (program.to_string(), python_args()),
+            None => default_launch(exe, project_root.is_some()),
+        };
+        let args = match env_value(vars, "ADCLICKER_DAEMON_ARGS") {
+            Some(raw) => raw.split_whitespace().map(str::to_string).collect(),
+            None => default_args,
         };
 
         // Ребёнку нужен полный набор переменных родителя (PYTHONPATH, PATH
@@ -771,7 +893,7 @@ mod tests {
         let mut vars = HashMap::new();
         vars.insert("PATH".to_string(), "/usr/bin".to_string());
         vars.insert(TOKEN_ENV.to_string(), "provided-token".to_string());
-        let spec = DaemonSpec::resolve(&vars, root.clone()).expect("спецификация собирается");
+        let spec = DaemonSpec::resolve(&vars, root.clone(), None).expect("спецификация собирается");
 
         assert_eq!(spec.program, DEFAULT_PYTHON);
         assert_eq!(spec.args, vec!["-m", "engine.control_plane.daemon"]);
@@ -799,7 +921,8 @@ mod tests {
         vars.insert("ADCLICKER_DAEMON_CWD".to_string(), "/srv/app".to_string());
         vars.insert(TOKEN_ENV.to_string(), "known-token".to_string());
 
-        let spec = DaemonSpec::resolve(&vars, PathBuf::from("/irrelevant")).expect("собирается");
+        let spec =
+            DaemonSpec::resolve(&vars, PathBuf::from("/irrelevant"), None).expect("собирается");
 
         assert_eq!(spec.program, "/nix/bin/python");
         assert_eq!(spec.args, vec!["-m", "my.daemon", "--verbose"]);
@@ -808,6 +931,182 @@ mod tests {
             .env
             .iter()
             .any(|(key, value)| key == TOKEN_ENV && value == "known-token"));
+    }
+
+    #[test]
+    fn spec_env_python_beats_the_sidecar_next_to_the_bundle() {
+        let (bundle, exe) = bundle_with_sidecar("adclicker-env-python");
+        let mut vars = HashMap::new();
+        vars.insert(
+            "ADCLICKER_DAEMON_PYTHON".to_string(),
+            "/nix/bin/python".to_string(),
+        );
+        vars.insert("ADCLICKER_DAEMON_CWD".to_string(), "/srv/app".to_string());
+        vars.insert(TOKEN_ENV.to_string(), "known-token".to_string());
+
+        let spec = DaemonSpec::resolve(&vars, bundle.clone(), Some(&exe))
+            .expect("спецификация собирается");
+
+        assert_eq!(
+            spec.program, "/nix/bin/python",
+            "явно заданный интерпретатор сильнее sidecar'а"
+        );
+        assert_eq!(spec.args, python_args());
+        let _ = fs::remove_dir_all(&bundle);
+    }
+
+    #[test]
+    fn spec_uses_the_sidecar_for_a_packaged_bundle() {
+        let (bundle, exe) = bundle_with_sidecar("adclicker-bundle");
+        let mut vars = HashMap::new();
+        vars.insert("ADCLICKER_DAEMON_CWD".to_string(), "/srv/app".to_string());
+        vars.insert(TOKEN_ENV.to_string(), "known-token".to_string());
+
+        let spec = DaemonSpec::resolve(&vars, bundle.clone(), Some(&exe))
+            .expect("спецификация собирается");
+
+        assert_eq!(
+            spec.program,
+            exe.parent()
+                .expect("бинарник в Contents/MacOS")
+                .join(SIDECAR_NAME)
+                .display()
+                .to_string(),
+            "упакованный .app спавнит sidecar рядом с собой"
+        );
+        assert!(
+            spec.args.is_empty(),
+            "диспетчер sidecar'а сам выбирает ветку демона: {:?}",
+            spec.args
+        );
+        assert_eq!(spec.cwd, PathBuf::from("/srv/app"));
+        let _ = fs::remove_dir_all(&bundle);
+    }
+
+    #[test]
+    fn spec_keeps_python_from_sources_in_dev() {
+        // Рядом с dev-бинарником лежит скопированный tauri'ем замороженный
+        // sidecar — пустить его в ход значило бы отрезать правки engine/
+        // от демона. Dev обязан остаться на python3 из исходников.
+        let root = env::temp_dir().join(format!("adclicker-dev-{}", std::process::id()));
+        fs::create_dir_all(&root).expect("каталог создаётся");
+        fs::write(root.join(PROJECT_MARKER), "{}").expect("маркер пишется");
+        let debug = root.join("ui/src-tauri/target/debug");
+        fs::create_dir_all(&debug).expect("каталог debug создаётся");
+        let exe = debug.join("ui");
+        fs::write(&exe, "").expect("бинарник создаётся");
+        fs::write(debug.join(SIDECAR_NAME), "").expect("sidecar создаётся");
+
+        let mut vars = HashMap::new();
+        vars.insert(TOKEN_ENV.to_string(), "provided-token".to_string());
+        let spec = DaemonSpec::resolve(&vars, root.clone(), Some(&exe)).expect("собирается");
+
+        assert_eq!(
+            spec.program, DEFAULT_PYTHON,
+            "dev-запуск остаётся на исходниках"
+        );
+        assert_eq!(spec.args, python_args());
+        assert_eq!(spec.cwd, root);
+        let _ = fs::remove_dir_all(&root);
+    }
+
+    #[test]
+    fn spec_falls_back_to_the_app_data_dir_without_project_root() {
+        // Из Finder cwd графического приложения — `/`, и подниматься оттуда
+        // некуда: рабочий каталог берётся из каталога данных приложения.
+        let home = env::temp_dir().join(format!("adclicker-home-{}", std::process::id()));
+        let start = env::temp_dir().join(format!("adclicker-finder-{}", std::process::id()));
+        fs::create_dir_all(&start).expect("каталог создаётся");
+        assert!(
+            find_project_root_from(&start).is_none(),
+            "у start нет маркера выше — иначе тест проверяет не тот путь"
+        );
+
+        let mut vars = HashMap::new();
+        vars.insert("HOME".to_string(), home.display().to_string());
+        vars.insert(TOKEN_ENV.to_string(), "provided-token".to_string());
+
+        let data_dir = app_data_dir(&vars, cfg!(target_os = "macos")).expect("HOME задан");
+        fs::create_dir_all(&data_dir).expect("каталог данных создаётся");
+        fs::write(data_dir.join(PROJECT_MARKER), "{}").expect("маркер пишется");
+
+        let spec =
+            DaemonSpec::resolve(&vars, start.clone(), None).expect("спецификация собирается");
+
+        assert_eq!(spec.cwd, data_dir, "cwd — каталог данных приложения");
+        assert_eq!(spec.program, DEFAULT_PYTHON);
+        let _ = fs::remove_dir_all(&start);
+        let _ = fs::remove_dir_all(&home);
+    }
+
+    #[test]
+    fn spec_without_any_project_marker_names_both_places() {
+        let home = env::temp_dir().join(format!("adclicker-empty-{}", std::process::id()));
+        let start = env::temp_dir().join(format!("adclicker-nohome-{}", std::process::id()));
+        fs::create_dir_all(&start).expect("каталог создаётся");
+
+        let mut vars = HashMap::new();
+        vars.insert("HOME".to_string(), home.display().to_string());
+        vars.insert(TOKEN_ENV.to_string(), "provided-token".to_string());
+
+        let error = DaemonSpec::resolve(&vars, start.clone(), None)
+            .expect_err("без маркера в обоих местах старт невозможен");
+
+        let data_dir = app_data_dir(&vars, cfg!(target_os = "macos")).expect("HOME задан");
+        assert!(
+            error.contains(&format!("{data_dir:?}")),
+            "причина называет каталог данных: {error}"
+        );
+        assert!(
+            error.contains("ADCLICKER_DAEMON_CWD"),
+            "причина подсказывает обходной путь: {error}"
+        );
+        let _ = fs::remove_dir_all(&start);
+    }
+
+    #[test]
+    fn app_data_dir_follows_the_platform_layout() {
+        let vars = HashMap::from([
+            ("HOME".to_string(), "/home/user".to_string()),
+            ("XDG_DATA_HOME".to_string(), "/custom/data".to_string()),
+        ]);
+
+        assert_eq!(
+            app_data_dir(&vars, true).as_deref(),
+            Some(Path::new(
+                "/home/user/Library/Application Support/Google Ad Clicker"
+            )),
+            "macOS: тот же каталог, что WorkingDirectory в launchd plist"
+        );
+        assert_eq!(
+            app_data_dir(&vars, false).as_deref(),
+            Some(Path::new("/custom/data/Google Ad Clicker")),
+            "XDG_DATA_HOME сильнее дефолта"
+        );
+
+        let no_xdg = HashMap::from([("HOME".to_string(), "/home/user".to_string())]);
+        assert_eq!(
+            app_data_dir(&no_xdg, false).as_deref(),
+            Some(Path::new("/home/user/.local/share/Google Ad Clicker"))
+        );
+
+        assert_eq!(
+            app_data_dir(&HashMap::new(), true),
+            None,
+            "без HOME каталога данных не вычислить"
+        );
+    }
+
+    /// Бумажный .app-бандл с бинарником приложения и sidecar рядом с ним.
+    /// Возвращает корень бандла (для удаления) и путь к бинарнику.
+    fn bundle_with_sidecar(prefix: &str) -> (PathBuf, PathBuf) {
+        let base = env::temp_dir().join(format!("{prefix}-{}", std::process::id()));
+        let macos = base.join("App.app/Contents/MacOS");
+        fs::create_dir_all(&macos).expect("структура бандла создаётся");
+        let exe = macos.join("Google Ad Clicker Premium");
+        fs::write(&exe, "").expect("бинарник создаётся");
+        fs::write(macos.join(SIDECAR_NAME), "").expect("sidecar создаётся");
+        (base, exe)
     }
 
     #[test]

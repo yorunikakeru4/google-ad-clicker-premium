@@ -87,6 +87,34 @@ is what makes a Finder launch work. Set the variable yourself only when the
 daemon is started externally (launchd plist, manual `daemon.py`): then the app
 must receive that same token, or control API calls come back as 401.
 
+## Building a desktop app
+
+`pnpm tauri dev` is only the dev loop (Vite on :1420 + Rust host, daemon from
+Python sources). For a real desktop app run `pnpm tauri build` — it
+type-checks the frontend, builds the Rust release and packages a bundle
+(`.app`/`.dmg` on macOS, `.deb`/`.rpm`/AppImage on Linux) into
+`src-tauri/target/release/bundle/`. Double-clicking that `.app` needs no
+environment set up beforehand.
+
+The sidecar binary has to exist before the bundle step:
+
+```sh
+nix develop --command bash scripts/build-sidecar.sh          # with nix
+scripts/bootstrap-venv.sh && PYTHON_BIN=.venv/bin/python \
+  scripts/build-sidecar.sh                                   # without nix
+```
+
+What the packaged launch resolves on its own (see `src-tauri/src/daemon.rs`):
+
+- control token — generated at startup if the variable is unset;
+- daemon program — the `engine` sidecar next to the app binary inside
+  `.app/Contents/MacOS/`; `ADCLICKER_DAEMON_PYTHON` still wins, and
+  `pnpm tauri dev` stays on `python3` from sources even though tauri copies a
+  frozen sidecar next to the dev binary;
+- working directory — project tree above the launch directory, otherwise the
+  app data dir (`~/Library/Application Support/Google Ad Clicker` on macOS,
+  the same path as `WorkingDirectory` in the launchd plist).
+
 ## Theming
 
 Two themes live in `src/plugins/vuetify.ts` (`adclickerLight`, `adclickerDark`).
