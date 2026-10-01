@@ -500,23 +500,29 @@ def test_get_random_user_agent_string_filters_by_windows(set_paths, tmp_path, mo
     assert utils.get_random_user_agent_string() == "Mozilla/5.0 (Windows NT 10.0) Chrome/120"
 
 
-def test_get_random_user_agent_string_keeps_ios_agents_on_macos(set_paths, tmp_path, monkeypatch):
+def test_get_random_user_agent_string_drops_ios_agents_on_macos(set_paths, tmp_path, monkeypatch):
     ua_file = tmp_path / "user_agents.txt"
     ua_file.write_text("Mozilla/5.0 (iPhone; CPU iPhone OS 17_0) Safari\n"
+                       "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) Chrome/131.0.0.0\n"
                        "Mozilla/5.0 (Windows NT 10.0) Chrome/120\n", encoding="utf-8")
     set_paths(user_agents=ua_file)
     monkeypatch.setattr(platform, "system", lambda: "Darwin")
 
-    assert utils.get_random_user_agent_string().startswith("Mozilla/5.0 (iPhone")
+    # Мобильный UA в десктопном Chrome — готовый сигнал детекта: платформа
+    # MacIntel против строки iOS (см. suspicion_flags в диагностике и
+    # Sec-CH-UA-Platform на стороне сервера). На macOS остаётся только Macintosh.
+    assert utils.get_random_user_agent_string().startswith("Mozilla/5.0 (Macintosh")
 
 
-def test_get_random_user_agent_string_counts_android_as_linux(set_paths, tmp_path, monkeypatch):
+def test_get_random_user_agent_string_drops_android_agents_on_linux(set_paths, tmp_path, monkeypatch):
     ua_file = tmp_path / "user_agents.txt"
-    ua_file.write_text("Mozilla/5.0 (Linux; Android 13) Chrome/117\n", encoding="utf-8")
+    ua_file.write_text("Mozilla/5.0 (Linux; Android 13) Chrome/117\n"
+                       "Mozilla/5.0 (X11; Linux x86_64) Chrome/131.0.0.0\n", encoding="utf-8")
     set_paths(user_agents=ua_file)
     monkeypatch.setattr(platform, "system", lambda: "Linux")
 
-    assert utils.get_random_user_agent_string() == "Mozilla/5.0 (Linux; Android 13) Chrome/117"
+    # та же логика: Android-UA на десктопном Chrome не должен выбираться
+    assert utils.get_random_user_agent_string() == "Mozilla/5.0 (X11; Linux x86_64) Chrome/131.0.0.0"
 
 
 def test_get_random_user_agent_string_falls_back_to_all_agents_on_unknown_os(

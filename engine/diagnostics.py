@@ -7,9 +7,9 @@
    пояс, экран и окно, ``navigator.webdriver``, ядра/память, WebGL
    vendor/renderer — всё, что читается из контекста страницы.
 2. **Echo** (``ECHO_SNIPPET``, ``execute_async_script``): fetch к
-   :data:`ECHO_URL` **из контекста страницы** — то есть через тот же прокси и
+   :data:`ECHO_URLS` **из контекста страницы** — то есть через тот же прокси и
    с теми же заголовками, что уйдут наружу реально. Ответ даёт
-   фактические заголовки и внешний IP. URL недоступен или не ответил за
+   фактические заголовки и внешний IP. Ни один из сервисов не ответил за
    :data:`ECHO_TIMEOUT_MS` — поля остаются NULL, а причина идёт строкой в
    ``suspicion_flags``: отказ echo не роняет ни сбор, ни воркер.
    Oговорка: запрос идёт с текущего origin (на старте сессии — ``about:blank``,
@@ -23,7 +23,7 @@
 Тесты сети не используют: ``echo_fetcher``/``local_ip_fetcher`` инжектируются,
 драйвер — заглушка.
 
-Согласованность — четыре чистых правила (:mod:`см. ниже`), каждое из которых
+Согласованность — пять чистых правил (:mod:`см. ниже`), каждое из которых
 при нехватке данных возвращает ``None``, а не флаг: ложное «подозрение»
 хуже его отсутствия. Результат — список строк в колонке
 ``suspicion_flags``; пустой список означает «нарушений не найдено».
@@ -57,7 +57,11 @@ from engine.db import migrations
 # Echo «headers + ip»: тело ответа содержит фактические заголовки запроса и
 # внешний IP (``origin``). Меняется только здесь — контракт для тестов и для
 # UI один: ответ разбирается как ``{"headers": {...}, "origin": "ip"}``.
-ECHO_URL = "https://httpbin.org/anything"
+#
+# Список, а не один URL: сам httpbin у воркеров через прокси падал с
+# «TypeError: Failed to fetch» (поля ip/headers оставались NULL, и по заголовкам
+# было не проверить Sec-CH-UA). Пробуем по порядку, первый живой выигрывает.
+ECHO_URLS = ("https://httpbingo.org/anything", "https://httpbin.org/anything")
 
 # Таймауты живут внутри JS (Promise.race/ setTimeout), а не в драйвере:
 # collect не меняет настройки чужого WebDriver, а результат приходит в
@@ -120,9 +124,10 @@ return {
 # echo: последний аргумент execute_async_script — колбэк Selenium.
 ECHO_SNIPPET = """
 const done = arguments[arguments.length - 1];
-const url = arguments[0];
+const urls = arguments[0];
 const timeoutMs = arguments[1];
 let settled = false;
+let lastError = 'no urls';
 const finish = (value) => {
   if (settled) { return; }
   settled = true;
@@ -132,15 +137,23 @@ const timer = setTimeout(
   () => finish({ok: false, error: 'timeout after ' + timeoutMs + 'ms'}),
   timeoutMs
 );
-try {
-  fetch(url, {credentials: 'omit', headers: {'Accept': 'application/json'}})
-    .then((response) => response.json())
-    .then((body) => { clearTimeout(timer); finish({ok: true, body: body}); })
-    .catch((error) => { clearTimeout(timer); finish({ok: false, error: String(error)}); });
-} catch (error) {
-  clearTimeout(timer);
-  finish({ok: false, error: String(error)});
-}
+const attempt = (index) => {
+  if (index >= urls.length) {
+    clearTimeout(timer);
+    finish({ok: false, error: lastError});
+    return;
+  }
+  try {
+    fetch(urls[index], {credentials: 'omit', headers: {'Accept': 'application/json'}})
+      .then((response) => response.json())
+      .then((body) => { clearTimeout(timer); finish({ok: true, body: body}); })
+      .catch((error) => { lastError = String(error); attempt(index + 1); });
+  } catch (error) {
+    lastError = String(error);
+    attempt(index + 1);
+  }
+};
+attempt(0);
 """
 
 # Внутренний IP: кандидат ICE без внешних серверов. Chrome отдаёт локальные
@@ -464,14 +477,21 @@ def browser_version(capabilities: Any, user_agent: str | None) -> str | None:
 # --- fetcher'ы: сеть только за пределами тестов -----------------------------------
 
 
-def fetch_echo(driver: Any, *, url: str = ECHO_URL, timeout_ms: int = ECHO_TIMEOUT_MS) -> EchoResult:
+def fetch_echo(
+    driver: Any,
+    *,
+    urls: Sequence[str] = ECHO_URLS,
+    timeout_ms: int = ECHO_TIMEOUT_MS,
+) -> EchoResult:
     """Запрос echo **из контекста страницы**: те же заголовки, тот же прокси.
 
-    Не бросает: отказ драйвера или таймаут — это ``EchoResult(error=...)``,
-    по которому колонки останутся NULL, а причина уйдёт в suspicion_flags.
+    ``urls`` пробуются по порядку (см. :data:`ECHO_URLS`) — общий таймаут на
+    всю цепочку. Не бросает: отказ драйвера или таймаут — это
+    ``EchoResult(error=...)``, по которому колонки останутся NULL, а причина
+    уйдёт в suspicion_flags.
     """
     try:
-        raw = driver.execute_async_script(ECHO_SNIPPET, url, timeout_ms)
+        raw = driver.execute_async_script(ECHO_SNIPPET, list(urls), timeout_ms)
     except Exception as exc:
         return EchoResult(None, None, f"{type(exc).__name__}: {exc}")
     return parse_echo_payload(raw)
@@ -557,6 +577,41 @@ def check_platform_vs_user_agent(user_agent: str | None, platform: str | None) -
     return f"Платформа {plat!r} не соответствует ОС {os_name} из User-Agent"
 
 
+# Заморозка UA reduction: с Chrome131 честный браузер шлёт в строке UA
+# Chrome/131.0.0.0 независимо от своей реальной версии. Всё, что не совпадает
+# ни с реальной версией, ни с этой, — UA из user_agents.txt, подделанный под
+# несуществующий браузер.
+REDUCED_CHROME_MAJOR = 131
+
+
+def check_ua_version_vs_browser(
+    user_agent: str | None, browser_version: str | None
+) -> str | None:
+    """Строка-UA ↔ реальная версия браузера.
+
+    Честный Chrome отдаёт либо свою версию (``Chrome/153...``), либо
+    редуцированную (``Chrome/131.0.0.0``). ``Chrome/136`` при браузере 153
+    или устаревший ``CriOS/114`` — UA из ``user_agents.txt``: строка и
+    ``Sec-CH-UA``/``navigator.userAgentData`` расходятся уже в заголовках,
+    серверу не нужен JS. Нехватка данных — не флаг.
+    """
+    ua = _text(user_agent)
+    version = _text(browser_version)
+    if ua is None or version is None:
+        return None
+    match = re.search(r"(?:Chrome|CriOS)/(\d+)", ua)
+    browser_major = version.split(".", 1)[0]
+    if match is None or not browser_major.isdigit():
+        return None
+    ua_major = int(match.group(1))
+    if ua_major in (int(browser_major), REDUCED_CHROME_MAJOR):
+        return None
+    return (
+        f"Версия Chrome в User-Agent {ua_major} не соответствует "
+        f"версии браузера {version}"
+    )
+
+
 def check_screen_vs_window(
     screen_w: Any, screen_h: Any, window_w: Any, window_h: Any
 ) -> str | None:
@@ -584,10 +639,10 @@ def compute_suspicion_flags(
     locales: Mapping[str, Sequence[str]] | None = None,
     collection_errors: Sequence[str] = (),
 ) -> list[str]:
-    """Собрать ``suspicion_flags``: четыре правила + ошибки сбора.
+    """Собрать ``suspicion_flags``: пять правил + ошибки сбора.
 
-    Порядок стабилен (язык, пояс, платформа, экран, затем ошибки) — UI
-    показывает список как есть, и его порядок не должен прыгать между
+    Порядок стабилен (язык, пояс, платформа, версия UA, экран, затем ошибки) —
+    UI показывает список как есть, и его порядок не должен прыгать между
     снимками с одинаковыми проблемами.
     """
     flags = [
@@ -598,6 +653,7 @@ def compute_suspicion_flags(
             ),
             check_timezone_vs_geo(snapshot.timezone_id, snapshot.geo_timezone),
             check_platform_vs_user_agent(snapshot.user_agent, snapshot.platform),
+            check_ua_version_vs_browser(snapshot.user_agent, snapshot.browser_version),
             check_screen_vs_window(
                 snapshot.screen_w, snapshot.screen_h, snapshot.window_w, snapshot.window_h
             ),

@@ -17,7 +17,7 @@ from engine.control_plane.state import StateStore
 from engine.db import migrations
 from engine.diagnostics import (
     DIAGNOSTICS_FLAG_PREFIX,
-    ECHO_URL,
+    ECHO_URLS,
     DiagnosticSnapshot,
     EchoResult,
     PageSnapshot,
@@ -27,6 +27,7 @@ from engine.diagnostics import (
     check_platform_vs_user_agent,
     check_screen_vs_window,
     check_timezone_vs_geo,
+    check_ua_version_vs_browser,
     clear_signal,
     collect_snapshot,
     compute_suspicion_flags,
@@ -345,7 +346,7 @@ class TestFetchers:
         echo = fetch_echo(driver)
 
         script, args = driver.scripts[-1]
-        assert args[0] == ECHO_URL
+        assert args[0] == list(ECHO_URLS)
         assert "fetch(" in script
         assert echo.ip == "203.0.113.7"
 
@@ -591,6 +592,58 @@ class TestPlatformAgainstUserAgent:
         assert check_platform_vs_user_agent(ua, "Win32") is None
 
 
+class TestUaVersionAgainstBrowser:
+    """Строка-UA ↔ версия браузера: ловит UA из user_agents.txt.
+
+    Снято живым прогоном: при браузере153 в снимках плавали Chrome/136
+    (Macintosh) и CriOS/114 (iPhone) — обе строки сервер читает вместе
+    с честными Sec-CH-UA и уже по одному этому считает браузер подделанным.
+    """
+
+    BROWSER = "153.0.8010.55"
+
+    @pytest.mark.parametrize(
+        "ua",
+        [
+            # честная строка совпадает с реальной версией
+            "Mozilla/5.0 (Macintosh) Chrome/153.0.0.0 Safari/537.36",
+            # честная редуцированная строка (заморозка UA reduction)
+            "Mozilla/5.0 (Macintosh) Chrome/131.0.0.0 Safari/537.36",
+        ],
+    )
+    def test_honest_versions_are_ok(self, ua):
+        assert check_ua_version_vs_browser(ua, self.BROWSER) is None
+
+    @pytest.mark.parametrize(
+        "ua",
+        [
+            # живой случай: Chrome/136 при браузере153
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) Chrome/136.0.0.0 Safari/537.36",
+            # живой случай: устаревший мобильный CriOS
+            "Mozilla/5.0 (iPhone; CPU iPhone OS 16_5 like Mac OS X) CriOS/114.0.5735.50 Safari",
+        ],
+    )
+    def test_fabricated_versions_are_flagged(self, ua):
+        flag = check_ua_version_vs_browser(ua, self.BROWSER)
+
+        assert flag is not None
+        assert "не соответствует" in flag
+        assert self.BROWSER in flag
+
+    @pytest.mark.parametrize(
+        ("ua", "version"),
+        [
+            (None, "153.0.8010.55"),
+            ("Mozilla/5.0 Chrome/136.0.0.0", None),
+            ("", "153.0.8010.55"),
+            ("SomeBot/1.0", "153.0.8010.55"),
+            ("Mozilla/5.0 Chrome/136.0.0.0", ""),
+        ],
+    )
+    def test_missing_data_or_foreign_ua_is_not_a_flag(self, ua, version):
+        assert check_ua_version_vs_browser(ua, version) is None
+
+
 class TestScreenAgainstWindow:
     @pytest.mark.parametrize(
         ("screen_w", "screen_h", "window_w", "window_h"),
@@ -674,11 +727,15 @@ class TestComputeSuspicionFlags:
             timezone_id="Europe/Paris",
             platform="MacIntel",
             window_w=2560,
+            # мобильный CriOS на десктопе даёт сразу два флага:
+            # «платформа не соответствует ОС» и «версия не соответствует»
+            user_agent="Mozilla/5.0 (iPhone; CPU iPhone OS 16_5) CriOS/114.0.5735.50",
+            browser_version="153.0.8010.55",
         )
 
         flags = compute_suspicion_flags(snapshot, locales=LOCALES)
 
-        assert len(flags) == 4, flags
+        assert len(flags) == 5, flags
 
     @pytest.mark.parametrize(
         "overrides",

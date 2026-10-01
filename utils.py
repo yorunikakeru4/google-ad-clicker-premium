@@ -58,15 +58,17 @@ def get_random_user_agent_string() -> str:
         filtered_user_agents = [ua for ua in all_user_agents if "Windows" in ua]
 
     elif current_os == "Darwin":
-        filtered_user_agents = [
-            ua
-            for ua in all_user_agents
-            if any(platform in ua for platform in ("Macintosh", "iPhone", "iPad"))
-        ]
+        # Только десктопный Mac. iPhone/iPad-UA в десктопном Chrome даёт
+        # пару «navigator.platform = MacIntel + мобильная строка» — это
+        # ловит уже suspicion_flags в диагностике («Платформа 'MacIntel'
+        # не соответствует ОС ios») и это же читает сервер Google по
+        # заголовкам (Sec-CH-UA-Platform: macOS против UA iOS).
+        filtered_user_agents = [ua for ua in all_user_agents if "Macintosh" in ua]
 
     elif current_os == "Linux":
+        # Как и на macOS: Android-UA на десктопном Chrome — то же несоответствие.
         filtered_user_agents = [
-            ua for ua in all_user_agents if any(platform in ua for platform in ("Linux", "Android"))
+            ua for ua in all_user_agents if "Linux" in ua and "Android" not in ua
         ]
 
     else:
