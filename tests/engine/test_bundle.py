@@ -100,3 +100,22 @@ def test_argv_none_takes_sys_argv(routed, monkeypatch):
 
     assert code == 11
     assert routed == {"worker": ["--browser-id", "br-9"]}
+
+
+def test_main_freezes_multiprocessing_before_dispatch(monkeypatch) -> None:
+    """Дочке spawn в замороженном exe нужен перехват ДО диспетчера.
+
+    Без freeze_support() ветка spawn на macOS (``engine
+    --multiprocessing-fork``) уходила в dispatch() и умирала на argparse,
+    а родитель висел в ``reader.recv()`` — зависший воркер, пойманный
+    живым прогоном. Порядок здесь и есть контракт.
+    """
+    import multiprocessing
+
+    calls: list[str] = []
+
+    monkeypatch.setattr(multiprocessing, "freeze_support", lambda: calls.append("freeze"))
+    monkeypatch.setattr(bundle, "dispatch", lambda: calls.append("dispatch") or 0)
+
+    assert bundle.main() == 0
+    assert calls == ["freeze", "dispatch"]

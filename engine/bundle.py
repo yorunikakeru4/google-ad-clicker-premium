@@ -47,7 +47,27 @@ def dispatch(argv: Sequence[str] | None = None) -> int:
     return daemon_main(args)
 
 
+def main() -> int:
+    """Точка входа замороженного бинарника.
+
+    Первым делом — перехват дочернего процесса multiprocessing: ветка
+    spawn (дефолт macOS) в замороженном exe порождает дочку как
+    ``engine --multiprocessing-fork ...`` (``multiprocessing.spawn`` для
+    ``sys.frozen``). Без ``freeze_support()`` дочка уходит в обычный
+    ``dispatch()``, падает на argparse и умирает, а родитель виснет в
+    ``reader.recv()`` до конца времен — так зависал воркер на macOS через
+    ``undetected_chromedriver.dprocess.start_detached``
+    (``use_subprocess=False``). В dev вызов — no-op; в frozen его делает
+    рабочим патч PyInstaller ``pyi_rth_multiprocessing``, подменяющий
+    ``freeze_support`` на posix.
+    """
+    import multiprocessing
+
+    multiprocessing.freeze_support()
+    return dispatch()
+
+
 if __name__ == "__main__":
-    # sys.exit, а не голый dispatch(): код возврата должен дойти до
+    # sys.exit, а не голый return: код возврата должен дойти до
     # вызывающей стороны (Tauri, launchd, терминал).
-    sys.exit(dispatch())
+    sys.exit(main())

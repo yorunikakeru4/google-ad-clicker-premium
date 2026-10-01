@@ -537,7 +537,15 @@ def create_webdriver(
             driver_executable_path=driver_exe_path,
             options=chrome_options,
             user_multi_procs=multi_procs_enabled,
-            use_subprocess=False,
+            # True = браузер обычным subprocess. False вёл в UC
+            # dprocess.start_detached (multiprocessing.Pipe + reader.recv),
+            # а в замороженном бинарнике дочка spawn перезапускает сам
+            # бутлоадер и умирает, не послав pid — родитель висел в recv()
+            # навсегда (макOS, поймано живым прогоном: ни логов, ни
+            # chromedriver, два зомби-ребёнка). True дополнительно даёт:
+            # браузер — наш ребёнок (waitpid в quit честно работает) и он в
+            # той же группе процессов, поэтому group-kill демона его гасит.
+            use_subprocess=True,
         )
 
         if transport == PROXY_TRANSPORT_CDP_AUTH and credentials is not None:
@@ -593,7 +601,9 @@ def create_webdriver(
             driver_executable_path=driver_exe_path,
             options=chrome_options,
             user_multi_procs=multi_procs_enabled,
-            use_subprocess=False,
+            # True — см. комментарий в ветке с прокси: False (UC
+            # dprocess/multiprocessing) вис в замороженном бинарнике на macOS.
+            use_subprocess=True,
         )
         if profile_timezone:
             _override_timezone(driver, profile_timezone)
