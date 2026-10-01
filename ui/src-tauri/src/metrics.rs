@@ -322,7 +322,13 @@ impl DbReader {
         let since_bucket = current_bucket - i64::from(since_hours) * BUCKET_SECONDS;
         let window_seconds = BUCKET_SECONDS * (i64::from(since_hours) + 1);
 
-        let (uptime_seconds, buckets): (i64, i64) = self
+        // Python пишет uptime_seconds дробным (``uptime_seconds += elapsed``,
+        // elapsed float): INTEGER-аффинити колонки хранит дробное значение
+        // как REAL, и SUM возвращает Real. rusqlite читает Real только в f64
+        // — прежнее чтение в i64 падало на самом Dashboard с «Invalid column
+        // type Real at index: 0». Сумма берётся f64 (принимает и Integer, и
+        // Real) и округляется до секунд; ratio считается по точной сумме.
+        let (uptime_sum, buckets): (f64, i64) = self
             .conn
             .query_row(
                 "SELECT COALESCE(SUM(uptime_seconds), 0), COUNT(*) \
@@ -332,9 +338,10 @@ impl DbReader {
             )
             .map_err(read_failed)?;
 
+        let uptime_seconds = uptime_sum.round() as i64;
         // Ни одной строки в окне — метрики не считались вовсе: None, а не
         // 0% (пустая таблица, окно в будущем, окно до первой записи).
-        let ratio = (buckets > 0).then(|| uptime_seconds as f64 / window_seconds as f64);
+        let ratio = (buckets > 0).then(|| uptime_sum / window_seconds as f64);
 
         Ok(UptimeSummary {
             ratio,
@@ -882,6 +889,33 @@ mod tests {
             3600 * 25,
             "окно 24 ч: слоты включительно — 25 часовых позиций"
         );
+    }
+
+    #[test]
+    fn uptime_summary_tolerates_fractional_seconds_written_by_python() {
+        // Python пишет uptime_seconds += elapsed (float): хранение дробного
+        // REAL в INTEGER-колонке — штатные данные, а не порча. Раньше SUM
+        // возвращал Real, чтение в i64 падало с «Invalid column type Real»
+        // прямо на экране Dashboard.
+        let tmp = TempDb::new();
+        let path = tmp.path();
+        let writer = seed(&path);
+        let now = 90_000.0 + 600.0;
+        writer
+            .execute(
+                "INSERT INTO metrics_hourly (bucket, uptime_seconds) VALUES (?1, ?2)",
+                rusqlite::params![bucket_at(now), 1799.75],
+            )
+            .expect("дробная строка пишется");
+
+        let reader = DbReader::open(&path).expect("БД открывается");
+        let summary = reader
+            .uptime_summary_at(0, now)
+            .expect("REAL-сумма читается без ошибки типа");
+
+        assert_eq!(summary.uptime_seconds, 1800, "сумма округляется до секунд");
+        assert_eq!(summary.buckets, 1);
+        assert!(summary.ratio.is_some(), "дробные данные — не «нет данных»");
     }
 
     #[test]
