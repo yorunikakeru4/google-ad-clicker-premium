@@ -29,12 +29,34 @@ import io
 import os
 import platform
 import re
+import ssl
 import subprocess
 import zipfile
 from pathlib import Path
 from typing import Callable
 from urllib.error import HTTPError, URLError
 from urllib.request import urlopen
+
+# Корневые сертификаты для HTTPS-загрузок драйвера.
+#
+# В замороженном бинарнике (PyInstaller one-file) `ssl` не находит системные
+# сертификаты: пути OpenSSL указывают на сборочную машину, и каждый urlopen
+# падает с «CERTIFICATE_VERIFY_FAILED / unable to get local issuer» — поймано
+# живым прогоном на macOS, где воркер умирал на «драйвер не найден, каталог
+# known-good недоступен». Импорт стоит на верхнем уровне (а не в функции) не
+# ради красоты: PyInstaller кладёт в бандл только видимый графу импорт, и
+# ленивый `import certifi` внутри функции в бандл бы не попал.
+try:
+    import certifi
+except ImportError:  # без requests certifi нет — спасут системные bundle'ы
+    certifi = None
+
+# Системные CA-бандлы на случай, если certifi недоступен.
+_SYSTEM_CAFILES = (
+    "/etc/ssl/cert.pem",  # macOS (системный LibreSSL bundle)
+    "/etc/ssl/certs/ca-certificates.crt",  # Debian/Ubuntu/NixOS
+    "/etc/pki/tls/certs/ca-bundle.crt",  # RHEL/Fedora
+)
 
 # Маркер, который ищет UC-Patcher.is_binary_patched.
 UC_MARKER = b"undetected chromedriver"
@@ -80,13 +102,32 @@ def _platform_zip() -> str:
     return f"chromedriver-{cft_platform()}.zip"
 
 
+def _cafile_candidates() -> tuple[str | None, ...]:
+    """Файлы корневых сертификатов в порядке предпочтения."""
+    first: tuple[str | None, ...] = (certifi.where(),) if certifi is not None else ()
+    return first + _SYSTEM_CAFILES
+
+
+def _ssl_context() -> ssl.SSLContext:
+    """HTTPS-контекст с CA-файлом, который действительно существует.
+
+    Первый существующий кандидат из :func:`_cafile_candidates`; если ни
+    certifi, ни системные bundle'ы не найдены — дефолтные пути OpenSSL
+    (в dev-окружении они и так работают).
+    """
+    for candidate in _cafile_candidates():
+        if candidate and Path(candidate).is_file():
+            return ssl.create_default_context(cafile=candidate)
+    return ssl.create_default_context()
+
+
 def _default_fetch_bytes(url: str) -> bytes:
-    with urlopen(url, timeout=30) as response:  # noqa: S310 — свои домены CfT/gh
+    with urlopen(url, timeout=30, context=_ssl_context()) as response:  # noqa: S310 — свои домены CfT/gh
         return response.read()
 
 
 def _default_fetch_text(url: str) -> str:
-    with urlopen(url, timeout=30) as response:  # noqa: S310
+    with urlopen(url, timeout=30, context=_ssl_context()) as response:  # noqa: S310
         return response.read().decode("utf-8")
 
 

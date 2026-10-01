@@ -11,13 +11,19 @@ from __future__ import annotations
 
 import io
 import json
+import ssl
 import zipfile
 
 import pytest
 
+from engine import driver_bin
 from engine.driver_bin import (
     UC_MARKER,
     _append_marker,
+    _cafile_candidates,
+    _default_fetch_bytes,
+    _default_fetch_text,
+    _ssl_context,
     browser_version,
     cft_platform,
     prepare_driver,
@@ -210,3 +216,57 @@ def test_prepare_zip_without_driver_is_readble_error(tmp_path) -> None:
             fetch_text=fetch_bytes,
             browser_ver=lambda: "153.0.8010.36",
         )
+
+
+# --- корневые сертификаты в замороженном бинарнике ---------------------------
+#
+# Поймано живым прогоном на macOS: воркер умирал на «драйвер не найден,
+# каталог known-good недоступен» с CERTIFICATE_VERIFY_FAILED — у one-file
+# бинарника нет доступа к системным сертификатам, и каждый HTTPS падал.
+
+
+def test_cafile_candidates_prefer_certifi_when_present() -> None:
+    import certifi
+
+    assert _cafile_candidates()[0] == certifi.where()
+
+
+def test_ssl_context_is_built_even_without_certifi(monkeypatch) -> None:
+    # Без requests certifi нет — контекст обязан пасть на системные bundle'ы,
+    # а не на дефолтные пути OpenSSL со сборочной машины.
+    monkeypatch.setattr(driver_bin, "certifi", None)
+
+    assert isinstance(_ssl_context(), ssl.SSLContext)
+
+
+def test_default_fetch_passes_timeout_and_ssl_context(monkeypatch) -> None:
+    # Без context у urlopen в frozen-бинарнике — CERTIFICATE_VERIFY_FAILED.
+    captured: dict[str, object] = {}
+
+    class _Response:
+        def __enter__(self) -> "_Response":
+            return self
+
+        def __exit__(self, *exc: object) -> bool:
+            return False
+
+        def read(self) -> bytes:
+            return b"payload"
+
+    def fake_urlopen(
+        url: str, timeout: int | None = None, context: object = None
+    ) -> _Response:
+        captured["url"] = url
+        captured["timeout"] = timeout
+        captured["context"] = context
+        return _Response()
+
+    monkeypatch.setattr(driver_bin, "urlopen", fake_urlopen)
+
+    assert _default_fetch_bytes("https://example.invalid/x") == b"payload"
+    assert captured["timeout"] == 30
+    assert isinstance(captured["context"], ssl.SSLContext)
+    assert captured["url"] == "https://example.invalid/x"
+
+    assert _default_fetch_text("https://example.invalid/y") == "payload"
+    assert isinstance(captured["context"], ssl.SSLContext)
