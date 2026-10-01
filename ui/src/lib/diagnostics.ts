@@ -231,6 +231,57 @@ export interface DiagnosticCard {
   snapshot: DiagnosticSnapshot | null;
 }
 
+/** Ключ режима «как сайт видит сессию» в localStorage. */
+export const RAW_MODES_STORAGE_KEY = "adclicker:diagnostics-raw";
+
+/** Минимальный контракт localStorage — в тестах подменяется картой. */
+export interface RawModesStorage {
+  getItem(key: string): string | null;
+  setItem(key: string, value: string): void;
+}
+
+/**
+ * Сохранённые режимы карточек.
+ *
+ * Состояние живёт в компоненте, но переход на другой экран его уничтожает —
+ * без хранилища переключатель «терялся» при каждом уходе со страницы.
+ * Битый или чужой JSON, недоступное хранилище (приватный режим) и
+ * небулевы значения — не ошибка: режим просто сбрасывается.
+ */
+export function loadRawModes(storage: RawModesStorage): Record<string, boolean> {
+  try {
+    const raw = storage.getItem(RAW_MODES_STORAGE_KEY);
+    if (raw === null) return {};
+    const parsed: unknown = JSON.parse(raw);
+    if (typeof parsed !== "object" || parsed === null) return {};
+    return Object.fromEntries(
+      Object.entries(parsed as Record<string, unknown>).filter(
+        (entry): entry is [string, boolean] => typeof entry[1] === "boolean",
+      ),
+    );
+  } catch {
+    return {};
+  }
+}
+
+/** Новое состояние после переключения одной карточки. */
+export function withRawMode(
+  modes: Record<string, boolean>,
+  key: string,
+  value: boolean,
+): Record<string, boolean> {
+  return { ...modes, [key]: value };
+}
+
+/** Пишет режимы; сбой хранилища не должен ронять экран. */
+export function saveRawModes(storage: RawModesStorage, modes: Record<string, boolean>): void {
+  try {
+    storage.setItem(RAW_MODES_STORAGE_KEY, JSON.stringify(modes));
+  } catch {
+    // нет хранилища: режим действует до перезагрузки страницы
+  }
+}
+
 /**
  * Карточки = снимки из читалки ∪ живые воркеры.
  *

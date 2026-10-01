@@ -18,9 +18,12 @@ import {
   diagnosticToCsv,
   diagnosticToJson,
   flagSeverity,
+  loadRawModes,
   parseSuspicionFlags,
   rawParams,
+  saveRawModes,
   sessionParams,
+  withRawMode,
   type DiagnosticCard,
   type DiagnosticSnapshot,
   type RawParam,
@@ -78,8 +81,14 @@ function toCardView(card: DiagnosticCard, rawMode: boolean): CardView {
   };
 }
 
-/** Режим «как сайт видит» — по ключу карточки, состояние переживает тики. */
-const rawModes = ref<Record<string, boolean>>({});
+/**
+ * Режим «как сайт видит сессию» — по ключу карточки.
+ *
+ * Состояние переживает и тики, и переход на другой экран: компонент при
+ * уходе со страницы размонтируется, поэтому режимы продублированы в
+ * localStorage (см. loadRawModes/saveRawModes).
+ */
+const rawModes = ref<Record<string, boolean>>(loadRawModes(window.localStorage));
 
 const cardViews = computed(() =>
   diagnostics.cards.value.map((card) =>
@@ -88,7 +97,8 @@ const cardViews = computed(() =>
 );
 
 function toggleRaw(key: string, value: boolean): void {
-  rawModes.value = { ...rawModes.value, [key]: value };
+  rawModes.value = withRawMode(rawModes.value, key, value);
+  saveRawModes(window.localStorage, rawModes.value);
 }
 
 // --- сбор и экспорт -------------------------------------------------------
@@ -233,7 +243,10 @@ function collectCard(view: CardView): void {
           </v-card-title>
 
           <v-card-text>
+            <!-- Переключатель имеет смысл только при снимке: без данных
+                 оба режима пусты, и выключатель выглядел бы нерабочим. -->
             <v-switch
+              v-if="view.snapshot"
               :model-value="view.rawMode"
               label="Как сайт видит сессию"
               color="primary"

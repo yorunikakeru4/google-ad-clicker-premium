@@ -9,16 +9,20 @@ import { describe, expect, it, vi } from "vitest";
 import {
   DIAGNOSTIC_CSV_COLUMNS,
   DIAGNOSTICS_WORKER_STALE_SECS,
+  RAW_MODES_STORAGE_KEY,
   buildDiagnosticCards,
   createDiagnosticsApi,
   diagnosticToCsv,
   diagnosticToJson,
   diagnosticsApiError,
   flagSeverity,
+  loadRawModes,
   parseHeaders,
   parseSuspicionFlags,
   rawParams,
+  saveRawModes,
   sessionParams,
+  withRawMode,
   type DiagnosticSnapshot,
 } from "./diagnostics";
 import type { ActiveWorker, DbApi } from "./dbApi";
@@ -469,5 +473,78 @@ describe("diagnosticToJson: экспорт снимка", () => {
     for (const column of DIAGNOSTIC_CSV_COLUMNS) {
       expect(parsed).toHaveProperty(column);
     }
+  });
+});
+
+describe("rawModes: режим «как сайт видит» переживает уход со страницы", () => {
+  /** Хранилище на карте: тесты видят и содержимое, и сбои записи. */
+  function mapStorage(initial: Record<string, string> = {}) {
+    const data = new Map(Object.entries(initial));
+    return {
+      getItem: (key: string) => data.get(key) ?? null,
+      setItem: (key: string, value: string) => {
+        data.set(key, value);
+      },
+      dump: () => Object.fromEntries(data),
+    };
+  }
+
+  it("сохранённое значение читается новым экземпляром экрана", () => {
+    const storage = mapStorage({
+      [RAW_MODES_STORAGE_KEY]: JSON.stringify({ "br-1": true }),
+    });
+
+    expect(loadRawModes(storage)).toEqual({ "br-1": true });
+  });
+
+  it("битый или чужой JSON и недоступное хранилище — пустой режим", () => {
+    expect(loadRawModes(mapStorage({ [RAW_MODES_STORAGE_KEY]: "{oops" }))).toEqual({});
+    expect(loadRawModes(mapStorage({ [RAW_MODES_STORAGE_KEY]: '"string"' }))).toEqual({});
+    expect(loadRawModes(mapStorage())).toEqual({});
+    expect(
+      loadRawModes({
+        getItem(): string | null {
+          throw new Error("blocked");
+        },
+        setItem(): void {
+          // заглушке записи здесь не место
+        },
+      }),
+    ).toEqual({});
+  });
+
+  it("небулевы значения отбрасываются", () => {
+    const storage = mapStorage({
+      [RAW_MODES_STORAGE_KEY]: JSON.stringify({ "br-1": true, "br-2": "yes", "br-3": 1 }),
+    });
+
+    expect(loadRawModes(storage)).toEqual({ "br-1": true });
+  });
+
+  it("переключение пишется и читается обратно", () => {
+    const storage = mapStorage();
+
+    const next = withRawMode({ "br-1": false }, "br-1", true);
+    saveRawModes(storage, next);
+
+    expect(loadRawModes(storage)).toEqual({ "br-1": true });
+    // соседние ключи не затираются
+    expect(withRawMode(next, "br-2", true)).toEqual({ "br-1": true, "br-2": true });
+  });
+
+  it("сбой записи не роняет экран", () => {
+    expect(() =>
+      saveRawModes(
+        {
+          getItem(): string | null {
+            return null;
+          },
+          setItem(): void {
+            throw new Error("quota");
+          },
+        },
+        { "br-1": true },
+      ),
+    ).not.toThrow();
   });
 });
