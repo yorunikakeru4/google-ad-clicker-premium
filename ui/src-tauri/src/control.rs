@@ -7,8 +7,9 @@
 //! Контракт с демоном (`engine/control_plane/api.py`, `daemon.py`):
 //!
 //! - токен — та же переменная, что у демона: `ADCLICKER_CONTROL_TOKEN`;
-//!   без неё демон не стартует вовсе, поэтому её отсутствие — явная ошибка,
-//!   а не молчаливый запрос без заголовка;
+//!   на старте приложение заполняет её само ([`ensure_control_token`]), если
+//!   переменной нет снаружи, а её отсутствие в рантайме остаётся явной
+//!   ошибкой, а не молчаливым запросом без заголовка;
 //! - базовый URL — `ADCLICKER_API_URL`, дефолт `http://127.0.0.1:8787`
 //!   (порт `--port` демона, хост — только loopback);
 //! - транспорт — голый HTTP без TLS: демон слушает только loopback и только
@@ -41,6 +42,10 @@ pub const BASE_URL_ENV: &str = "ADCLICKER_API_URL";
 /// Дефолт совпадает с дефолтом `--port` в `daemon.py`.
 pub const DEFAULT_BASE_URL: &str = "http://127.0.0.1:8787";
 
+/// Сколько байт энтропии в сгенерированном токене: 16 байт дают 32
+/// hex-символа, как `openssl rand -hex 16` из README.
+const TOKEN_BYTES: usize = 16;
+
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(2);
 const READ_TIMEOUT: Duration = Duration::from_secs(5);
 const MAX_RESPONSE_BYTES: usize = 10 * 1024 * 1024;
@@ -57,6 +62,64 @@ pub struct ControlReply {
 pub struct Endpoint {
     pub host: String,
     pub port: u16,
+}
+
+/// Токен control API на этот запуск: берёт заданную извне переменную,
+/// иначе генерирует свою и записывает её в окружение процесса.
+///
+/// Зачем: запущенное из Finder (или из launchd без `EnvironmentVariables`)
+/// приложение не получает окружения, и раньше это давало две ошибки разом —
+/// `DaemonSpec::from_env` отказывался спавнить демон, а `control_request`
+/// не мог авторизоваться у него. Генерация убирает обе: спавнимый демон и UI
+/// видят одно и то же значение, потому что оно прокидывается через
+/// окружение процесса — тот же канал, что и раньше.
+///
+/// Правила:
+///
+/// - заданная извне переменная всегда сильнее: в ней может быть токен уже
+///   работающего демона (dev-shell, launchd plist);
+/// - генерируется один раз на процесс, на диск не пишется, в логи и ответы
+///   не попадает — токен живёт в памяти процесса и уходит ребёнку при спавне
+///   демона;
+/// - перевод строки в заданном значении — ошибка, а не тихая подмена:
+///   иначе сломанный env выглядел бы как рабочий.
+///
+/// Вызывается в `run()` до старта потоков Tauri: `std::env::set_var`
+/// небезопасен при параллельном чтении окружения, а [`control_request`]
+/// читает переменную на каждый вызов — после вызова здесь она уже готова.
+pub fn ensure_control_token() -> Result<String, String> {
+    let provided = std::env::var(TOKEN_ENV).ok();
+    let token = token_or_generate(provided.as_deref())?;
+    std::env::set_var(TOKEN_ENV, &token);
+    Ok(token)
+}
+
+/// Ядро [`ensure_control_token`]: заданный токен побеждает, пустой или
+/// отсутствующий — генерация. Отделено от записи в окружение, чтобы тесты
+/// не трогали глобальное состояние процесса (иначе они гонялись бы
+/// параллельно с чужими чтениями env).
+fn token_or_generate(provided: Option<&str>) -> Result<String, String> {
+    let provided = provided.map(str::trim).unwrap_or_default();
+    if provided.is_empty() {
+        return generate_token();
+    }
+    if provided.contains('\r') || provided.contains('\n') {
+        return Err(format!("{TOKEN_ENV} содержит перевод строки"));
+    }
+    Ok(provided.to_owned())
+}
+
+/// 128 бит из `/dev/urandom`, закодированные в hex.
+///
+/// Фолбэка на время/пида сознательно нет: он дал бы предсказуемый токен.
+/// `/dev/urandom` есть на обеих целевых платформах проекта (macOS, Linux),
+/// и его отсутствие — понятная ошибка, а не повод ставить слабое значение.
+fn generate_token() -> Result<String, String> {
+    let mut bytes = [0u8; TOKEN_BYTES];
+    std::fs::File::open("/dev/urandom")
+        .and_then(|mut source| source.read_exact(&mut bytes))
+        .map_err(|error| format!("не удалось прочитать /dev/urandom для токена: {error}"))?;
+    Ok(bytes.iter().map(|byte| format!("{byte:02x}")).collect())
 }
 
 /// Команда Tauri. Читает env на каждый вызов: dev-смена переменных
@@ -551,6 +614,47 @@ mod tests {
         let request = received.recv().unwrap();
         assert!(request.starts_with("POST /control/proxies HTTP/1.1"));
         assert!(request.ends_with(r#"{"lines":["http://a:8080"]}"#));
+    }
+
+    #[test]
+    fn provided_token_wins_over_generation() {
+        // Заданная извне переменная (dev-shell, launchd) всегда сильнее:
+        // в ней может быть токен уже работающего демона.
+        assert_eq!(
+            token_or_generate(Some("  known-token  ")).expect("заданный токен принимается"),
+            "known-token",
+            "значение обрезается, но не подменяется"
+        );
+    }
+
+    #[test]
+    fn missing_or_blank_token_is_generated() {
+        for provided in [None, Some(""), Some("   ")] {
+            let token = token_or_generate(provided).expect("генерация не падает");
+
+            assert_eq!(token.len(), TOKEN_BYTES * 2, "32 hex-символа: {token}");
+            assert!(
+                token
+                    .chars()
+                    .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c)),
+                "только строчные hex: {token}"
+            );
+        }
+
+        assert_ne!(
+            token_or_generate(None).expect("первый токен"),
+            token_or_generate(None).expect("второй токен"),
+            "два запуска не должны получить одно и то же значение"
+        );
+    }
+
+    #[test]
+    fn provided_token_with_newline_is_refused() {
+        // Тихая генерация вместо ошибки скрыла бы сломанный env: приложение
+        // сгенерировало бы свой токен, а демон продолжал бы жить со старым.
+        let error =
+            token_or_generate(Some("bad\ntoken")).expect_err("перевод строки должен быть отклонён");
+        assert!(error.contains("перевод строки"), "{error}");
     }
 
     #[test]

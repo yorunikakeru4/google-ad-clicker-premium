@@ -74,10 +74,18 @@ the same environment contract as the daemon:
 
 | Variable                 | Meaning                          | Default                     |
 | ------------------------ | -------------------------------- | --------------------------- |
-| `ADCLICKER_CONTROL_TOKEN`| auth token (same name as daemon) | required                    |
+| `ADCLICKER_CONTROL_TOKEN`| auth token (same name as daemon) | generated at startup        |
 | `ADCLICKER_API_URL`      | daemon control API base URL      | `http://127.0.0.1:8787`     |
 
 The token is never logged or echoed back to the frontend.
+
+On startup the app resolves the token once (`ensure_control_token` in
+`src/control.rs`): an explicitly set variable always wins, otherwise the app
+generates 128 random bits and exports them to its own environment, so the UI
+and the daemon it spawns share the same value without any manual setup — this
+is what makes a Finder launch work. Set the variable yourself only when the
+daemon is started externally (launchd plist, manual `daemon.py`): then the app
+must receive that same token, or control API calls come back as 401.
 
 ## Theming
 

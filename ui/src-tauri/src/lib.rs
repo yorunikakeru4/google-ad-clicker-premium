@@ -24,6 +24,15 @@ fn daemon_status(supervisor: tauri::State<'_, DaemonSupervisor>) -> DaemonStatus
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    // Токен control API нужен и UI, и спавнимому демону. Из Finder/launchd
+    // окружения может не быть — тогда приложение генерирует его само, до
+    // первого чтения в control.rs и до DaemonSpec::from_env. Ошибка здесь
+    // не роняет запуск: UI обязан открыться и показать причину, а без
+    // токена и спавн, и запросы упадут с теми же читаемыми сообщениями.
+    if let Err(error) = control::ensure_control_token() {
+        eprintln!("токен control API не подготовлен: {error}");
+    }
+
     let supervisor = DaemonSupervisor::new(SupervisorOptions::default());
 
     let app = tauri::Builder::default()
