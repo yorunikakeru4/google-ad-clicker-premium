@@ -326,6 +326,81 @@ class TestProfileUserAgent:
         )
 
 
+class TestProxyHealthCheck:
+    """Отбраковка мёртого exit IP до запуска Chrome (отчёт по CAPTCHA, §4.5).
+
+    ~30% строк в пуле капчат даже чистый браузер — раунд на них заведомо
+    проигран. probe=True → раунд не начинается (False), сигнал degraded
+    уходит супервизору на ротацию; probe=None (сеть молчит) → fail-open,
+    раунд идёт как обычно.
+    """
+
+    @staticmethod
+    def _run(monkeypatch, probe_result):
+        probes = []
+
+        def fake_probe(proxy):
+            probes.append(proxy)
+            return probe_result
+
+        monkeypatch.setattr(ad_clicker, "probe_proxy_captcha", fake_probe)
+        started = []
+
+        def fake_create(*args, **kwargs):
+            started.append(args)
+            raise StopBeforeBrowser()
+
+        monkeypatch.setattr(ad_clicker, "create_webdriver", fake_create)
+
+        # probe=True → run_scenario возвращает False ДО create_webdriver;
+        # иначе фейковый драйвер бросает StopBeforeBrowser, как в остальных
+        # тестах этого файла (исключения подготовки не гасятся).
+        if probe_result:
+            completed = ad_clicker.run_scenario(query="usb hub", proxy="u:p@proxy.host:80")
+        else:
+            with pytest.raises(StopBeforeBrowser):
+                ad_clicker.run_scenario(query="usb hub", proxy="u:p@proxy.host:80")
+            completed = "started"
+        return completed, probes, started
+
+    def test_captcha_flagged_proxy_skips_round_before_browser(self, monkeypatch):
+        completed, probes, started = self._run(monkeypatch, True)
+
+        assert completed is False, "отбракованный IP — раунд не начат, не успех"
+        assert probes == ["u:p@proxy.host:80"]
+        assert started == [], "Chrome не должен запускаться на мёртвом IP"
+
+    def test_unknown_probe_result_fails_open_to_the_round(self, monkeypatch):
+        # None = «проверить не удалось»: неисправность транспорта ловят
+        # свои ветки, health-check не должен отбраковывать IP вслепую.
+        completed, probes, started = self._run(monkeypatch, None)
+
+        assert probes == ["u:p@proxy.host:80"]
+        assert len(started) == 1, "при неизвестном вердикте раунд обязан начаться"
+
+    def test_clean_probe_starts_the_round(self, monkeypatch):
+        completed, probes, started = self._run(monkeypatch, False)
+
+        assert probes == ["u:p@proxy.host:80"]
+        assert len(started) == 1
+
+    def test_no_proxy_means_no_probe(self, monkeypatch):
+        probes = []
+        monkeypatch.setattr(
+            ad_clicker, "probe_proxy_captcha", lambda p: probes.append(p)
+        )
+        monkeypatch.setattr(
+            ad_clicker,
+            "create_webdriver",
+            lambda *a, **k: (_ for _ in ()).throw(StopBeforeBrowser()),
+        )
+
+        with pytest.raises(StopBeforeBrowser):
+            ad_clicker.run_scenario(query="usb hub")
+
+        assert probes == [], "без прокси health-check не вызывается"
+
+
 class TestDiagnosticsCheckpoint:
     """Снимок диагностики в сценарии: две точки входа и защита от сбоев.
 

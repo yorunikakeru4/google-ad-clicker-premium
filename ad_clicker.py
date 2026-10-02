@@ -21,6 +21,7 @@ from search_controller import SearchController
 from utils import (
     get_domains,
     is_mobile_user_agent,
+    probe_proxy_captcha,
     take_screenshot,
     generate_click_report,
 )
@@ -189,6 +190,23 @@ def run_scenario(
         log.debug("browser", "Profile applied", fields={"profile_id": profile["id"]})
 
     plugin_folder_name = "".join(random.choices(string.ascii_lowercase, k=5))
+
+    # Health-check exit IP перед раундом (отчёт по CAPTCHA, §4.5): ~30% строк
+    # в пуле капчат даже чистый браузер — раунд на них заведомо проигран, а
+    # solve сжигал бы 2captcha-бюджет и лимит сессии. Дешёвый GET /search
+    # через прокси отбраковывает такие IP до запуска Chrome; mark_degraded
+    # отдаёт сигнал супервизору на ротацию прокси. Fail-open: probe=None
+    # (сеть молчит) — раунд идёт как обычно, капчу поймает _check_captcha.
+    if proxy:
+        probe = probe_proxy_captcha(proxy)
+        if probe:
+            log.warning(
+                "proxy",
+                "proxy IP is captcha-flagged by Google, round skipped",
+                fields={"proxy": proxy.split("@")[-1]},
+            )
+            log.mark_degraded("google captcha on proxy ip")
+            return False
 
     driver, country_code = create_webdriver(proxy, user_agent, plugin_folder_name)
 

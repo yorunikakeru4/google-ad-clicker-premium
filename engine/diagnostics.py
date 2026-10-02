@@ -519,8 +519,8 @@ def check_language_vs_country(
     """Язык Accept-Language ↔ страна прокси.
 
     Страна не найдена в таблице локалей — данных нет, вывода тоже нет:
-    ``utils.get_locale_language`` для неизвестных стран возвращает ``"en"``,
-    и по нему флаговался бы каждый не-английский браузер.
+    ``utils.get_locale_language`` для неизвестных стран возвращает ``None``,
+    и без локали флаговался бы каждый не-английский браузер.
     """
     text = _text(accept_language)
     code = _text(country)

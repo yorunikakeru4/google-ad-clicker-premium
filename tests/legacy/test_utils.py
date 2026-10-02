@@ -279,8 +279,16 @@ def test_get_locale_language_returns_first_locale_for_multilingual_country():
     assert utils.get_locale_language("AF") == "ps-AF"
 
 
-def test_get_locale_language_falls_back_to_english_for_unknown_country():
-    assert utils.get_locale_language("ZZ") == "en"
+def test_get_locale_language_returns_none_for_unknown_country():
+    # None, а не прежнее "en": одиночный Accept-Language: en — редкий
+    # паттерн, который на проводе читается как аномалия (отчёт §4.1).
+    # Без локали браузер шлёт свой честный дефолт en-US,en;q=0.9.
+    assert utils.get_locale_language("ZZ") is None
+
+
+def test_get_locale_language_returns_none_without_country():
+    # Геолокация упала (country_code=None) — локаль не ставится вовсе.
+    assert utils.get_locale_language(None) is None
 
 
 def test_get_locale_language_falls_back_to_module_dir_when_cwd_has_no_file(
@@ -601,3 +609,80 @@ def test_is_mobile_user_agent_is_false_for_desktop_strings():
         "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 "
         "(KHTML, like Gecko) Chrome/136.0.0.0 Safari/537.36"
     )
+
+
+# --- probe_proxy_captcha ----------------------------------------------------------
+
+
+class _FakeResponse:
+    """Ответ requests для probe: url + тело, без сети."""
+
+    def __init__(self, url, text="", status_code=200):
+        self.url = url
+        self.text = text
+        self.status_code = status_code
+
+
+def test_probe_flags_captcha_by_sorry_url(monkeypatch):
+    monkeypatch.setattr(
+        utils.requests,
+        "get",
+        lambda *a, **k: _FakeResponse(
+            "https://www.google.com/sorry/index?continue=x", "whatever"
+        ),
+    )
+
+    assert utils.probe_proxy_captcha("user:pass@host:8080") is True
+
+
+def test_probe_flags_captcha_by_body_text(monkeypatch):
+    monkeypatch.setattr(
+        utils.requests,
+        "get",
+        lambda *a, **k: _FakeResponse(
+            "https://www.google.com/search?q=probe",
+            "Our systems have detected unusual traffic from your computer network",
+        ),
+    )
+
+    assert utils.probe_proxy_captcha("host:8080") is True
+
+
+def test_probe_passes_clean_search_page(monkeypatch):
+    monkeypatch.setattr(
+        utils.requests,
+        "get",
+        lambda *a, **k: _FakeResponse(
+            "https://www.google.com/search?q=probe", "<html>results</html>"
+        ),
+    )
+
+    assert utils.probe_proxy_captcha("host:8080") is False
+
+
+def test_probe_fails_open_on_network_error(monkeypatch):
+    # Сетевая ошибка — None (fail-open): неисправность транспорта ловят
+    # свои ветки, а ложная отбраковка здорового IP дороже пропущенного раунда.
+    def _raise(*args, **kwargs):
+        raise utils.requests.RequestException("boom")
+
+    monkeypatch.setattr(utils.requests, "get", _raise)
+
+    assert utils.probe_proxy_captcha("host:8080") is None
+
+
+def test_probe_passes_proxy_credentials_to_requests(monkeypatch):
+    captured = {}
+
+    def _get(url, proxies=None, timeout=None, headers=None):
+        captured["proxies"] = proxies
+        return _FakeResponse(url, "")
+
+    monkeypatch.setattr(utils.requests, "get", _get)
+
+    utils.probe_proxy_captcha("user:pass@proxy.host:8080")
+
+    assert captured["proxies"] == {
+        "http": "http://user:pass@proxy.host:8080",
+        "https": "http://user:pass@proxy.host:8080",
+    }

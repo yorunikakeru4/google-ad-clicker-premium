@@ -328,16 +328,19 @@ def _apply_locale(chrome_options, lang: Optional[object]) -> None:
     """Поставить локаль в опции Chrome. None — нечего применять.
 
     Основной вход — строка (``"de-DE"``): ``get_locale_language`` возвращает
-    первую локаль, поэтому в prefs уходит чистое значение, а ``--lang``
-    обрезается до языка (``lang[:2]``). ``str()`` и обработка списка
-    сохранены для старых форматов (профильные значения, legacy-конфиги;
-    см. тесты паритета).
+    первую локаль, и в prefs, и в ``--lang`` уходит один и тот же полный
+    тег — обрезка до двух букв (раньше ``lang[:2]``) рвала связку и
+    оставляла ``--lang=['de...`` от legacy-списков. ``str()`` и обработка
+    списка сохранены для старых форматов (профильные значения, legacy-конфиги;
+    см. тесты паритета), ``None`` — локаль не ставится вовсе.
     """
 
     if lang is None:
         return
     chrome_options.add_experimental_option("prefs", {"intl.accept_languages": str(lang)})
-    chrome_options.add_argument(f"--lang={str(lang)[:2]}")
+    # Полный тег, а не [:2]: обрезка рвала связку prefs/флаг (prefs "de-DE",
+    # флаг "de"), а --lang с BCP-47 тегом Chrome принимает как есть.
+    chrome_options.add_argument(f"--lang={str(lang)}")
 
 
 def _override_timezone(driver, timezone: object, fields: Optional[dict] = None) -> None:
@@ -548,9 +551,13 @@ def create_webdriver(
         geo_country, geo_timezone = country_code, timezone
 
         # Профильная локаль главнее гео-вычисления; само гео вызывается
-        # только когда включён language_from_proxy, как и раньше.
+        # только когда включён language_from_proxy, как и раньше. Страна
+        # не определена (гео упало) — локаль не ставим вообще: иначе в
+        # Accept-Language уходит одиночное "en" (отчёт по CAPTCHA, §4.1).
         geo_locale = (
-            get_locale_language(country_code) if config.webdriver.language_from_proxy else None
+            get_locale_language(country_code)
+            if config.webdriver.language_from_proxy and country_code
+            else None
         )
         _apply_locale(chrome_options, resolve_locale(profile, geo_locale))
         timezone = resolve_timezone(profile, timezone)
@@ -709,7 +716,9 @@ def create_seleniumbase_driver(
         # читает диагностика.
         geo_country, geo_timezone = country_code, timezone
 
-        if config.webdriver.language_from_proxy:
+        # Та же защита, что в UC-ветке: без определённой страны локаль
+        # не ставится (см. §4.1 отчёта по CAPTCHA).
+        if config.webdriver.language_from_proxy and country_code:
             lang = get_locale_language(country_code)
         timezone = resolve_timezone(profile, timezone)
 

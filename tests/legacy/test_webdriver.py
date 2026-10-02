@@ -877,7 +877,7 @@ class TestProfileSettings:
 
         prefs = driver.options.experimental_options["prefs"]
         assert prefs["intl.accept_languages"] == "de-DE"
-        assert "--lang=de" in driver.options.arguments
+        assert "--lang=de-DE" in driver.options.arguments
 
     def test_without_a_profile_the_geo_locale_is_used_unchanged(
         self,
@@ -898,7 +898,7 @@ class TestProfileSettings:
         # обрезанный до языка (раньше сюда уходил str() от списка).
         prefs = driver.options.experimental_options["prefs"]
         assert prefs["intl.accept_languages"] == "de-DE"
-        assert "--lang=de" in driver.options.arguments
+        assert "--lang=de-DE" in driver.options.arguments
 
     def test_empty_profile_locale_keeps_the_geo_one(
         self,
@@ -938,7 +938,7 @@ class TestProfileSettings:
 
         prefs = driver.options.experimental_options["prefs"]
         assert prefs["intl.accept_languages"] == "fr-FR"
-        assert "--lang=fr" in driver.options.arguments
+        assert "--lang=fr-FR" in driver.options.arguments
 
     def test_disabled_geo_flag_without_profile_leaves_locale_alone(
         self, isolated_tempdir, fake_chrome, geolocated_proxy, transport
@@ -949,6 +949,25 @@ class TestProfileSettings:
 
         prefs = driver.options.experimental_options.get("prefs", {})
         assert "intl.accept_languages" not in prefs
+
+    def test_failed_geo_lookup_does_not_force_english_locale(
+        self, isolated_tempdir, fake_chrome, config, monkeypatch, transport
+    ):
+        # Гео упало (нет страны) при включённом language_from_proxy:
+        # раньше уходил get_locale_language(None)="en" → Accept-Language: en
+        # (одиночный "en" — редкий паттерн, читается как аномалия, отчёт §4.1).
+        # Теперь локаль не ставится вовсе — браузер шлёт свой честный дефолт.
+        transport("direct")
+        monkeypatch.setattr(config.webdriver, "language_from_proxy", True)
+        monkeypatch.setattr(
+            webdriver, "get_location", lambda client, proxy: (None, None, None, None)
+        )
+
+        driver, _ = webdriver.create_webdriver(PROXY, "Mozilla/5.0", "abcde")
+
+        prefs = driver.options.experimental_options.get("prefs", {})
+        assert "intl.accept_languages" not in prefs
+        assert "--lang=en" not in driver.options.arguments
 
     def test_profile_locale_is_applied_without_a_proxy(
         self, isolated_tempdir, fake_chrome, assign_profile, transport

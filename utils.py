@@ -723,13 +723,20 @@ def _check_error(response_text: str, request_type: str = "in_php") -> tuple[bool
     return (error_to_exit, error_to_continue, error_to_break)
 
 
-def get_locale_language(country_code: str) -> str:
+def get_locale_language(country_code: Optional[str]) -> Optional[str]:
     """Get locale language for the given country code
 
-    :type country_code: str
+    :type country_code: Optional[str]
     :param country_code: Country code for proxy IP
-    :rtype: str
+    :rtype: Optional[str]
     :returns: Primary locale for the given country code (напр. ``"de-DE"``)
+        или ``None``, если страна неизвестна/не определена геолокацией
+
+    ``None`` вместо прежнего ``"en"``: одиночный Accept-Language ``en`` —
+    редкий для десктопа паттерн, который на проводе читается как аномалия
+    (отчёт по CAPTCHA, §4.1). Без локали браузер шлёт свой честный
+    дефолт (``en-US,en;q=0.9``); защита от ``country_code=None`` есть и в
+    ``webdriver`` (обе ветки), здесь — для неизвестных стран.
     """
 
     log.debug("browser", "Getting locale language...", fields={"country_code": country_code})
@@ -751,16 +758,78 @@ def get_locale_language(country_code: str) -> str:
 
     # Список → первая локаль: str(list) уходил в prefs и в --lang как
     # "['de-DE']" (и в --lang=['de-DE'] при срезе [:2]), а поле Accept-Language
-    # в снимке диагностики выглядело как массив. Пустой список — английский.
-    locales_list = locales.get(country_code) or ["en"]
+    # в снимке диагностики выглядело как массив. Нет записи (неизвестная
+    # страна, гео не определено) → None, локаль не ставится вовсе.
+    locales_list = locales.get(country_code) if country_code else None
 
     log.debug(
         "browser",
         "Locale language code",
-        fields={"country_code": country_code, "language": locales_list[0]},
+        fields={"country_code": country_code, "language": locales_list[0] if locales_list else None},
     )
 
-    return locales_list[0]
+    return locales_list[0] if locales_list else None
+
+
+# Честный UA для probe-запроса: python-requests сам по себе уже аномалия,
+# а нам нужно отличить «IP в бане» от «клиент странный» — шлём как Chrome.
+_PROBE_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/153.0.0.0 Safari/537.36"
+)
+
+_PROBE_URL = "https://www.google.com/search?q=proxy+health+check"
+
+
+def probe_proxy_captcha(proxy: str, timeout: float = 10.0) -> Optional[bool]:
+    """Прямой GET /search через прокси: отбраковка мёртвого exit IP.
+
+    Дешёвый health-check перед раундом (отчёт по CAPTCHA, §4.5): мёртый
+    IP (капча даже чистому браузеру) виден на неавторизованном запросе —
+    ``/sorry/`` в URL или ``unusual traffic`` в теле, — и раунд на нём
+    заведомо проигран.
+
+    :type proxy: str
+    :param proxy: Прокси в формате ``[user:pass@]host:port``
+    :type timeout: float
+    :param timeout: Таймаут запроса, сек
+    :rtype: Optional[bool]
+    :returns: ``True`` — IP в бане (капча), ``False`` — чисто,
+        ``None`` — проверить не удалось (сеть/прокси молчит)
+
+    Fail-open: сетевая ошибка — ``None``, а не ``True``: неисправность
+    транспорта ловят свои ветки (proxy_health/CDP-degraded), а ложная
+    отбраковка здорового IP ротацией обошлась бы дороже пропущенного
+    раунда. Креды в логи не попадают — вызывающий маскирует сам.
+    """
+
+    proxies = {"http": f"http://{proxy}", "https": f"http://{proxy}"}
+    try:
+        response = requests.get(
+            _PROBE_URL,
+            proxies=proxies,
+            timeout=timeout,
+            headers={"User-Agent": _PROBE_UA},
+        )
+    except requests.RequestException as exp:
+        log.debug(
+            "proxy",
+            "proxy captcha probe did not complete",
+            fields={"error_type": type(exp).__name__},
+        )
+        return None
+
+    flagged = "/sorry/" in response.url or "unusual traffic" in response.text.lower()
+    log.debug(
+        "proxy",
+        "proxy captcha probe",
+        fields={
+            "proxy": proxy.split("@")[-1],
+            "status_code": response.status_code,
+            "captcha": flagged,
+        },
+    )
+    return flagged
 
 
 def resolve_redirect(url: str) -> str:
