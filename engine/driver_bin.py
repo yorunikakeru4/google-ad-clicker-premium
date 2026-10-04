@@ -87,6 +87,38 @@ def browser_version(executable: str, runner: Callable | None = None) -> str:
     return match.group(1)
 
 
+def installed_driver_version(path: str | Path) -> str | None:
+    """Версия уже лежащего драйвера из ``<driver> --version``. None — не вышло.
+
+    Кэш драйвера живёт отдельно от браузера и не пересоздаётся при смене
+    браузера: подменить Chromium 153 на Chrome 140 и взять старый драйвер
+    значит получить ``session not created: only supports Chrome version 153``
+    уже на старте Chrome. Версию читаем с самого файла, а не запоминаем в
+    маркере: файл мог положить туда прежний код или оператор руками.
+
+    Нечитаемый файл (не бинарь, нет прав, обрезан) — None, а не ошибка:
+    такое сравнивать не с чем, и правило «уже лежит → не трогаем» важнее
+    лишней перекачки.
+    """
+
+    try:
+        result = subprocess.run(
+            [str(path), "--version"], capture_output=True, text=True, timeout=15
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    match = _VERSION_RE.search(f"{result.stdout}{result.stderr}")
+    return None if match is None else match.group(1)
+
+
+def _same_major(left: str | None, right: str | None) -> bool:
+    """Совпадение major: chromedriver связан с major браузера жёстко."""
+    if left is None or right is None:
+        return True
+    return left.split(".", 1)[0] == right.split(".", 1)[0]
+
+
+
 def cft_platform() -> str:
     """Платформенная метка CfT: ``linux64`` | ``mac-x64`` | ``mac-arm64`` | ``win64``."""
     import sys
@@ -197,14 +229,33 @@ def prepare_driver(
     Скачивание атомарно (tmp + ``os.replace``), поэтому параллельные воркеры
     не ловят частичный файл. Маркер ставится после любой поставки — UC патч
     пропущен, байткод нетронут.
+
+    Файл на месте — возвращается без сети, но только пока его major совпадает
+    с major браузера: кэш переживает смену браузера (154 → 140), а драйвер
+    от чужого major даёт ``session not created`` уже на старте Chrome. Если
+    сверить не с чего (драйвер не отдаёт версию, браузер не отвечает),
+    действует прежнее правило «лежит → не трогаем».
     """
     dest = Path(dest)
-    if dest.is_file():
-        _append_marker(dest)
-        return dest
-
     version_fn = browser_ver or (lambda: browser_version(_find_browser()))
-    version = version_fn()
+
+    if dest.is_file():
+        installed = installed_driver_version(dest)
+        browser = None
+        if installed is not None:
+            try:
+                browser = version_fn()
+            except RuntimeError:
+                browser = None
+        if browser is None or _same_major(installed, browser):
+            _append_marker(dest)
+            return dest
+        # Major разошёлся — старый драйвер уже бесполезен, перекачиваем под
+        # новый: версия браузера тут же понадобится для URL, переиспользуем.
+        version = browser
+    else:
+        version = version_fn()
+
     url = resolve_chromedriver_url(version, fetch_bytes=fetch_bytes, fetch_text=fetch_text)
     try:
         payload = fetch_bytes(url)

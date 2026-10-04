@@ -170,6 +170,74 @@ def test_prepare_existing_file_only_marks_it(tmp_path) -> None:
     assert UC_MARKER in target.read_bytes()
 
 
+def _versioned_driver(version: str) -> bytes:
+    """Исполняемый «драйвер», отдающий нужную строку версии."""
+
+    return f'#!/bin/sh\necho "ChromeDriver {version} (deadbeef)"\n'.encode()
+
+
+def test_installed_driver_version_reads_the_binary_and_none_for_garbage(tmp_path) -> None:
+    good = tmp_path / "good"
+    good.write_bytes(_versioned_driver("140.0.7339.207"))
+    good.chmod(0o755)
+
+    bad = tmp_path / "bad"
+    bad.write_bytes(b"payload")
+
+    assert driver_bin.installed_driver_version(good) == "140.0.7339.207"
+    assert driver_bin.installed_driver_version(bad) is None
+    assert driver_bin.installed_driver_version(tmp_path / "absent") is None
+
+
+def test_prepare_keeps_the_driver_of_the_same_major(tmp_path) -> None:
+    """Major совпал (140 ↔ 140.0.7339.212) — кэш не трогается, сеть молчит."""
+    target = tmp_path / "chromedriver"
+    target.write_bytes(_versioned_driver("140.0.7339.207"))
+    target.chmod(0o755)
+
+    def no_fetch(url: str):
+        raise AssertionError("та же major — перекачивать нечего")
+
+    result = prepare_driver(
+        target,
+        fetch_bytes=no_fetch,
+        fetch_text=no_fetch,
+        browser_ver=lambda: "140.0.7339.212",
+    )
+
+    assert result == target
+    assert UC_MARKER in target.read_bytes()
+
+
+def test_prepare_replaces_the_driver_left_from_another_major(tmp_path) -> None:
+    """Сменили браузер (153 → 140): старый драйвер обязан уехать под новый.
+
+    Поймано живым прогоном: кэш лежал от Chromium 153, под Chrome 140 сессия
+    не создавалась с «This version of ChromeDriver only supports Chrome
+    version 153». Кэш переживает смену браузера, major — нет.
+    """
+    target = tmp_path / "chromedriver"
+    target.write_bytes(_versioned_driver("153.0.8010.36"))
+    target.chmod(0o755)
+    requests: list[str] = []
+
+    def fetch_bytes(url: str) -> bytes:
+        requests.append(url)
+        return _fake_zip(payload=b"#!/bin/sh\necho driver 140\n")
+
+    prepare_driver(
+        target,
+        fetch_bytes=fetch_bytes,
+        fetch_text=fetch_bytes,
+        browser_ver=lambda: "140.0.7339.207",
+    )
+
+    assert requests and requests[0].endswith("/140.0.7339.207/chromedriver-linux64.zip")
+    assert b"153.0.8010.36" not in target.read_bytes(), "старый драйвер должен быть заменён"
+    assert b"driver 140" in target.read_bytes()
+    assert UC_MARKER in target.read_bytes()
+
+
 def test_prepare_downloads_unpacks_marks_and_is_executable(tmp_path) -> None:
     target = tmp_path / "chromedriver"
     requests: list[str] = []
