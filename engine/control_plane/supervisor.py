@@ -36,11 +36,15 @@ in-memory ``last_heartbeat`` строго по факту роста значе�
 (``is_alive=1``) и не занятым другим живым воркером строкам, внутри
 категории берётся наименее используемая (``usage_count``, затем ``id``), чтобы
 нагрузка не садилась на один прокси. Свободных нет — прокси делится с WARNING
-(старт блокировать нельзя); живых нет или пул пуст — спавн без
-``ADCLICKER_PROXY``, как и до этой фичи. Наследие переменной из окружения
-демона снимается: иначе воркеры мимо пула получили бы один и тот же прокси.
-Факт выдачи уходит в ``workers.proxy_id`` (StateStore), строку ``proxy_usage``
-и лог с категорией ``proxy`` — без кредов, только ``proxy_id``.
+(старт блокировать нельзя); живых нет, но пул при этом непуст — спавн
+отклоняется (:class:`NoAliveProxyError`, в HTTP это 503 ``no_alive_proxy``):
+воркер без переменной молча берёт строку из ``paths.proxy_file`` и обходит
+health-проверку целиком, то есть браузер получил бы помеченный мёртвым прокси.
+Пул пуст — legacy-режим «прокси только из файла», он не блокируется. Наследие
+переменной из окружения демона снимается: иначе воркеры мимо пула получили бы
+один и тот же прокси. Факт выдачи уходит в ``workers.proxy_id`` (StateStore),
+строку ``proxy_usage`` и лог с категорией ``proxy`` — без кредов, только
+``proxy_id``.
 
 **Ротация.** Воркер, пометивший себя ``degraded`` (прокси/CDP перестал
 работать), не остаётся в ``running``: ``tick()`` видит сигнал и подменяет
@@ -54,7 +58,10 @@ in-memory ``last_heartbeat`` строго по факту роста значе�
 рестартов: повторная деградация сразу после подмены не превращается в
 плотный цикл. Тот же путь подмены обслуживает публичный ``rotate_all`` —
 внешний триггер (политика порога CAPTCHA) без статуса ``degraded``; он берёт
-только свободный резерв и уважает тот же backoff.
+только свободный резерв и уважает тот же backoff. Третий триггер — сама
+health-проверка: прокси, назначенный живому воркеру и помеченный
+``is_alive=0``, ротируется тем же ``_handle_degraded`` (иначе воркер знал бы
+о мёртвом прокси только по своей ошибке, а браузер поднимался бы по раунду).
 
 **Назначение профиля.** Каждый спавн (первый, респавн после падения, ротация
 прокси) начинается с ``ProfilePool.take_for_worker``: выданный профиль уходит
@@ -173,6 +180,16 @@ class InvalidWorkerCountError(SupervisorError):
 
 class WorkerSpawnError(SupervisorError):
     """Не удалось запустить процесс воркера."""
+
+
+class NoAliveProxyError(SupervisorError):
+    """Пул непуст, но живых строк в нём нет — спавн без прокси запрещён.
+
+    Воркер без ``ADCLICKER_PROXY`` молча берёт строку из ``paths.proxy_file``
+    (``_LegacySource.proxies``) и обходит health-проверку целиком: прокси,
+    помеченный мёртвым (4xx/5xx, 407, таймаут), снова получил бы браузер.
+    Пустой пул — legacy-режим «прокси только из файла», он не блокируется.
+    """
 
 
 @dataclass(frozen=True)
@@ -382,6 +399,11 @@ class _Worker:
     # «exhausted» для текущей деградации уже записан: без флага каждый тик
     # плодил бы новую строку, пока резерв не найден.
     degraded_recorded: bool = False
+    # Респавн отложен из-за пустого списка живых прокси (NoAliveProxyError).
+    # Свой счётчик, а не restart_count: это состояние пула, а не падение
+    # воркера, и circuit breaker за него отвечать не должен. Обнуляется
+    # успешным спавном.
+    proxy_waits: int = 0
 
     def is_alive(self) -> bool:
         return self.process.poll() is None
@@ -502,6 +524,7 @@ class Supervisor:
         profile = self._take_profile(browser_id)
         try:
             picked = self._pick_spawn_proxy(browser_id, profile)
+            self._require_alive_proxy(picked)
             proxy = None if picked is None else picked[0]
             process = self._spawn_checked(browser_id, proxy, profile)
         except BaseException:
@@ -624,6 +647,21 @@ class Supervisor:
 
     # --- прокси: выбор, выдача, ротация -----------------------------------
 
+    def _require_alive_proxy(self, picked: tuple[dict[str, Any], str] | None) -> None:
+        """Отклоняет спавн без прокси, когда пул при этом непуст.
+
+        ``picked is None`` в непустом пуле означает «живых строк нет»: без
+        переменной воркер уходит в legacy-ветку ``paths.proxy_file`` и берёт
+        оттуда любую строку, включая помеченную health-проверкой мёртвой —
+        проверка в UI при этом показывала бы 4xx/5xx. Пустой пул — режим
+        «прокси только из файла», воркер спавнится как раньше.
+        """
+        if picked is None and self.proxy_pool.list_proxies():
+            raise NoAliveProxyError(
+                "в пуле прокси нет живых строк — спавн отклонён, "
+                "запустите проверку прокси"
+            )
+
     def _pick_proxy(
         self,
         browser_id: str,
@@ -686,8 +724,12 @@ class Supervisor:
             # и профиль, выданный перед спавном, обязан уцелеть.
             self.store.release_proxy(browser_id)
             if self.proxy_pool.list_proxies():
-                # Пул непустой, но живых строк нет: воркер работает без
-                # прокси не по своему выбору, и это должно быть видно.
+                # Сюда доходим только если _require_alive_proxy и выбор прокси
+                # разошлись (гонка: строку успели удалить между чтениями).
+                # Непустой пул без живых строк отсекается ещё до спавна, а
+                # пустой пул сюда не попадает — list_proxies() его не вернёт.
+                # Страховка: воркер работает без прокси не по своему выбору,
+                # и это обязано быть видно, а не прятаться.
                 self.store.log(
                     "WARNING",
                     "proxy",
@@ -736,9 +778,20 @@ class Supervisor:
         )
 
     def _handle_degraded(
-        self, browser_id: str, worker: _Worker, stored: dict[str, Any]
+        self,
+        browser_id: str,
+        worker: _Worker,
+        stored: dict[str, Any],
+        *,
+        reason: str | None = None,
     ) -> None:
-        """Ротация прокси для воркера, пометившего себя ``degraded``.
+        """Ротация прокси для воркера с нерабочим прокси.
+
+        Причина приходит отовсюду: по умолчанию — строка из
+        ``workers.last_error``, которую записал сам воркер (``mark_degraded``);
+        явным аргументом — результат health-проверки его прокси
+        (``_failed_check_reason``), при котором статус на degraded не
+        меняется и в ``last_error`` ничего не дописывается.
 
         Сначала фиксируется исчерпание текущего прокси (ровно раз на
         деградацию — иначе каждый тик плодил бы строки), потом ищется
@@ -756,8 +809,8 @@ class Supervisor:
             # Причина воркера — та же строка, что уже лежит в workers.last_error
             # и видна в UI: в лог она попадает, чтобы событие было читаемо
             # само по себе. Кредов в ней нет — их туда не кладёт mark_degraded.
-            reason = stored.get("last_error")
-            reason_fields: dict[str, Any] | None = {"reason": reason} if reason else None
+            cause = stored.get("last_error") if reason is None else reason
+            reason_fields: dict[str, Any] | None = {"reason": cause} if cause else None
             if current_id is None:
                 self.store.log(
                     "WARNING",
@@ -1237,14 +1290,17 @@ class Supervisor:
     def _reconcile(self, browser_id: str, worker: _Worker) -> None:
         """Приводит одного воркера в соответствие с реальностью.
 
-        Четыре состояния, и порядок проверок важен:
+        Пять состояний, и порядок проверок важен:
 
         1. circuit открыт — ничего не делаем, пользователь должен вмешаться;
         2. процесс жив и помечен ``degraded`` — ротация прокси, и статус
            НЕ затирается на running: сигнал воркера иначе прожил бы ровно
            один тик, и подмена прокси никогда не случилась бы;
-        3. процесс жив — обновляем статус на running;
-        4. процесс мёртв — либо ждём backoff, либо падение уже записано и
+        3. процесс жив, а health-проверка уже пометила его прокси мёртвым —
+           та же ротация: воркер об этом не знает и продолжает поднимать
+           по раунду новый браузер на том же адресе;
+        4. процесс жив — обновляем статус на running;
+        5. процесс мёртв — либо ждём backoff, либо падение уже записано и
            пора поднимать, либо записываем падение впервые.
         """
         if worker.circuit_open:
@@ -1255,6 +1311,14 @@ class Supervisor:
             if stored is not None and stored["status"] == WorkerStatus.DEGRADED.value:
                 self._handle_degraded(browser_id, worker, stored)
                 return
+            reason = None if stored is None else self._failed_check_reason(stored)
+            if reason is not None:
+                # Статус на degraded НЕ переводим: его ставит сам воркер, а
+                # здесь важно только решение о подмене. Иначе прокси,
+                # снова прошедший проверку, не вернул бы воркера в running —
+                # ветка degraded крутилась бы уже без причины.
+                self._handle_degraded(browser_id, worker, stored, reason=reason)
+                return
             self._mark_running(browser_id, worker, stored)
             return
 
@@ -1263,6 +1327,24 @@ class Supervisor:
             return
 
         self._handle_crash(browser_id, worker)
+
+    def _failed_check_reason(self, stored: dict[str, Any]) -> str | None:
+        """Причина, по которой назначенный прокси стал непригоден. None — годен.
+
+        Пул — источник правды: health-проверка отметила строку ``is_alive=0``
+        (4xx/5xx, 407, таймаут), а воркер об этом не знает. Причина берётся
+        из ``proxies.last_error`` — она построена без значений кредов
+        (см. engine.proxy_health). Удалённая строка — не повод для ротации:
+        ссылку в ``workers.proxy_id`` гасит сам FK ``ON DELETE SET NULL``.
+        """
+        proxy_id = stored.get("proxy_id")
+        if not proxy_id:
+            return None
+        proxy = self.proxy_pool.get(proxy_id)
+        if proxy is None or proxy.get("is_alive") == 1:
+            return None
+        return str(proxy.get("last_error") or "assigned proxy failed health check")
+
 
     def _mark_running(
         self, browser_id: str, worker: _Worker, stored: dict[str, Any] | None
@@ -1286,7 +1368,36 @@ class Supervisor:
         """Поднимает воркера, если срок backoff вышел."""
         if self._clock.wall() < worker.next_start_at:
             return
-        self._restart_worker(browser_id, worker)
+        try:
+            self._restart_worker(browser_id, worker)
+        except NoAliveProxyError as exc:
+            self._defer_respawn(browser_id, worker, exc)
+
+    def _defer_respawn(self, browser_id: str, worker: _Worker, exc: NoAliveProxyError) -> None:
+        """Откладывает респавн: в пуле не осталось живого прокси.
+
+        Исключение наружу не уходит: причина — состояние пула, которое
+        лечится проверкой прокси, а не остановкой демона вместе с циклом
+        run_idle. Свой счётчик (``proxy_waits``), а не ``restart_count`` —
+        иначе простой из-за мёртвых прокси выглядел бы как падение воркера
+        и отъедал бы лимит circuit breaker.
+        """
+        now = self._clock.wall()
+        worker.proxy_waits += 1
+        delay = backoff_delay(
+            worker.proxy_waits,
+            base=self.settings.restart_backoff_base,
+            maximum=self.settings.restart_backoff_max,
+        )
+        worker.next_start_at = now + delay
+        self.store.set_status(browser_id, WorkerStatus.BACKOFF, error=str(exc))
+        self.store.log(
+            "WARNING",
+            "proxy",
+            "worker restart postponed: no alive proxy",
+            {"retry_in": delay, "attempt": worker.proxy_waits},
+            browser_id=browser_id,
+        )
 
     def _maybe_reset_restart_count(self, worker: _Worker) -> None:
         """Обнуляет счётчики, если воркер проработал достаточно долго.
@@ -1391,6 +1502,10 @@ class Supervisor:
         profile = self._take_profile(browser_id)
         try:
             picked = self._pick_spawn_proxy(browser_id, profile)
+            # Единственное исключение, которое _maybe_respawn ловит и
+            # превращает в отложенный повтор: остальные уходят через tick()
+            # наружу и останавливали бы цикл run_idle.
+            self._require_alive_proxy(picked)
             proxy = None if picked is None else picked[0]
             process = self._spawn_checked(browser_id, proxy, profile)
         except BaseException:
@@ -1405,6 +1520,8 @@ class Supervisor:
         worker.started_at = now
         worker.last_heartbeat = now
         worker.next_start_at = now
+        # Пул снова дал прокси — счётчик ожидания больше не нужен.
+        worker.proxy_waits = 0
         # Сбрасываем флаг, иначе следующее падение не было бы засчитано:
         # тик увидел бы crash_recorded=True и ушёл в ветку backoff без записи.
         worker.crash_recorded = False

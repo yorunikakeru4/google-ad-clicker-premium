@@ -575,6 +575,50 @@ class TestAutoRestart:
         assert len(registry.created) == 2
         assert store.get_worker("br-1")["restart_count"] == 1
 
+    def test_respawn_is_postponed_while_the_pool_has_no_alive_proxy(
+        self, store, registry, clock, settings, db_path
+    ):
+        """Упавший воркер не поднимается на прокси, который проверка отбраковала.
+
+        Респавн без ``ADCLICKER_PROXY`` увёл бы воркер в legacy-ветку
+        ``paths.proxy_file`` — то есть браузер получил бы помеченный мёртвым
+        прокси. Исключение при этом не должно дойти до ``tick()``: причина —
+        состояние пула, а не падение демона.
+        """
+        pool = make_pool(db_path)
+        pool.add_lines(["alice:s3cr3t@10.0.0.1:8080"])
+        proxy_id = pool.list_proxies()[0]["id"]
+        supervisor = make_supervisor(store, registry, clock, settings)
+        supervisor.start(1)
+
+        registry.created[0].exit(1)
+        supervisor.tick()  # падение записано, backoff назначен
+        pool.record_check_result(proxy_id, alive=False, error="прокси ответил 503")
+        clock.advance(sup.RESTART_BACKOFF_BASE_SECONDS)
+        supervisor.tick()  # respawn отклонён — и tick при этом не падает
+
+        assert len(registry.created) == 1, "без живого прокси процесс не поднимается"
+        worker = store.get_worker("br-1")
+        assert worker["status"] == WorkerStatus.BACKOFF.value
+        assert "нет живых строк" in (worker["last_error"] or "")
+        assert worker["restart_count"] == 1, "ожидание прокси — не падение воркера"
+        postponed = [
+            row
+            for row in proxy_logs(store, level="WARNING")
+            if "no alive proxy" in row["message"]
+        ]
+        assert len(postponed) == 1
+
+        # Прокси снова прошёл проверку — воркер поднимается тем же механизмом.
+        pool.record_check_result(proxy_id, alive=True, latency_ms=17)
+        clock.advance(sup.RESTART_BACKOFF_BASE_SECONDS)
+        supervisor.tick()
+
+        assert len(registry.created) == 2
+        assert store.get_worker("br-1")["status"] == WorkerStatus.STARTING.value
+        assert registry.start_calls[1]["env"]["ADCLICKER_PROXY"] == "alice:s3cr3t@10.0.0.1:8080"
+        assert "s3cr3t" not in all_log_text(store)
+
     def test_backoff_doubles_each_failure(self, store, registry, clock, settings):
         """Второе падение ждёт вдвое дольше первого.
 
@@ -1672,21 +1716,28 @@ class TestProxyAssignment:
         assert all(store.get_worker(b)["proxy_id"] is None for b in ("br-1", "br-2"))
         assert usage_rows(store) == []
 
-    def test_dead_proxy_is_never_assigned(self, store, registry, clock, settings, db_path):
-        """Жив только ``is_alive=1``: мёртвый прокси не выдаётся даже в дележе."""
+    def test_start_is_refused_while_the_pool_has_no_alive_proxy(
+        self, store, registry, clock, settings, db_path
+    ):
+        """Непустой пул без живых строк — старт отклоняется, а не идёт мимо проверки.
+
+        Прежнее поведение (спавн без ``ADCLICKER_PROXY``) отдавало воркеру
+        legacy-ветку ``paths.proxy_file``: браузер поднимался с прокси,
+        помеченным health-проверкой мёртвым, а в UI при этом красовались
+        4xx/5xx. Пустой пул — режим «прокси только из файла», он не блокируется.
+        """
         pool = make_pool(db_path)
         pool.add_lines(["alice:s3cr3t@10.0.0.1:8080"])
         proxy_id = pool.list_proxies()[0]["id"]
-        pool.record_check_result(proxy_id, alive=False, error="timeout")
+        pool.record_check_result(proxy_id, alive=False, error="прокси ответил 502")
         supervisor = make_supervisor(store, registry, clock, settings)
 
-        supervisor.start(1)
+        with pytest.raises(sup.NoAliveProxyError):
+            supervisor.start(1)
 
-        assert "ADCLICKER_PROXY" not in registry.start_calls[0]["env"]
-        assert store.get_worker("br-1")["proxy_id"] is None
-        assert proxy_logs(store, level="WARNING"), (
-            "непустой, но мёртвый пул должен быть заметен в логе"
-        )
+        assert registry.created == [], "без живого прокси процесс не поднимается"
+        assert store.get_worker("br-1") is None, "отклонённый спавн не оставляет строки"
+        assert store.get_run_state() == "stopped", "частично поднятый пул обязан откатиться"
 
     def test_assignment_is_logged_without_credentials(
         self, store, registry, clock, settings, db_path
@@ -1773,6 +1824,107 @@ class TestProxyRotation:
     темп задаётся тем же backoff'ом, что и у рестартов, чтобы подмена не
     превращалась в плотный цикл.
     """
+
+    def test_health_check_of_the_assigned_proxy_triggers_rotation(
+        self, store, registry, clock, settings, db_path
+    ):
+        """Прокси, помеченный проверкой мёртвым, подменяется без сигнала воркера.
+
+        Воркер о health-проверке не знает: он продолжает раунды и поднимает
+        по ним новый браузер на том же адресе. Единственный, кто знает, —
+        супервизор, сверяющий ``workers.proxy_id`` с ``is_alive``.
+        """
+        pool = make_pool(db_path)
+        pool.add_lines(["alice:s3cr3t@10.0.0.1:8080", "bob:hunter2@10.0.0.2:9090"])
+        ids = [row["id"] for row in pool.list_proxies()]
+        supervisor = make_supervisor(store, registry, clock, settings)
+        supervisor.start(1)
+        assert store.get_worker("br-1")["proxy_id"] == ids[0]
+
+        pool.record_check_result(ids[0], alive=False, error="прокси ответил 502")
+        supervisor.tick()
+
+        assert len(registry.created) == 2, "ротация обязательна: старый процесс погашен"
+        assert registry.created[0].poll() is not None
+        assert store.get_worker("br-1")["proxy_id"] == ids[1]
+        assert registry.start_calls[1]["env"]["ADCLICKER_PROXY"] == (
+            "bob:hunter2@10.0.0.2:9090"
+        )
+        exhausted = [row for row in proxy_logs(store) if row["message"] == "proxy exhausted"]
+        assert len(exhausted) == 1, "исчерпание фиксируется один раз на деградацию"
+        assert json.loads(exhausted[0]["fields"])["reason"] == "прокси ответил 502"
+        assert store.get_worker("br-1")["restart_count"] == 0, "ротация — не падение воркера"
+        assert "s3cr3t" not in all_log_text(store)
+        assert "hunter2" not in all_log_text(store)
+
+    def test_health_check_without_a_reserve_keeps_the_worker_alive(
+        self, store, registry, clock, settings, db_path
+    ):
+        """Резерва нет — процесс не убивается: убийство ничего не чинило бы."""
+
+        def postponed():
+            return [
+                row
+                for row in proxy_logs(store, level="WARNING")
+                if "rotation postponed" in row["message"]
+            ]
+
+        pool = make_pool(db_path)
+        pool.add_lines(["alice:s3cr3t@10.0.0.1:8080"])
+        proxy_id = pool.list_proxies()[0]["id"]
+        supervisor = make_supervisor(store, registry, clock, settings)
+        supervisor.start(1)
+        worker_status = store.get_worker("br-1")["status"]
+
+        pool.record_check_result(proxy_id, alive=False, error="таймаут подключения к прокси")
+        supervisor.tick()
+
+        assert len(registry.created) == 1, "без резерва процесс остаётся"
+        assert registry.created[0].poll() is None
+        assert store.get_worker("br-1")["proxy_id"] == proxy_id
+        assert len(postponed()) == 1
+        assert len([r for r in proxy_logs(store) if r["message"] == "proxy exhausted"]) == 1
+
+        # Тики без времени не плодят предупреждения и попытки.
+        supervisor.tick()
+        supervisor.tick()
+        assert len(postponed()) == 1
+        assert len(registry.created) == 1
+
+        clock.advance(sup.RESTART_BACKOFF_BASE_SECONDS)
+        supervisor.tick()
+        assert len(postponed()) == 2, "попытка обязана повторяться по интервалу"
+        assert store.get_worker("br-1")["status"] == worker_status, (
+            "проверка не должна переопределять статус, который ставит сам воркер"
+        )
+
+    def test_proxy_that_passed_a_recheck_is_not_rotated(
+        self, store, registry, clock, settings, db_path
+    ):
+        """Ошибочная отбраковка не должна стоить ротации: проверка главнее.
+
+        Статус воркера при отбраковке не меняется на degraded — иначе ветка
+        ротации крутилась бы уже без причины и подменила бы рабочий прокси.
+        """
+        pool = make_pool(db_path)
+        pool.add_lines(["alice:s3cr3t@10.0.0.1:8080"])
+        proxy_id = pool.list_proxies()[0]["id"]
+        supervisor = make_supervisor(store, registry, clock, settings)
+        supervisor.start(1)
+
+        pool.record_check_result(proxy_id, alive=False, error="прокси ответил 503")
+        supervisor.tick()
+        assert len(registry.created) == 1, "без резерва и так не ротируем"
+
+        pool.record_check_result(proxy_id, alive=True, latency_ms=42)
+        clock.advance(sup.RESTART_BACKOFF_BASE_SECONDS)
+        supervisor.tick()
+        supervisor.tick()
+
+        assert len(registry.created) == 1, "восстановившийся прокси подменять нельзя"
+        assert store.get_worker("br-1")["proxy_id"] == proxy_id
+        assert registry.created[0].poll() is None
+        assert [row["result"] for row in usage_rows(store)] == ["assigned", "exhausted"]
 
     def test_degraded_worker_is_respawned_with_a_reserve_proxy(
         self, store, registry, clock, settings, db_path

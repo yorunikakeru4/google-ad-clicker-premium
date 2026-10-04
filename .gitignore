@@ -153,8 +153,10 @@ downloaded_files/
 .worktrees/
 
 # локальные данные юзера: креды прокси не должны попасть в git,
-# запросы — его рабочий список, а не часть репозитория
-proxies.txt
+# запросы — его рабочий список, а не часть репозитория. Маска, а не имя:
+# рядом могут лежать бэкапы того же списка (proxies.txt.webshare-backup)
+# с теми же кредами.
+proxies.txt*
 queries.txt
 
 # локальные venv (bootstrap-venv, .venv-sb для пробы seleniumbase)

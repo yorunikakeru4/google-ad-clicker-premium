@@ -37,6 +37,7 @@ from engine.control_plane.config import Config, ConfigError
 from engine.control_plane.supervisor import (
     AlreadyRunningError,
     InvalidWorkerCountError,
+    NoAliveProxyError,
     NotPausedError,
     NotRunningError,
     Supervisor,
@@ -92,6 +93,10 @@ _ERROR_STATUS = {
     NotPausedError: ("not_paused", 409),
     InvalidWorkerCountError: ("invalid_worker_count", 400),
     WorkerSpawnError: ("worker_spawn_failed", 503),
+    # Пул непуст, но живых строк нет: старт/рестарт без прокси дал бы воркеру
+    # строку из файла в обход health-проверки. 503, а не 400 — тело запроса
+    # корректно, отклоняет состояние пула.
+    NoAliveProxyError: ("no_alive_proxy", 503),
     ConfigError: ("invalid_config", 400),
     # Подсистема прокси: конфликт состояния, отсутствующая строка и ошибка
     # импорта. Каждый код — из контракта /control/proxies*, а не выдуман.

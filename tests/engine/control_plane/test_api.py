@@ -29,6 +29,7 @@ from engine.control_plane.api import (
 from engine.control_plane.config import Config
 from engine.control_plane.state import StateStore, WorkerStatus
 from engine.control_plane.supervisor import Supervisor, SupervisorSettings
+from engine.proxy_pool import ProxyPool
 from tests.engine.control_plane.test_supervisor import FakeClock, FakeProcessRegistry
 
 TOKEN = "s3cret-token-value"
@@ -512,6 +513,24 @@ class TestControlStart:
 
         assert status == 400
         assert body["error"]["code"] == "invalid_request"
+        assert registry.created == []
+
+    def test_start_is_refused_when_the_pool_has_no_alive_proxy(self, server, registry, db_path):
+        """Пул непуст, живых строк нет — 503, а не старт мимо health-проверки.
+
+        Воркер без прокси взял бы строку из paths.proxy_file, то есть браузер
+        пошёл бы на прокси, который проверка уже отметила 4xx/5xx.
+        """
+        pool = ProxyPool(db_path)
+        pool.add_lines(["alice:s3cr3t@10.0.0.1:8080"])
+        pool.record_check_result(
+            pool.list_proxies()[0]["id"], alive=False, error="прокси ответил 502"
+        )
+
+        status, body, _ = request(server, "/control/start", method="POST", body={"workers": 1})
+
+        assert status == 503
+        assert body["error"]["code"] == "no_alive_proxy"
         assert registry.created == []
 
 
