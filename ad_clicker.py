@@ -195,17 +195,26 @@ def run_scenario(
     # в пуле капчат даже чистый браузер — раунд на них заведомо проигран, а
     # solve сжигал бы 2captcha-бюджет и лимит сессии. Дешёвый GET /search
     # через прокси отбраковывает такие IP до запуска Chrome; mark_degraded
-    # отдаёт сигнал супервизору на ротацию прокси. Fail-open: probe=None
-    # (сеть молчит) — раунд идёт как обычно, капчу поймает _check_captcha.
+    # отдаёт сигнал супервизору на ротацию прокси.
+    #
+    # Браузер поднимается ТОЛЬКО при подтверждённом False (ответ доехал, капчи
+    # нет). True — IP в бане, None — прокси не ответил либо ответил 4xx/5xx:
+    # в обоих случаях раунд заведомо проигран, а Chrome на таком прокси лишь
+    # сжёг бы время и трафик вхолостую.
     if proxy:
         probe = probe_proxy_captcha(proxy)
-        if probe:
+        if probe is not False:
+            captcha = probe is True
             log.warning(
                 "proxy",
-                "proxy IP is captcha-flagged by Google, round skipped",
+                (
+                    "proxy IP is captcha-flagged by Google, round skipped"
+                    if captcha
+                    else "proxy pre-check failed, round skipped"
+                ),
                 fields={"proxy": proxy.split("@")[-1]},
             )
-            log.mark_degraded("google captcha on proxy ip")
+            log.mark_degraded("google captcha on proxy ip" if captcha else "proxy pre-check failed")
             return False
 
     driver, country_code = create_webdriver(proxy, user_agent, plugin_folder_name)

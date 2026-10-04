@@ -40,8 +40,201 @@ def get_proxies() -> list[str]:
     return [proxy for proxy in proxies if proxy]
 
 
+# --- Разделение трафика: PAC только на домены Google --------------------------
+#
+# Требование: прокси (дорогой) трафик только на Google, всё остальное (сайты
+# рекламодателей после клика) идёт напрямую. Инструмент — PAC, потому что
+# ``--proxy-bypass-list`` умеет только исключать перечисленные хосты из
+# прокси, а здесь нужно наоборот: проксировать только заданные.
+#
+# Список доменов — здесь единственный: и расширение (chrome.proxy.settings с
+# pacScript), и loopback-раздача для ``--proxy-pac-url`` читают
+# build_pac_script. Второй список в webdriver.py разошёлся бы с первым при
+# первом же изменении домена.
+#
+# Хост, на котором сам PAC обслуживается, обязан быть в DIRECT: иначе
+# Chrome пойдёт за скриптом через прокси, а тот ещё не задан — круговая
+# зависимость, и на старте это выглядит как «прокси не работает».
+GOOGLE_PROXY_HOSTS = (
+    "google.com",
+    "googleapis.com",
+    "gstatic.com",
+    "googleusercontent.com",
+    "doubleclick.net",
+    "googlesyndication.com",
+    "googleadservices.com",
+    "googletagservices.com",
+    "googletagmanager.com",
+    "youtube.com",
+    "ytimg.com",
+)
+
+
+def _pac_match_expression() -> str:
+    """JS-выражение «хост относится к Google» для use_pac_script."""
+    checks = []
+    for domain in GOOGLE_PROXY_HOSTS:
+        # Обе проверки обязательны для каждого домена: голый host без домена
+        # (""/"google.com") и поддомен (www.google.com) — разные случаи, а
+        # поисковая выдача приходит именно с www.
+        checks.append(f"host.endsWith('.{domain}') || host === '{domain}'")
+    return " ||\n".join(f"      {check}" for check in checks)
+
+
+# Национальные домены Google (google.de, google.co.uk, google.com.br): список
+# выше покрывает только инфраструктуру .com, а прокси выдаётся для любой страны.
+# Без этого правила не-американский прокси отправлял бы поиск в DIRECT, то
+# есть клики уходили бы с реального адреса машины — ровно то, ради чего
+# прокси и покупался.
+#
+# Якорь по всей строке обязателен: вариант «хост начинается с google.» пропускал
+# бы чужие google.evil.net и google.com.evil.net в прокси. Структура домена
+# здесь ровно одна метка google, опциональный www, и ccTLD — двухбуквенный
+# либо составной co.<cc> / com.<cc>.
+GOOGLE_CCTLD_MATCHER = "/^(www\\.)?google\\.[a-z]{2,3}(\\.[a-z]{2})?$/.test(host)"
+
+
+def build_pac_script(proxy_host_port: str) -> str:
+    """PAC-скрипт: ``PROXY host:port`` только на домены Google, иначе DIRECT.
+
+    :type proxy_host_port: str
+    :param proxy_host_port: Прокси в формате ``host:port`` без кредов
+    :rtype: str
+    :returns: Текст PAC-скрипта для ``chrome.proxy.settings`` (MV3) или
+        ``--proxy-pac-url``
+
+    Локаль хостов идёт первым и обязателен: loopback-раздача PAC и, при
+    транспорте ``direct``, сам прокси не должны попадать в прокси.
+    """
+
+    return (
+        "function FindProxyForURL(url, host) {\n"
+        "  host = host.toLowerCase();\n"
+        "  if (host === 'localhost' || host === '127.0.0.1' || host === '[::1]') {\n"
+        "    return 'DIRECT';\n"
+        "  }\n"
+        f"  if ({_pac_match_expression()} ||\n"
+        f"      {GOOGLE_CCTLD_MATCHER}) {{\n"
+        f"    return 'PROXY {proxy_host_port}';\n"
+        "  }\n"
+        "  return 'DIRECT';\n"
+        "}"
+    )
+
+
 # Endpoints that are still waiting for their extension to read the credentials.
 _credentials_services: list[HTTPServer] = []
+
+# PAC-endpoint'ы, отдающие скрипт браузеру. В отличие от credentials они
+# остаются живыми всё время работы Chrome: PAC перечитывается при каждом
+# новом запросе к незнакомому хосту, и закрытый endpoint означал бы возврат к
+# DIRECT для половины трафика Google.
+_pac_services: list[HTTPServer] = []
+
+
+class _PacHandler(BaseHTTPRequestHandler):
+    """Отдать PAC-скрипт из памяти.
+
+    Отдельный handler, а не общий с credentials: ответ другой (текст
+    ``application/x-ns-proxy-autoconfig``, а не JSON) и, главное, он не
+    закрывается после первого запроса — Chrome перечитывает PAC многократно.
+    """
+
+    def do_GET(self) -> None:
+        script = self.server.pac_script
+
+        self.send_response(200)
+        self.send_header("Content-Type", "application/x-ns-proxy-autoconfig")
+        self.send_header("Content-Length", str(len(script)))
+        self.send_header("Cache-Control", "no-store")
+        self.end_headers()
+        self.wfile.write(script)
+
+    def log_message(self, message_format: str, *args) -> None:
+        log.debug(
+            "proxy",
+            "PAC script endpoint",
+            fields={"request": message_format % args},
+        )
+
+
+def open_pac_service(proxy_host_port: str) -> str:
+    """Поднять loopback-endpoint с PAC и вернуть URL для ``--proxy-pac-url``.
+
+    :type proxy_host_port: str
+    :param proxy_host_port: Прокси в формате ``host:port`` без кредов
+    :rtype: str
+    :returns: URL вида ``http://127.0.0.1:<port>/proxy.pac``
+
+    Именно HTTP, а не ``file://``: Chromium игнорирует ``file://`` в
+    ``--proxy-pac-url`` и молча уходит в DIRECT (проверено на 154: страница
+    грузится, прокси не задействован). Молчаливый DIRECT здесь опаснее
+    явной ошибки — трафик Google пошёл бы с реального адреса машины, то есть
+    ровно то, чего прокси покупался избежать. Локальный HTTP-эндпоинт к
+    этому моменту уже отлажен в этом же модуле ради выдачи кредов.
+
+    Один URL — один эндпоинт, и живёт он ровно столько, сколько живёт
+    браузер, которому он отдан: закрывает его ``close_pac_service`` из
+    ``CustomChrome.quit``. Иначе воркер демона, делающий по раунду на
+    протяжении суток, накопил бы тысячу слушающих сокетов и потоков к
+    моменту выхода.
+    """
+
+    server = HTTPServer(("127.0.0.1", 0), _PacHandler)
+    server.pac_script = build_pac_script(proxy_host_port).encode("utf-8")
+    _pac_services.append(server)
+
+    threading.Thread(target=server.serve_forever, daemon=True).start()
+
+    port = server.server_address[1]
+    server.pac_url = f"http://127.0.0.1:{port}/proxy.pac"
+    log.debug("proxy", "PAC script is served", fields={"endpoint": f"127.0.0.1:{port}"})
+
+    return server.pac_url
+
+
+def _stop_pac_service(server: HTTPServer) -> None:
+    """Остановить один PAC-endpoint и убрать его из списка живых"""
+
+    try:
+        server.shutdown()
+        server.server_close()
+    except Exception as exp:  # noqa: BLE001 - выход не должен падать из-за сокета
+        log.debug(
+            "proxy",
+            "PAC endpoint stop failed",
+            fields={"error_type": type(exp).__name__},
+        )
+
+    if server in _pac_services:
+        _pac_services.remove(server)
+
+
+def close_pac_service(url: str) -> None:
+    """Закрыть PAC-endpoint, отдавший ``url``
+
+    :type url: str
+    :param url: Ровно тот URL, что вернул :func:`open_pac_service`
+
+    Вызывается после смерти браузера: пока Chrome жив, PAC ему нужен — он
+    перечитывает скрипт на каждом новом хосте, и обрыв раздачи означал бы
+    возврат в DIRECT для половины трафика Google. Неизвестный URL — тихий
+    но-op: закрытие не должно падать из quit() драйвера.
+    """
+
+    for server in list(_pac_services):
+        if getattr(server, "pac_url", None) == url:
+            _stop_pac_service(server)
+
+
+def _close_pac_services() -> None:
+    """Close every PAC endpoint still listening"""
+
+    for server in list(_pac_services):
+        _stop_pac_service(server)
+
+
+atexit.register(_close_pac_services)
 
 
 class _CredentialsHandler(BaseHTTPRequestHandler):
@@ -221,14 +414,9 @@ def install_plugin(
 
     background_js = """
 var config = {
-    mode: "fixed_servers",
-    rules: {
-        singleProxy: {
-            scheme: "http",
-            host: "%s",
-            port: %s
-        },
-        bypassList: ["localhost"]
+    mode: "pac_script",
+    pacScript: {
+        data: %s
     }
 };
 chrome.proxy.settings.set({value: config, scope: "regular"}, function() {});
@@ -278,8 +466,7 @@ chrome.webRequest.onAuthRequired.addListener(
     ['asyncBlocking']
 );
 """ % (
-        proxy_host,
-        proxy_port,
+        json.dumps(build_pac_script(f"{proxy_host}:{proxy_port}")),
         _open_credentials_service(username, password),
     )
 

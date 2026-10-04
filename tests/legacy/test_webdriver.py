@@ -10,10 +10,20 @@ geolocation-lookup не задействованы: драйвер создаё�
 
 import sys
 import tempfile
+import urllib.request
 
 import pytest
 
+import proxy
 import webdriver
+
+
+@pytest.fixture(autouse=True)
+def closed_pac_services():
+    """Не копить loopback-endpoint'ы PAC между тестами: их поднимает каждый create_webdriver."""
+
+    yield
+    proxy._close_pac_services()
 
 
 @pytest.fixture
@@ -227,6 +237,8 @@ class _FakeChrome:
         self.cdp_calls.append((args, kwargs))
 
     def quit(self) -> None:
+        # Как в настоящем CustomChrome: quit закрывает PAC-endpoint браузера.
+        webdriver.stop_pac_service(self)
         self.quit_calls += 1
 
 
@@ -356,6 +368,27 @@ def _proxy_args(driver) -> list[str]:
     return [a for a in driver.options.arguments if a.startswith("--proxy-server=")]
 
 
+def _pac_args(driver) -> list[str]:
+    """Аргументы PAC: маршрутизация задана скриптом, а не флагом --proxy-server."""
+
+    return [a for a in driver.options.arguments if a.startswith("--proxy-pac-url=")]
+
+
+def _pac_url(driver) -> str:
+    """URL из --proxy-pac-url без префикса флага."""
+
+    args = _pac_args(driver)
+    assert len(args) == 1, f"ожидался ровно один --proxy-pac-url, получено {args}"
+    return args[0].split("=", 1)[1]
+
+
+def _pac_served(driver, timeout: float = 5.0) -> str:
+    """Текст PAC, который Chrome реально получит по указанному URL."""
+
+    with urllib.request.urlopen(_pac_url(driver), timeout=timeout) as response:
+        return response.read().decode("utf-8")
+
+
 class TestProxyTransportOptions:
     """Какие аргументы уходят в Chrome и что поднимается для каждого транспорта."""
 
@@ -373,11 +406,36 @@ class TestProxyTransportOptions:
 
         driver, _ = webdriver.create_webdriver(PROXY, "Mozilla/5.0", "abcde")
 
-        assert _proxy_args(driver) == [f"--proxy-server={PROXY_HOST_PORT}"]
+        assert _proxy_args(driver) == [], "маршрут задаёт PAC, а не весь трафик на --proxy-server"
+        assert PROXY not in _pac_served(driver), "креды не должны попадать в PAC"
+        assert f"PROXY {PROXY_HOST_PORT}" in _pac_served(driver)
         assert PROXY not in " ".join(driver.options.arguments)
         assert install_plugin_stub == []
         # Креды не должны утекать ни в аргументы Chrome, ни в логи.
         assert PROXY not in record_log.text
+
+    def test_quit_closes_the_pac_endpoint(
+        self,
+        isolated_tempdir,
+        fake_chrome,
+        proxy_auth_stub,
+        install_plugin_stub,
+        no_geolocation,
+        record_log,
+        transport,
+    ):
+        transport("cdp_auth")
+
+        driver, _ = webdriver.create_webdriver(PROXY, "Mozilla/5.0", "abcde")
+        pac_url = _pac_url(driver)
+        urllib.request.urlopen(pac_url, timeout=5).read()
+
+        driver.quit()
+
+        # Раунд демона поднимает PAC на каждый прогон: без закрытия в quit
+        # воркер накопил бы слушающие сокеты и потоки к концу суток.
+        with pytest.raises(OSError):
+            urllib.request.urlopen(pac_url, timeout=2)
 
     def test_cdp_auth_starts_proxy_auth_manager_after_driver_creation(
         self,
@@ -424,7 +482,8 @@ class TestProxyTransportOptions:
 
         driver, _ = webdriver.create_webdriver(PLAIN_PROXY, "Mozilla/5.0", "abcde")
 
-        assert _proxy_args(driver) == [f"--proxy-server={PLAIN_PROXY}"]
+        assert _proxy_args(driver) == []
+        assert f"PROXY {PLAIN_PROXY}" in _pac_served(driver)
         assert proxy_auth_stub.calls == []
         assert install_plugin_stub == []
 
@@ -493,7 +552,8 @@ class TestProxyTransportOptions:
 
         driver, _ = webdriver.create_webdriver(PLAIN_PROXY, "Mozilla/5.0", "abcde")
 
-        assert _proxy_args(driver) == [f"--proxy-server={PLAIN_PROXY}"]
+        assert _proxy_args(driver) == []
+        assert f"PROXY {PLAIN_PROXY}" in _pac_served(driver)
         assert install_plugin_stub == []
         assert proxy_auth_stub.calls == []
 
@@ -535,7 +595,9 @@ class TestProxyTransportOptions:
 
         driver, _ = webdriver.create_webdriver(PROXY, "Mozilla/5.0", "abcde")
 
-        assert _proxy_args(driver) == [f"--proxy-server={PROXY_HOST_PORT}"]
+        assert _proxy_args(driver) == []
+        assert f"PROXY {PROXY_HOST_PORT}" in _pac_served(driver)
+        assert PROXY not in _pac_served(driver)
         assert install_plugin_stub == []
         assert proxy_auth_stub.calls == []
         assert PROXY not in " ".join(driver.options.arguments)
@@ -556,7 +618,8 @@ class TestProxyTransportOptions:
 
         driver, _ = webdriver.create_webdriver(PLAIN_PROXY, "Mozilla/5.0", "abcde")
 
-        assert _proxy_args(driver) == [f"--proxy-server={PLAIN_PROXY}"]
+        assert _proxy_args(driver) == []
+        assert f"PROXY {PLAIN_PROXY}" in _pac_served(driver)
 
     def test_without_proxy_no_proxy_flag_and_no_manager(
         self,
@@ -743,6 +806,15 @@ def seleniumbase_stub(monkeypatch):
 class TestSeleniumBaseTransport:
     """Ветка use_seleniumbase: те же транспорты, тот же порт DevTools."""
 
+    @staticmethod
+    def _pac_served(driver, timeout: float = 5.0) -> str:
+        """Текст PAC по URL, переданному в proxy_pac_url у seleniumbase."""
+
+        url = driver.init_kwargs.get("proxy_pac_url")
+        assert url, "ожидался proxy_pac_url — маршрут обязан задаваться PAC"
+        with urllib.request.urlopen(url, timeout=timeout) as response:
+            return response.read().decode("utf-8")
+
     def test_cdp_auth_strips_credentials_and_starts_manager(
         self,
         isolated_tempdir,
@@ -758,7 +830,10 @@ class TestSeleniumBaseTransport:
 
         driver, _ = webdriver.create_webdriver(PROXY, "Mozilla/5.0", "abcde")
 
-        assert driver.init_kwargs["proxy_string"] == PROXY_HOST_PORT
+        # proxy_string был бы --proxy-server и весь трафик через прокси.
+        assert driver.init_kwargs["proxy_string"] is None
+        assert f"PROXY {PROXY_HOST_PORT}" in self._pac_served(driver)
+        assert PROXY not in self._pac_served(driver)
         assert PROXY not in str(driver.init_kwargs)
         assert install_plugin_stub == []
         assert len(proxy_auth_stub.calls) == 1
@@ -802,11 +877,13 @@ class TestSeleniumBaseTransport:
 
         driver, _ = webdriver.create_webdriver(PROXY, "Mozilla/5.0", "abcde")
 
-        assert driver.init_kwargs["proxy_string"] == PROXY_HOST_PORT
+        # Whitelist-IP: адрес в PAC, кредов нет и CDP-менеджер не поднимается.
+        assert driver.init_kwargs["proxy_string"] is None
+        assert f"PROXY {PROXY_HOST_PORT}" in self._pac_served(driver)
         assert proxy_auth_stub.calls == []
         assert install_plugin_stub == []
 
-    def test_extension_keeps_the_current_behaviour(
+    def test_extension_uses_pac_and_cdp_credentials(
         self,
         isolated_tempdir,
         seleniumbase_mode,
@@ -821,11 +898,18 @@ class TestSeleniumBaseTransport:
 
         driver, _ = webdriver.create_webdriver(PROXY, "Mozilla/5.0", "abcde")
 
-        # Ровно то, что было до появления транспортов: строка целиком,
-        # без расширения и без CDP-менеджера.
-        assert driver.init_kwargs["proxy_string"] == PROXY
-        assert proxy_auth_stub.calls == []
+        # Транспорт меняется только в том, КАК доставить креды: строка целиком
+        # в proxy_string означала --proxy-server и весь трафик через прокси,
+        # а авторизация самого seleniumbase (user:pass@PAC_URL) поднимает
+        # расширение с fixed_servers, которое перекрывает PAC. Маршрут здесь
+        # обязан остаться PAC, а креды уходят по CDP.
+        assert driver.init_kwargs["proxy_string"] is None
+        assert f"PROXY {PROXY_HOST_PORT}" in self._pac_served(driver)
+        assert PROXY not in self._pac_served(driver)
         assert install_plugin_stub == []
+        assert len(proxy_auth_stub.calls) == 1
+        call = proxy_auth_stub.calls[0]
+        assert (call["username"], call["password"]) == ("user", "pass")
 
     def test_without_proxy_proxy_string_is_empty(
         self,
@@ -843,8 +927,35 @@ class TestSeleniumBaseTransport:
         driver, _ = webdriver.create_webdriver("", "Mozilla/5.0", "abcde")
 
         assert driver.init_kwargs["proxy_string"] is None
+        assert driver.init_kwargs["proxy_pac_url"] is None
         assert proxy_auth_stub.calls == []
         assert install_plugin_stub == []
+
+    def test_quit_closes_the_pac_endpoint(
+        self,
+        isolated_tempdir,
+        seleniumbase_mode,
+        seleniumbase_stub,
+        proxy_auth_stub,
+        install_plugin_stub,
+        no_geolocation,
+        record_log,
+        transport,
+    ):
+        transport("cdp_auth")
+
+        driver, _ = webdriver.create_webdriver(PROXY, "Mozilla/5.0", "abcde")
+        pac_url = driver.init_kwargs["proxy_pac_url"]
+        urllib.request.urlopen(pac_url, timeout=5).read()
+
+        driver.quit()
+
+        # Раунд демона поднимает PAC на каждый прогон: без закрытия в quit
+        # воркер накопил бы слушающие сокеты и потоки к концу суток.
+        with pytest.raises(OSError):
+            urllib.request.urlopen(pac_url, timeout=2)
+        assert proxy_auth_stub.managers[0].stopped == 1
+        assert driver.quit_calls == 1
 
 
 # --- Настройки профиля: локаль и часовой пояс против гео-вычислений ----------

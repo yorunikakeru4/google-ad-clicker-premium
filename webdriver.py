@@ -34,7 +34,7 @@ from engine.proxy_auth import (
     resolve_proxy_transport,
 )
 from geolocation_db import GeolocationDB
-from proxy import install_plugin
+from proxy import close_pac_service, install_plugin, open_pac_service
 from utils import get_location, get_locale_language, get_random_sleep
 
 
@@ -69,6 +69,11 @@ class CustomChrome(undetected_chromedriver.Chrome):
             # нельзя: без записи в лог падение браузера при выходе
             # недиагностируемо.
             log.debug("browser", str(e), fields={"error_type": type(e).__name__}, exc_info=e)
+
+        # PAC закрывается ПОСЛЕ смерти браузера — в отличие от CDP-авторизации,
+        # которую гасят первой: пока Chrome жив, ему нужен скрипт (он перечитывает
+        # его на каждом новом хосте), а процесс, убитый SIGTERM, PAC уже не спросит.
+        stop_pac_service(self)
 
         if hasattr(self, "service") and getattr(self.service, "process", None):
                 self.service.stop()
@@ -159,19 +164,26 @@ def is_multi_procs_enabled() -> bool:
 
 # --- Транспорты прокси (план.md §2.1) -----------------------------------------
 #
-# Транспорт выбирает, КАК креды доходят до Chrome:
-#   cdp_auth   — --proxy-server=host:port + ProxyAuthManager по CDP (дефолт);
-#   extension  — install_plugin (MV3-расширение), флаг --proxy-server не нужен;
-#   direct     — только --proxy-server=host:port, без кредов (whitelist-IP).
+# Транспорт выбирает, КАК креды доходят до Chrome, но маршрут у всех один:
+# прокси только на домены Google, остальное напрямую (PAC, см. proxy.py).
+#   cdp_auth   — --proxy-pac-url + ProxyAuthManager по CDP (дефолт);
+#   extension  — install_plugin: PAC внутри расширения, флаг не нужен;
+#   direct     — --proxy-pac-url без кредов (whitelist-IP).
 # Значения объявлены в engine.proxy_transport и переэкспортируются
 # engine.proxy_auth — второго словаря значений негде появиться.
 
 # Атрибут драйвера, в котором живёт поднятый ProxyAuthManager.
 PROXY_AUTH_ATTR = "_proxy_auth_manager"
 
+# Признак того, что quit() драйвера уже завёрнут в очистку прокси-ресурсов.
+PROXY_QUIT_ATTR = "_proxy_quit_wrapped"
+
+# Атрибут драйвера с URL PAC-endpoint'а этого браузера (см. attach_pac_service).
+PAC_URL_ATTR = "_pac_service_url"
+
 
 def _proxy_host_port(proxy: str) -> str:
-    """Адрес прокси без кредов — ровно то, что уходит в ``--proxy-server``.
+    """Адрес прокси без кредов — ровно то, что уходит в PAC-скрипт.
 
     Логин/пароль не должны быть видны в списке процессов Chrome: их доставляет
     транспорт (расширение или CDP), а не аргументы запуска.
@@ -256,6 +268,42 @@ def stop_proxy_auth(driver) -> None:
         )
 
 
+def attach_pac_service(driver, url: str) -> None:
+    """Запомнить на драйвере URL его PAC-endpoint.
+
+    URL кладётся в атрибут, а не ищется в ``options.arguments``: драйвер
+    SeleniumBase — чужой класс, и guarantee по ``.options`` там нет, а
+    потерянный URL означал бы endpoint, живущий до выхода процесса.
+    """
+    setattr(driver, PAC_URL_ATTR, url)
+
+
+def stop_pac_service(driver) -> None:
+    """Закрыть PAC-endpoint этого браузера. Никогда не бросает исключений.
+
+    Закрывается только после смерти процесса Chrome: пока браузер жив, PAC
+    ему нужен — скрипт перечитывается на каждом новом хосте, и обрыв раздачи
+    означал бы возврат в DIRECT для половины трафика Google. Зато закрываться
+    он обязан на каждом выходе: воркер демона делает по раунду сутки напролёт,
+    и без этого к вечеру накопились бы тысячи слушающих сокетов с потоками.
+    """
+
+    url = getattr(driver, PAC_URL_ATTR, None)
+    if not url:
+        return
+    try:
+        setattr(driver, PAC_URL_ATTR, None)
+        close_pac_service(url)
+    except Exception as exc:
+        # quit() не должен роняться из-за сокета, но и молчать нельзя:
+        # без записи в лог утечка endpoint'а была бы недиагностируема.
+        log.debug(
+            "proxy",
+            "PAC cleanup failed",
+            fields={"error_type": type(exc).__name__, "error": str(exc)},
+        )
+
+
 def attach_proxy_auth(driver, manager: ProxyAuthManager) -> None:
     """Привязать менеджер к драйверу и остановить его в ``quit()``.
 
@@ -264,13 +312,34 @@ def attach_proxy_auth(driver, manager: ProxyAuthManager) -> None:
     путь остановки для обоих браузеров.
     """
     setattr(driver, PROXY_AUTH_ATTR, manager)
+    _wrap_quit(driver)
+
+
+def attach_pac_cleanup(driver) -> None:
+    """Закрыть PAC-endpoint в ``quit()`` драйвера SeleniumBase.
+
+    Нужен и без CDP-авторизации (транспорт ``direct``): UC-драйвер закрывает
+    PAC в собственном ``quit``, а чужой класс заворачиваем здесь. Обёртка
+    одна на обе функции — :func:`_wrap_quit` идемпотентен.
+    """
+    _wrap_quit(driver)
+
+
+def _wrap_quit(driver) -> None:
+    """Одна обёртка quit: остановить авторизацию и закрыть PAC-endpoint."""
+
+    if getattr(driver, PROXY_QUIT_ATTR, False):
+        return
+
     original_quit = driver.quit
 
-    def quit_with_proxy_auth() -> None:
+    def quit_with_proxy_cleanup() -> None:
         stop_proxy_auth(driver)
+        stop_pac_service(driver)
         original_quit()
 
-    driver.quit = quit_with_proxy_auth
+    driver.quit = quit_with_proxy_cleanup
+    setattr(driver, PROXY_QUIT_ATTR, True)
 
 
 def _start_proxy_auth(
@@ -529,20 +598,37 @@ def create_webdriver(
         credentials = _proxy_credentials(proxy, transport)
         host_port = _proxy_host_port(proxy)
         masked_proxy = _mask_proxy(proxy)
+        # URL loopback-раздачи PAC, если транспорт пошёл через --proxy-pac-url;
+        # None — расширение несёт скрипт внутри себя.
+        pac_url = None
 
         log.info("proxy", "Using proxy", fields={"proxy": masked_proxy})
         log.debug("proxy", "Using proxy", fields={"proxy": masked_proxy})
 
         if transport == PROXY_TRANSPORT_EXTENSION and credentials is not None:
-            # extension: ровно прежнее поведение — креды уходят в расширение,
-            # поэтому отдельный --proxy-server Chrome не нужен.
+            # extension: креды уходят в расширение, поэтому отдельный
+            # --proxy-server Chrome не нужен. Разделение трафика (Google через
+            # прокси, остальное напрямую) делает сам скрипт расширения —
+            # chrome.proxy.settings с pacScript, см. proxy.build_pac_script.
             username, password = credentials
             host, port = host_port.split(":")
 
             install_plugin(chrome_options, host, int(port), username, password, plugin_folder_name)
             sleep(2 * config.behavior.wait_factor)
         else:
-            chrome_options.add_argument(f"--proxy-server={host_port}")
+            # cdp_auth и direct: PAC вместо --proxy-server. Без него через
+            # прокси уходит весь трафик браузера, а прокси платный по мегабайтам
+            # (счёт идёт и на страницы рекламодателей после клика).
+            #
+            # Именно PAC, а не --proxy-bypass-list: список умеет лишь вывести
+            # перечисленные хосты из прокси, а нужно обратное — оставить в
+            # прокси только заданные домены.
+            #
+            # Креды в PAC не попадают: адрес сюда приходит уже без них
+            # (_proxy_host_port), а для cdp_auth их подставляет ProxyAuthManager
+            # по CDP на ответ 407. В самом PAC остаётся только host:port.
+            pac_url = open_pac_service(host_port)
+            chrome_options.add_argument(f"--proxy-pac-url={pac_url}")
 
         # get location of the proxy IP
         lat, long, country_code, timezone = get_location(geolocation_db_client, proxy)
@@ -576,6 +662,11 @@ def create_webdriver(
             # той же группе процессов, поэтому group-kill демона его гасит.
             use_subprocess=True,
         )
+
+        if pac_url is not None:
+            # Quit драйвера должен закрыть этот endpoint: CustomChrome.quit
+            # зовёт stop_pac_service, а URL он берёт именно отсюда.
+            attach_pac_service(driver, pac_url)
 
         if transport == PROXY_TRANSPORT_CDP_AUTH and credentials is not None:
             # Старт после создания драйвера: DevTools-порт доступен только
@@ -726,16 +817,15 @@ def create_seleniumbase_driver(
     base_dir.mkdir(exist_ok=True)
     profile_dir = base_dir / f"profile_{random.randint(1000,9999)}"
 
-    # Креды в proxy_string не идут ни при каком транспорте, кроме extension:
-    # там строка остаётся целиком, как и до появления транспортов, а
-    # cdp_auth/direct отдают Chrome только адрес — логин/пароль в списке
-    # процессов недопустимы.
-    proxy_string = None
-    if proxy:
-        if transport == PROXY_TRANSPORT_EXTENSION and credentials is not None:
-            proxy_string = proxy
-        else:
-            proxy_string = host_port
+    # Маршрут и в этой ветке задаёт PAC, а не proxy_string: строка в
+    # proxy_string превращается в --proxy-server, и весь трафик браузера —
+    # включая сайты рекламодателей после клика — ушёл бы через платный прокси
+    # (та же причина, что и в UC-ветке). Креды в адрес не попадают: их
+    # подставляет ProxyAuthManager по CDP, а авторизация самого seleniumbase
+    # (user:pass@PAC_URL) не годится — она поднимает своё расширение,
+    # которое перекрывает PAC своим fixed_servers и снова уводит весь
+    # трафик в прокси.
+    proxy_pac_url = open_pac_service(host_port) if proxy else None
 
     # Профильная локаль главнее гео-вычисленной; без профиля и без
     # language_from_proxy в аргумент уходит None, как и раньше.
@@ -747,7 +837,8 @@ def create_seleniumbase_driver(
         headless2=False,
         do_not_track=True,
         user_agent=user_agent,
-        proxy_string=proxy_string,
+        proxy_string=None,
+        proxy_pac_url=proxy_pac_url,
         multi_proxy=config.behavior.browser_count > 1,
         incognito=config.webdriver.incognito,
         locale_code=str(lang) if lang is not None else None,
@@ -755,18 +846,29 @@ def create_seleniumbase_driver(
     )
     _log_actual_user_agent(driver)
 
-    if proxy and transport == PROXY_TRANSPORT_CDP_AUTH and credentials is not None:
-        # Тот же механизм, что и в UC-ветке: DevTools-порт берётся из
-        # user_data_dir (файл) или из options.debugger_address (фолбэк,
-        # обязателен для UC с фиксированным портом).
-        manager = _start_proxy_auth(
-            credentials,
-            profile_dir,
-            host_port,
-            _debugger_address_of(driver),
-        )
-        if manager is not None:
-            attach_proxy_auth(driver, manager)
+    if proxy:
+        if proxy_pac_url is not None:
+            # Quit драйвера должен закрыть endpoint: обёртка ниже зовёт
+            # stop_pac_service, а URL он берёт именно отсюда.
+            attach_pac_service(driver, proxy_pac_url)
+        # Одна обёртка quit закрывает и CDP-авторизацию, и PAC-endpoint:
+        # драйвер SeleniumBase — чужой класс, своего quit с очисткой у него нет.
+        attach_pac_cleanup(driver)
+
+        if credentials is not None:
+            # Тот же механизм, что и в UC-ветке: DevTools-порт берётся из
+            # user_data_dir (файл) или из options.debugger_address (фолбэк,
+            # обязателен для UC с фиксированным портом). Креды доставляются
+            # для всех транспортов, кроме direct: без них Chrome получит 407,
+            # а PAC тут ни при чём — он отвечает только за маршрут.
+            manager = _start_proxy_auth(
+                credentials,
+                profile_dir,
+                host_port,
+                _debugger_address_of(driver),
+            )
+            if manager is not None:
+                attach_proxy_auth(driver, manager)
 
     # set geolocation and timezone if available
     if proxy and lat and long:

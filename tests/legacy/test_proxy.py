@@ -167,9 +167,24 @@ def test_install_plugin_substitutes_host_and_port_into_background_js(isolated_cw
     proxy.install_plugin(options, "10.0.0.1", 3128, "user", "pass", "abcde")
 
     background = read_extension(isolated_cwd, "abcde", "background.js")
-    assert 'host: "10.0.0.1"' in background
-    assert "port: 3128" in background
-    assert 'scheme: "http"' in background
+    # PAC вместо fixed_servers: прокси только на домены Google.
+    assert "FindProxyForURL" in background
+    assert "PROXY 10.0.0.1:3128" in background
+    assert 'mode: "pac_script"' in background
+
+
+def test_install_plugin_pac_keeps_credentials_out_of_the_script(isolated_cwd):
+    # В PAC адрес обязан быть без кредов: логин/пароль в аргументах запуска или в
+    # скрипте расширения читаются из списка процессов и из самого профиля.
+    options = ChromeOptions()
+
+    proxy.install_plugin(options, "10.0.0.1", 3128, "proxy-login-42", "secret-password", "abcde")
+
+    background = read_extension(isolated_cwd, "abcde", "background.js")
+    pac_data = json.loads(re.search(r"data: (\".*?\")\n", background).group(1))
+    assert "proxy-login-42" not in pac_data
+    assert "secret-password" not in pac_data
+    assert "PROXY 10.0.0.1:3128" in pac_data
 
 
 def test_install_plugin_answers_auth_challenges_from_session_storage(isolated_cwd):
@@ -215,8 +230,8 @@ def test_install_plugin_separates_extensions_by_folder_name(isolated_cwd):
 
     first = read_extension(isolated_cwd, "first", "background.js")
     second = read_extension(isolated_cwd, "second", "background.js")
-    assert 'host: "10.0.0.1"' in first
-    assert 'host: "10.0.0.2"' in second
+    assert "PROXY 10.0.0.1:8080" in first
+    assert "PROXY 10.0.0.2:8080" in second
 
 
 def test_install_plugin_does_not_leak_password_into_extension_path(isolated_cwd):
@@ -333,3 +348,159 @@ def test_cleanup_removes_only_auto_created_dirs(tmp_path):
     assert not auto.exists(), "автосозданный tempdir должен быть удалён"
     assert manual.is_dir(), "явно переданный каталог трогать нельзя"
 
+
+# --- PAC: разделение трафика (прокси только на Google) ------------------------
+#
+# Скрипт проверяется как текст, а не исполнением: Chromium выполняет PAC через
+# V8, и подставлять node в юнит-тест нельзя — его нет в сборочном окружении.
+# Исполняемую проверку (PAC реально рулит маршрутом в живом Chromium) даёт
+# e2e, а здесь контракт: какие домены в списке, куда уходит локаль и что в
+# скрипте не оказалось кредов.
+
+
+@pytest.fixture
+def pac():
+    return proxy.build_pac_script("10.0.0.1:3128")
+
+
+def test_pac_is_a_proxy_autoconfig_function(pac):
+    assert pac.startswith("function FindProxyForURL(url, host) {")
+
+
+def test_pac_sends_google_hosts_to_the_proxy(pac):
+    for domain in proxy.GOOGLE_PROXY_HOSTS:
+        assert f"host.endsWith('.{domain}') || host === '{domain}'" in pac, (
+            f"{domain} должен уходить через прокси и как сам домен, и как поддомен"
+        )
+
+
+def test_pac_keeps_www_google_in_the_proxy(pac):
+    # Поддоменная проверка обязательна для каждого домена, а не только для
+    # первого: поисковая выдача приходит с www.google.<cc>.
+    assert "host.endsWith('.google.com')" in pac
+
+
+def test_pac_covers_national_google_domains(pac):
+    # Прокси выдаётся для любой страны, а не только под .com: без ccTLD-правила
+    # не-американский прокси отправил бы поиск в DIRECT, и клики ушли бы с
+    # реального адреса машины.
+    assert proxy.GOOGLE_CCTLD_MATCHER in pac
+    assert "[a-z]{2,3}" in pac
+
+
+def test_pac_matches_cc_tld_domains_anchored(pac):
+    # Якорь по всей строке: вариант «хост начинается с google.» пропускал бы в
+    # прокси чужие google.evil.net и google.com.evil.net.
+    assert "^" in proxy.GOOGLE_CCTLD_MATCHER
+    assert "$" in proxy.GOOGLE_CCTLD_MATCHER
+    assert "startsWith" not in proxy.GOOGLE_CCTLD_MATCHER
+
+
+def test_pac_lowercases_host_before_comparing(pac):
+    # Регистр хоста не от набора пользователем запроса, а приходит из URL.
+    assert "host = host.toLowerCase();" in pac
+
+
+def test_pac_routes_localhost_direct_before_the_proxy(pac):
+    # Локаль проверяется раньше прокси: сам PAC и credentials отдаются через
+    # loopback, и уход этого запроса в прокси означал бы круговую зависимость.
+    assert "host === 'localhost'" in pac
+    assert pac.index("'localhost'") < pac.index("PROXY 10.0.0.1:3128")
+
+
+def test_pac_falls_back_to_direct(pac):
+    assert pac.rstrip().endswith("}")
+
+
+def test_pac_has_no_credentials():
+    # build_pac_script принимает адрес без кредов, а и расширение, и эндпоинт
+    # отдают ровно этот текст: пароля в браузере оказаться не может.
+    script = proxy.build_pac_script("10.0.0.1:3128")
+    assert "@" not in script
+
+
+# --- PAC endpoint для --proxy-pac-url ------------------------------------------
+
+
+@pytest.fixture(autouse=True)
+def closed_pac_services():
+    """Закрывать PAC-endpoint'ы, поднятые open_pac_service, вместе с тестом."""
+
+    yield
+    proxy._close_pac_services()
+
+
+def test_open_pac_service_returns_http_url_on_loopback():
+    # Именно http, а не file://: Chromium молча игнорирует file:// в
+    # --proxy-pac-url и уходит в DIRECT (проверено на живом 154), то есть
+    # трафик Google пошёл бы с реального адреса машины вместо прокси.
+    url = proxy.open_pac_service("10.0.0.1:3128")
+
+    assert url.startswith("http://127.0.0.1:")
+    assert url.endswith("/proxy.pac")
+
+
+def test_open_pac_service_serves_the_script():
+    url = proxy.open_pac_service("10.0.0.1:3128")
+
+    with urllib.request.urlopen(url, timeout=5) as response:
+        served = response.read().decode("utf-8")
+
+    assert "FindProxyForURL" in served
+    assert "PROXY 10.0.0.1:3128" in served
+
+
+def test_open_pac_service_serves_repeatedly():
+    # В отличие от endpoint'а с кредами PAC перечитывается на каждом новом
+    # хосте, поэтому закрываться после первого запроса он не должен.
+    url = proxy.open_pac_service("10.0.0.1:3128")
+
+    for _ in range(3):
+        with urllib.request.urlopen(url, timeout=5) as response:
+            assert b"FindProxyForURL" in response.read()
+
+
+def test_open_pac_service_answers_with_the_proxy_autoconfig_type():
+    url = proxy.open_pac_service("10.0.0.1:3128")
+
+    with urllib.request.urlopen(url, timeout=5) as response:
+        content_type = response.headers.get("Content-Type")
+
+    assert content_type == "application/x-ns-proxy-autoconfig"
+
+
+def test_close_pac_services_stops_the_endpoint():
+    url = proxy.open_pac_service("10.0.0.1:3128")
+
+    proxy._close_pac_services()
+
+    with pytest.raises(OSError):
+        urllib.request.urlopen(url, timeout=2)
+
+
+def test_close_pac_service_stops_only_its_own_endpoint():
+    # Воркер держит по одному PAC на живой браузер: закрытие одного не должно
+    # рвать скрипт у соседа — иначе тот молча ушёл бы в DIRECT.
+    closing = proxy.open_pac_service("10.0.0.1:3128")
+    living = proxy.open_pac_service("10.0.0.2:3128")
+
+    proxy.close_pac_service(closing)
+
+    with pytest.raises(OSError):
+        urllib.request.urlopen(closing, timeout=2)
+    with urllib.request.urlopen(living, timeout=5) as response:
+        assert b"PROXY 10.0.0.2:3128" in response.read()
+
+
+def test_close_pac_service_ignores_an_unknown_url():
+    # quit() драйвера не должен падать: URL мог быть закрыт уже этим же quit.
+    proxy.open_pac_service("10.0.0.1:3128")
+
+    proxy.close_pac_service("http://127.0.0.1:1/proxy.pac")
+
+
+def test_two_services_get_two_ports():
+    first = proxy.open_pac_service("10.0.0.1:3128")
+    second = proxy.open_pac_service("10.0.0.1:3128")
+
+    assert first != second

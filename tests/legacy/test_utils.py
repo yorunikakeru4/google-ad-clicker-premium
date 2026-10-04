@@ -660,15 +660,47 @@ def test_probe_passes_clean_search_page(monkeypatch):
     assert utils.probe_proxy_captcha("host:8080") is False
 
 
-def test_probe_fails_open_on_network_error(monkeypatch):
-    # Сетевая ошибка — None (fail-open): неисправность транспорта ловят
-    # свои ветки, а ложная отбраковка здорового IP дороже пропущенного раунда.
+def test_probe_returns_none_on_network_error(monkeypatch):
+    # Сетевая ошибка — None, и вызывающий обязан НЕ поднимать браузер:
+    # проверка ничего не подтвердила, а Chrome на нерабочем прокси сжёг бы
+    # время и трафик вхолостую.
     def _raise(*args, **kwargs):
         raise utils.requests.RequestException("boom")
 
     monkeypatch.setattr(utils.requests, "get", _raise)
 
     assert utils.probe_proxy_captcha("host:8080") is None
+
+
+def test_probe_treats_error_status_as_not_clean(monkeypatch):
+    # 4xx/5xx — ответ получен, но IP он не проверяет: прокси отдал 502 на
+    # CONNECT или 403 на сам запрос, Google — 429/503. В body такого ответа
+    # нет маркера капчи, и раньше он читался бы как «чисто» — раунд стартовал
+    # с заведомо нерабочим прокси.
+    for status in (403, 407, 429, 500, 502, 503):
+        monkeypatch.setattr(
+            utils.requests,
+            "get",
+            lambda *a, **k: _FakeResponse(
+                "https://www.google.com/search?q=probe", "<html>error</html>", status
+            ),
+        )
+
+        assert utils.probe_proxy_captcha("host:8080") is None, f"статус {status}"
+
+
+def test_probe_error_status_does_not_hide_a_captcha(monkeypatch):
+    # Капча, приехавшая вместе с 4xx: /sorry/ важнее кода ответа, раунд
+    # всё равно пропускается — но уже как капча, с ротацией по этой причине.
+    monkeypatch.setattr(
+        utils.requests,
+        "get",
+        lambda *a, **k: _FakeResponse(
+            "https://www.google.com/sorry/index?continue=x", "whatever", 429
+        ),
+    )
+
+    assert utils.probe_proxy_captcha("host:8080") is True
 
 
 def test_probe_passes_proxy_credentials_to_requests(monkeypatch):

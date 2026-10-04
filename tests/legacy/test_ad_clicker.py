@@ -327,12 +327,13 @@ class TestProfileUserAgent:
 
 
 class TestProxyHealthCheck:
-    """Отбраковка мёртого exit IP до запуска Chrome (отчёт по CAPTCHA, §4.5).
+    """Отбраковка нерабочего exit IP до запуска Chrome (отчёт по CAPTCHA, §4.5).
 
     ~30% строк в пуле капчат даже чистый браузер — раунд на них заведомо
-    проигран. probe=True → раунд не начинается (False), сигнал degraded
-    уходит супервизору на ротацию; probe=None (сеть молчит) → fail-open,
-    раунд идёт как обычно.
+    проигран. probe=True (капча) и probe=None (сеть молчит либо ответ
+    4xx/5xx) → раунд не начинается (False), сигнал degraded уходит
+    супервизору на ротацию; поднимается браузер только при probe=False —
+    ответ доехал и капчи нет.
     """
 
     @staticmethod
@@ -352,10 +353,10 @@ class TestProxyHealthCheck:
 
         monkeypatch.setattr(ad_clicker, "create_webdriver", fake_create)
 
-        # probe=True → run_scenario возвращает False ДО create_webdriver;
+        # Не-False → run_scenario возвращает False ДО create_webdriver;
         # иначе фейковый драйвер бросает StopBeforeBrowser, как в остальных
         # тестах этого файла (исключения подготовки не гасятся).
-        if probe_result:
+        if probe_result is not False:
             completed = ad_clicker.run_scenario(query="usb hub", proxy="u:p@proxy.host:80")
         else:
             with pytest.raises(StopBeforeBrowser):
@@ -370,13 +371,41 @@ class TestProxyHealthCheck:
         assert probes == ["u:p@proxy.host:80"]
         assert started == [], "Chrome не должен запускаться на мёртвом IP"
 
-    def test_unknown_probe_result_fails_open_to_the_round(self, monkeypatch):
-        # None = «проверить не удалось»: неисправность транспорта ловят
-        # свои ветки, health-check не должен отбраковывать IP вслепую.
+    def test_unknown_probe_result_skips_the_round(self, monkeypatch):
+        # None = «проверить не удалось»: таймаут, обрыв, отказ прокси на
+        # CONNECT, ответ 4xx/5xx. Браузер на таком прокси лишь сжёг бы время
+        # и трафик вхолостую, поэтому раунд не начинается.
         completed, probes, started = self._run(monkeypatch, None)
 
         assert probes == ["u:p@proxy.host:80"]
-        assert len(started) == 1, "при неизвестном вердикте раунд обязан начаться"
+        assert completed is False, "неудачная проверка — раунд пропущен"
+        assert started == [], "Chrome не должен запускаться без подтверждения"
+
+    def test_probe_failure_is_reported_as_degraded(self, monkeypatch):
+        # Причина уходит супервизору (workers.last_error и ротация) и не
+        # должна выглядеть как капча: это разные события для оператора.
+        records = []
+
+        class _Log:
+            def warning(self, *args, **kwargs):
+                records.append(("warning", args, kwargs))
+
+            def mark_degraded(self, reason):
+                records.append(("degraded", reason))
+
+            def __getattr__(self, name):
+                return lambda *args, **kwargs: None
+
+        monkeypatch.setattr(ad_clicker, "log", _Log())
+        monkeypatch.setattr(ad_clicker, "probe_proxy_captcha", lambda proxy: None)
+        monkeypatch.setattr(
+            ad_clicker,
+            "create_webdriver",
+            lambda *a, **k: pytest.fail("браузер не должен стартовать"),
+        )
+
+        assert ad_clicker.run_scenario(query="usb hub", proxy="u:p@proxy.host:80") is False
+        assert ("degraded", "proxy pre-check failed") in records
 
     def test_clean_probe_starts_the_round(self, monkeypatch):
         completed, probes, started = self._run(monkeypatch, False)

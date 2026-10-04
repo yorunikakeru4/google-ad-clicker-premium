@@ -782,7 +782,7 @@ _PROBE_URL = "https://www.google.com/search?q=proxy+health+check"
 
 
 def probe_proxy_captcha(proxy: str, timeout: float = 10.0) -> Optional[bool]:
-    """Прямой GET /search через прокси: отбраковка мёртвого exit IP.
+    """Прямой GET /search через прокси: отбраковка нерабочего exit IP.
 
     Дешёвый health-check перед раундом (отчёт по CAPTCHA, §4.5): мёртый
     IP (капча даже чистому браузеру) виден на неавторизованном запросе —
@@ -795,12 +795,17 @@ def probe_proxy_captcha(proxy: str, timeout: float = 10.0) -> Optional[bool]:
     :param timeout: Таймаут запроса, сек
     :rtype: Optional[bool]
     :returns: ``True`` — IP в бане (капча), ``False`` — чисто,
-        ``None`` — проверить не удалось (сеть/прокси молчит)
+        ``None`` — проверить не удалось (сеть молчит либо ответ 4xx/5xx)
 
-    Fail-open: сетевая ошибка — ``None``, а не ``True``: неисправность
-    транспорта ловят свои ветки (proxy_health/CDP-degraded), а ложная
-    отбраковка здорового IP ротацией обошлась бы дороже пропущенного
-    раунда. Креды в логи не попадают — вызывающий маскирует сам.
+    ``False`` — единственный исход, при котором проверка что-то подтвердила:
+    ответ доехал и капчи нет. Всё остальное (таймаут, обрыв, отказ прокси
+    на CONNECT, ответ прокси или Google 4xx/5xx) — ``None``, и вызывающий
+    обязан НЕ поднимать браузер: раньше ошибки считались «чисто»
+    (``flagged=False``), и раунд стартовал с заведомо нерабочего прокси —
+    Chrome поднимался, тратил время и трафик и всё равно умирал. Маркер
+    капчи главнее кода ответа: ``/sorry/`` на ответе 429 — это капча,
+    а не ошибка транспорта. Креды в логи не попадают — вызывающий маскирует
+    сам.
     """
 
     proxies = {"http": f"http://{proxy}", "https": f"http://{proxy}"}
@@ -820,16 +825,43 @@ def probe_proxy_captcha(proxy: str, timeout: float = 10.0) -> Optional[bool]:
         return None
 
     flagged = "/sorry/" in response.url or "unusual traffic" in response.text.lower()
+    if flagged:
+        log.debug(
+            "proxy",
+            "proxy captcha probe",
+            fields={
+                "proxy": proxy.split("@")[-1],
+                "status_code": response.status_code,
+                "captcha": True,
+            },
+        )
+        return True
+
+    # Ошибка транспорта, упакованная в HTTP-ответ: прокси отдал 407/502 на
+    # CONNECT или 403/429 на сам запрос, Google — 429/503. Тело такого ответа
+    # не содержит маркера капчи, поэтому без этой проверки он читался бы как
+    # «чисто» и раунд стартовал бы с мёртвым прокси.
+    if response.status_code >= 400:
+        log.debug(
+            "proxy",
+            "proxy captcha probe got an error response",
+            fields={
+                "proxy": proxy.split("@")[-1],
+                "status_code": response.status_code,
+            },
+        )
+        return None
+
     log.debug(
         "proxy",
         "proxy captcha probe",
         fields={
             "proxy": proxy.split("@")[-1],
             "status_code": response.status_code,
-            "captcha": flagged,
+            "captcha": False,
         },
     )
-    return flagged
+    return False
 
 
 def resolve_redirect(url: str) -> str:
