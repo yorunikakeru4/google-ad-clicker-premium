@@ -637,6 +637,71 @@ class TestProxyCheck:
         assert status == 405
 
 
+class TestProxyDeleteAll:
+    """``{"all": true}`` — весь пул одним запросом, best-effort с отчётом."""
+
+    @staticmethod
+    def _add(pool, count: int) -> list[int]:
+        pool.add_lines([f"10.0.0.{octet}:8080" for octet in range(1, count + 1)])
+        return [row["id"] for row in pool.list_for_check()]
+
+    def test_all_deletes_every_proxy(self, server, pool, db_path):
+        self._add(pool, 3)
+
+        status, body, _ = call(
+            server, "/control/proxies/delete", method="POST", body={"all": True}
+        )
+
+        assert status == 200
+        assert body == {"deleted": 3, "skipped": 0, "problems": []}
+        assert pool_rows(db_path) == []
+
+    def test_all_keeps_assigned_proxy_and_reports_it(self, server, pool, db_path):
+        busy_id, free_id = self._add(pool, 2)
+        assign_worker(db_path, busy_id, "br-1", status="running")
+
+        status, body, _ = call(
+            server, "/control/proxies/delete", method="POST", body={"all": True}
+        )
+
+        assert status == 200, "назначенный прокси не должен ронять запрос"
+        assert body["deleted"] == 1
+        assert body["skipped"] == 1
+        assert f"id={busy_id}: назначен воркеру br-1" in body["problems"]
+        assert [row["id"] for row in pool_rows(db_path)] == [busy_id]
+
+    def test_all_on_empty_pool_is_a_noop(self, server):
+        status, body, _ = call(
+            server, "/control/proxies/delete", method="POST", body={"all": True}
+        )
+
+        assert status == 200
+        assert body == {"deleted": 0, "skipped": 0, "problems": []}
+
+    @pytest.mark.parametrize("value", [False, "yes", 1, None])
+    def test_all_must_be_true(self, server, value):
+        """Непустое, но не True — не «удалить всё», а ошибка тела."""
+        status, body, _ = call(
+            server, "/control/proxies/delete", method="POST", body={"all": value}
+        )
+
+        assert status == 400
+        assert body["error"]["code"] == "invalid_request"
+
+    def test_all_requires_token(self, server, pool):
+        self._add(pool, 1)
+
+        status, _, _ = call(
+            server,
+            "/control/proxies/delete",
+            method="POST",
+            token=None,
+            body={"all": True},
+        )
+
+        assert status == 401
+
+
 class TestProxyFilePath:
     """GET /control/proxies/file: путь для «открыть proxies.txt» из UI.
 

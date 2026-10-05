@@ -228,6 +228,7 @@ describe("экраны на шаблоне", () => {
       "proxies-check",
       "proxies-open-file",
       "proxies-delete-failed",
+      "proxies-delete-all",
       "proxies-empty",
     ]) {
       expect(html).toContain(`data-test="${hook}"`);

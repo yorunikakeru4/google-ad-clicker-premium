@@ -180,6 +180,11 @@ describe("proxiesRequest", () => {
       path: "/control/proxies/delete",
       body: '{"ids":[3,7,9]}',
     });
+    expect(proxiesRequest({ kind: "deleteAll" })).toEqual({
+      method: "POST",
+      path: "/control/proxies/delete",
+      body: '{"all":true}',
+    });
     // Путь отдаёт демон: резолвится он от его каталога, у UI своего нет.
     expect(proxiesRequest({ kind: "file" })).toEqual({
       method: "GET",

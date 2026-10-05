@@ -440,6 +440,26 @@ class ProxyPool:
 
         return {"deleted": deleted, "skipped": len(problems), "problems": problems}
 
+    def all_ids(self) -> list[int]:
+        """Все id пула по возрастанию — для удаления целиком.
+
+        Отдельный запрос, а не ``list_proxies``: тому нужны креды, воркер и
+        счётчик использования, а для удаления нужен ровно список id.
+        """
+        with self._connect() as conn:
+            rows = conn.execute("SELECT id FROM proxies ORDER BY id").fetchall()
+        return [int(row["id"]) for row in rows]
+
+    def delete_all(self) -> dict[str, Any]:
+        """Удаляет весь пул; занятые живым воркером уходят в ``skipped``.
+
+        Тот же best-effort, что и у батча (``delete_many``): удаление
+        «всего» не должно падать из-за одного назначенного прокси —
+        оператору важен и результат, и список того, что осталось. Пустой
+        пул — no-op, а не ошибка: кнопка может быть нажата дважды.
+        """
+        return self.delete_many(self.all_ids())
+
     # --- health-проверка -------------------------------------------------
 
     def record_check_result(

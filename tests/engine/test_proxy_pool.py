@@ -36,6 +36,12 @@ def pool(db_path):
     return ProxyPool(db_path)
 
 
+def add_proxies(pool, count):
+    """Добавляет ``count`` строк вида 10.0.0.N:8080 и возвращает их id."""
+    pool.add_lines([f"10.0.0.{octet}:8080" for octet in range(1, count + 1)])
+    return [row["id"] for row in pool.list_for_check()]
+
+
 def table_rows(db_path, table):
     """Сырые строки таблицы: проверяем БД, а не собственные методы пула."""
     conn = migrations.connect(db_path)
@@ -450,6 +456,37 @@ class TestDeleteMany:
 
         assert "s3cr3t" not in repr(result)
         assert "alice" not in repr(result)
+
+
+class TestDeleteAll:
+    """«Удалить всё» — тот же best-effort, что и у батча."""
+
+    def test_removes_the_whole_pool(self, pool, db_path):
+        add_proxies(pool, 3)
+
+        result = pool.delete_all()
+
+        assert result == {"deleted": 3, "skipped": 0, "problems": []}
+        assert table_rows(db_path, "proxies") == []
+
+    def test_assigned_proxy_is_reported_not_raised(self, pool, db_path):
+        busy_id, free_id = add_proxies(pool, 2)
+        assign_worker(db_path, busy_id, "br-1", status="running")
+
+        result = pool.delete_all()
+
+        assert result["deleted"] == 1
+        assert result["skipped"] == 1
+        assert f"id={busy_id}: назначен воркеру br-1" in result["problems"]
+        assert [row["id"] for row in table_rows(db_path, "proxies")] == [busy_id]
+
+    def test_empty_pool_is_a_noop(self, pool):
+        assert pool.delete_all() == {"deleted": 0, "skipped": 0, "problems": []}
+
+    def test_all_ids_returns_rows_in_order(self, pool):
+        first, second = add_proxies(pool, 2)
+
+        assert pool.all_ids() == [first, second]
 
 
 class TestRecordUsage:

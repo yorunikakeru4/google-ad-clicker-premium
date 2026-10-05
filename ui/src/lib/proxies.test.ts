@@ -471,6 +471,31 @@ describe("createProxiesApi: батчевое удаление", () => {
     await expect(api.removeMany([1])).rejects.toThrow(/deleted\/skipped\/problems/);
   });
 
+  it("удаление всего пула: all уходит одним запросом, отчёт разбирается", async () => {
+    const { transport, calls } = transportOf({
+      "/control/proxies/delete": {
+        status: 200,
+        body: JSON.stringify({
+          deleted: 1900,
+          skipped: 33,
+          problems: ["id=7: назначен воркеру br-1"],
+        }),
+      },
+    });
+    const api = createProxiesApi(transport);
+
+    const result = await api.removeAll();
+
+    expect(calls).toEqual([
+      { path: "/control/proxies/delete", method: "POST", body: '{"all":true}' },
+    ]);
+    expect(result).toEqual({
+      deleted: 1900,
+      skipped: 33,
+      problems: ["id=7: назначен воркеру br-1"],
+    });
+  });
+
   it("409 на батче доходит текстом демона", async () => {
     const { transport } = transportOf({
       "/control/proxies/delete": {

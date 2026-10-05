@@ -111,8 +111,10 @@ async function confirmDelete(): Promise<void> {
 /** Ссылка на таблицу — нужна, чтобы снять выбор после удаления строк. */
 const table = ref<InstanceType<typeof DataTablePage> | null>(null);
 
-/** Цель подтверждения батча: id и подписи диалога; null — диалог закрыт. */
+/** Цель подтверждения батча: ids либо «всё», подписи диалога; null — закрыт. */
 interface BulkTarget {
+  /** true — уходит запрос {"all": true}, ids при этом не используются. */
+  all: boolean;
   ids: number[];
   title: string;
   text: string;
@@ -136,7 +138,21 @@ function askBulkDelete(ids: number[], title: string, text: string): void {
   if (ids.length === 0) return;
   // Итог прошлой операции не должен пережить новое подтверждение.
   proxies.deleteResult.value = null;
-  bulkTarget.value = { ids, title, text };
+  bulkTarget.value = { all: false, ids, title, text };
+}
+
+function askDeleteAll(): void {
+  const count = tableRows.value.length;
+  if (count === 0) return;
+  proxies.deleteResult.value = null;
+  bulkTarget.value = {
+    all: true,
+    ids: [],
+    title: `Удалить все прокси (${count})?`,
+    text:
+      `Из пула уйдут ${count} прокси. Назначенные живому воркеру останутся — ` +
+      "они попадут в отчёт под таблицей; чтобы удалить и их, сначала нажмите Стоп.",
+  };
 }
 
 function askDeleteSelected(rows: ReadonlyArray<{ id: number }>): void {
@@ -160,7 +176,9 @@ async function confirmBulkDelete(): Promise<void> {
   const target = bulkTarget.value;
   bulkTarget.value = null;
   if (target === null) return;
-  const ok = await proxies.removeMany(target.ids);
+  const ok = target.all
+    ? await proxies.removeAll()
+    : await proxies.removeMany(target.ids);
   // Удалённых строк больше нет в items, но Vuetify selection не чистит сам.
   if (ok) table.value?.clearSelection();
 }
@@ -280,6 +298,19 @@ async function confirmBulkDelete(): Promise<void> {
           @click="askDeleteFailed()"
         >
           Удалить с ошибкой ({{ failedRows.length }})
+        </v-btn>
+
+        <v-btn
+          size="small"
+          variant="outlined"
+          color="error"
+          prepend-icon="mdi-delete-forever-outline"
+          :disabled="tableRows.length === 0"
+          :loading="proxies.pending.value === 'delete'"
+          data-test="proxies-delete-all"
+          @click="askDeleteAll()"
+        >
+          Удалить все ({{ tableRows.length }})
         </v-btn>
 
         <v-btn

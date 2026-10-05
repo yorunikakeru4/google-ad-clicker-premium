@@ -76,6 +76,8 @@ export interface ProxiesApi {
   remove(id: number): Promise<number>;
   /** Батч best-effort: занятые и не найденные идут в skipped/problems. */
   removeMany(ids: number[]): Promise<ProxyDeleteResult>;
+  /** Весь пул; занятые живым воркером — в skipped/problems. */
+  removeAll(): Promise<ProxyDeleteResult>;
   check(): Promise<void>;
   /** Абсолютный путь к proxies.txt для кнопки «открыть в системе». */
   filePath(): Promise<ProxyFilePath>;
@@ -275,6 +277,13 @@ export function createProxiesApi(transport: Transport): ProxiesApi {
     async removeMany(ids) {
       return pickDeleteResult(
         await send({ kind: "deleteMany", ids }),
+        "/control/proxies/delete",
+      );
+    },
+
+    async removeAll() {
+      return pickDeleteResult(
+        await send({ kind: "deleteAll" }),
         "/control/proxies/delete",
       );
     },

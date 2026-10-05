@@ -46,6 +46,7 @@ export type ProxiesAction =
   | { kind: "import" }
   | { kind: "delete"; id: number }
   | { kind: "deleteMany"; ids: number[] }
+  | { kind: "deleteAll" }
   | { kind: "check" }
   | { kind: "file" };
 
@@ -89,6 +90,10 @@ export function proxiesRequest(action: ProxiesAction): ProxiesRequest {
         path: "/control/proxies/delete",
         body: JSON.stringify({ ids: action.ids }),
       };
+    case "deleteAll":
+      // Список id собирает демон, а не UI: тело запроса не растёт с
+      // размером пула (у демона лимит 64 КБ на запрос).
+      return { method: "POST", path: "/control/proxies/delete", body: '{"all":true}' };
     case "check":
       return { method: "POST", path: "/control/proxies/check", body: "{}" };
     case "file":

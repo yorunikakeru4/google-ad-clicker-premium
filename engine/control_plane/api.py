@@ -426,19 +426,24 @@ class ControlPlaneHandler(BaseHTTPRequestHandler):
         return str(self.config.get("paths.proxy_file") or "")
 
     def _handle_proxies_delete(self) -> None:
-        """Одиночное удаление — строго, батч — best-effort с отчётом.
+        """Одиночное удаление — строго, батч и «всё» — best-effort с отчётом.
 
         ``{"id": n}`` (легаси-контракт UI) сохраняет 404/409: одна строка,
         которую держит воркер, — понятная и нужная ошибка. ``{"ids": [...]}``
-        занятые и отсутствующие строки не роняет: иначе один занятый битый
-        прокси заблокировал бы «удалить все с ошибкой», а оператор ждёт
-        ровно обратного — удалить всё, что можно, и увидеть, что мешало.
+        и ``{"all": true}`` занятые и отсутствующие строки не роняют:
+        иначе один занятый прокси заблокировал бы и «удалить все с ошибкой»,
+        и «удалить все», а оператор ждёт ровно обратного — удалить всё, что
+        можно, и увидеть, что мешало. Тело на «всё» не растёт с размером
+        пула: список id собирает демон, а не UI (MAX_BODY_BYTES — 64 КБ).
         """
-        ids, batch = self._requested_proxy_ids()
-        if not batch:
+        ids, mode = self._requested_proxy_ids()
+        if mode == "single":
             self.proxy_pool.delete(ids[0])
             # Счётчик, а не булево: UI (как и add/import) ждёт число.
             self._send_json(200, {"deleted": 1})
+            return
+        if mode == "all":
+            self._send_json(200, self.proxy_pool.delete_all())
             return
         self._send_json(200, self.proxy_pool.delete_many(ids))
 
@@ -643,17 +648,23 @@ class ControlPlaneHandler(BaseHTTPRequestHandler):
             raise InvalidRequestError("поле id должно быть целым числом")
         return profile_id
 
-    def _requested_proxy_ids(self) -> tuple[list[int], bool]:
-        """Идентификаторы для удаления прокси: ``(ids, is_batch)``.
+    def _requested_proxy_ids(self) -> tuple[list[int], str]:
+        """Что удалить: ``(ids, режим)``, режим — ``single`` / ``batch`` / ``all``.
 
         ``{"id": 7}`` — одиночное удаление (строгие 404/409),
-        ``{"ids": [...]}`` — батч best-effort. Дубли схлопываются с
-        сохранением порядка: повтор в списке не должен удалить строку, а
-        потом пожаловаться, что её уже нет.
+        ``{"ids": [...]}`` — батч best-effort, ``{"all": true}`` — весь пул.
+        В батче дубли схлопываются с сохранением порядка: повтор в списке
+        не должен удалить строку, а потом пожаловаться, что её уже нет.
+
+        ``all`` проверяется первым и не смешивается с остальными: запрос
+        «удалить всё» не должен зависеть от того, есть ли в нём случайно
+        чужое поле.
         """
         raw = self._read_json_body()
         if not isinstance(raw, dict):
-            raise InvalidRequestError("ожидается объект с полем id или ids")
+            raise InvalidRequestError("ожидается объект с полем id, ids или all")
+        if raw.get("all") is True:
+            return [], "all"
         if "ids" in raw:
             ids = raw["ids"]
             if not isinstance(ids, list) or not ids:
@@ -662,11 +673,11 @@ class ControlPlaneHandler(BaseHTTPRequestHandler):
                 isinstance(item, int) and not isinstance(item, bool) for item in ids
             ):
                 raise InvalidRequestError("поле ids должно быть списком целых чисел")
-            return list(dict.fromkeys(ids)), True
+            return list(dict.fromkeys(ids)), "batch"
         single = raw.get("id")
         if isinstance(single, bool) or not isinstance(single, int):
             raise InvalidRequestError("поле id должно быть целым числом")
-        return [single], False
+        return [single], "single"
 
     def _read_optional_object(self) -> dict[str, Any]:
         """Тело-объект для endpoint'ов с пустым или необязательным телом."""

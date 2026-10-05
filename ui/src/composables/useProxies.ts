@@ -59,6 +59,8 @@ export interface ProxiesState {
   remove(id: number): Promise<boolean>;
   /** Батчевое удаление: success — в deleteResult уходит отчёт демона. */
   removeMany(ids: number[]): Promise<boolean>;
+  /** Удалить весь пул; отчёт — тот же deleteResult. */
+  removeAll(): Promise<boolean>;
   runCheck(): Promise<boolean>;
   /** Открыть proxies.txt в системной программе по умолчанию. */
   openFile(): Promise<boolean>;
@@ -258,6 +260,24 @@ export function createProxies(
     }
   }
 
+  async function removeAll(): Promise<boolean> {
+    if (pending.value !== null) return false;
+    pending.value = "delete";
+    try {
+      const result = await api.removeAll();
+      deleteResult.value = result;
+      actionError.value = null;
+      await tick();
+      return true;
+    } catch (caught) {
+      actionError.value = errorMessage(caught);
+      deleteResult.value = null;
+      return false;
+    } finally {
+      pending.value = null;
+    }
+  }
+
   async function start(): Promise<void> {
     desired = true;
     if (timer !== null) return;
@@ -296,6 +316,7 @@ export function createProxies(
     importFile,
     remove,
     removeMany,
+    removeAll,
     runCheck,
     openFile,
   };
