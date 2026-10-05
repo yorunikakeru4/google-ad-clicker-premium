@@ -15,6 +15,7 @@ import {
   type FileOpener,
   type ProxiesApi,
   type ProxyChangeResult,
+  type ProxyDeleteResult,
   type ProxyRow,
 } from "../lib/proxies";
 
@@ -43,6 +44,8 @@ export interface ProxiesState {
   addResult: Ref<ProxyChangeResult | null>;
   /** Итог последнего импорта из proxies.txt. */
   importResult: Ref<ProxyChangeResult | null>;
+  /** Итог последнего батчевого удаления: deleted/skipped/problems. */
+  deleteResult: Ref<ProxyDeleteResult | null>;
   /** Проверка запущена и ещё не перепроверила все строки. */
   checking: Ref<boolean>;
   checkProgress: ComputedRef<CheckProgress>;
@@ -54,6 +57,8 @@ export interface ProxiesState {
   add(lines: string[]): Promise<boolean>;
   importFile(): Promise<boolean>;
   remove(id: number): Promise<boolean>;
+  /** Батчевое удаление: success — в deleteResult уходит отчёт демона. */
+  removeMany(ids: number[]): Promise<boolean>;
   runCheck(): Promise<boolean>;
   /** Открыть proxies.txt в системной программе по умолчанию. */
   openFile(): Promise<boolean>;
@@ -71,6 +76,7 @@ export function createProxies(
   const pending = ref<ProxiesPending | null>(null);
   const addResult = ref<ProxyChangeResult | null>(null);
   const importResult = ref<ProxyChangeResult | null>(null);
+  const deleteResult = ref<ProxyDeleteResult | null>(null);
   const checking = ref(false);
   const checkDone = ref(0);
   const checkTotal = ref(0);
@@ -193,6 +199,24 @@ export function createProxies(
     }
   }
 
+  async function removeMany(ids: number[]): Promise<boolean> {
+    if (ids.length === 0 || pending.value !== null) return false;
+    pending.value = "delete";
+    try {
+      const result = await api.removeMany(ids);
+      deleteResult.value = result;
+      actionError.value = null;
+      await tick();
+      return true;
+    } catch (caught) {
+      actionError.value = errorMessage(caught);
+      deleteResult.value = null;
+      return false;
+    } finally {
+      pending.value = null;
+    }
+  }
+
   async function runCheck(): Promise<boolean> {
     if (pending.value !== null) return false;
     pending.value = "check";
@@ -262,6 +286,7 @@ export function createProxies(
     pending,
     addResult,
     importResult,
+    deleteResult,
     checking,
     checkProgress,
     start,
@@ -270,6 +295,7 @@ export function createProxies(
     add,
     importFile,
     remove,
+    removeMany,
     runCheck,
     openFile,
   };

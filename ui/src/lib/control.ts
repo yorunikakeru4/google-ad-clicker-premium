@@ -45,6 +45,7 @@ export type ProxiesAction =
   | { kind: "add"; lines: string[] }
   | { kind: "import" }
   | { kind: "delete"; id: number }
+  | { kind: "deleteMany"; ids: number[] }
   | { kind: "check" }
   | { kind: "file" };
 
@@ -79,6 +80,14 @@ export function proxiesRequest(action: ProxiesAction): ProxiesRequest {
         method: "POST",
         path: "/control/proxies/delete",
         body: JSON.stringify({ id: action.id }),
+      };
+    case "deleteMany":
+      // Батч: демон отвечает best-effort {deleted, skipped, problems}, а не
+      // одним кодом — занятый воркером прокси не должен ронять весь запрос.
+      return {
+        method: "POST",
+        path: "/control/proxies/delete",
+        body: JSON.stringify({ ids: action.ids }),
       };
     case "check":
       return { method: "POST", path: "/control/proxies/check", body: "{}" };

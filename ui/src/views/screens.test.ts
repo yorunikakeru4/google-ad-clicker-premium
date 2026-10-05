@@ -226,6 +226,8 @@ describe("экраны на шаблоне", () => {
       "proxies-add",
       "proxies-import",
       "proxies-check",
+      "proxies-open-file",
+      "proxies-delete-failed",
       "proxies-empty",
     ]) {
       expect(html).toContain(`data-test="${hook}"`);
@@ -236,7 +238,11 @@ describe("экраны на шаблоне", () => {
     expect(html).not.toContain("proxies-action-error");
     expect(html).not.toContain("proxies-add-dialog");
     expect(html).not.toContain("proxies-delete-dialog");
+    expect(html).not.toContain("proxies-bulk-delete-dialog");
+    expect(html).not.toContain("proxies-delete-result");
     expect(html).not.toContain("proxies-check-progress");
+    // кнопка батч-удаления есть всегда: без строк со статусом она на нуле
+    expect(html).toContain("Удалить с ошибкой");
   });
 
   it("Profiles: PageLayout, фильтры, массовые действия и пустое состояние", async () => {

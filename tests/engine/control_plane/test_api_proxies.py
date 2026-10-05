@@ -405,7 +405,7 @@ class TestProxyDelete:
         )
 
         assert status == 200
-        assert body == {"deleted": True}
+        assert body == {"deleted": 1}
         assert pool_rows(db_path) == []
 
     def test_in_use_returns_409(self, server, pool, db_path):
@@ -430,7 +430,7 @@ class TestProxyDelete:
         )
 
         assert status == 200
-        assert body == {"deleted": True}
+        assert body == {"deleted": 1}
 
     def test_unknown_id_is_404(self, server):
         status, body, _ = call(
@@ -467,6 +467,122 @@ class TestProxyDelete:
 
         assert status == 405
         assert body["error"]["code"] == "method_not_allowed"
+
+
+class TestProxyDeleteMany:
+    """Батч ``{"ids": [...]}`` — best-effort: занятые не роняют операцию.
+
+    Контракт ответа тот же, что у добавления/импорта: ``deleted`` /
+    ``skipped`` / ``problems`` — оператор видит и результат, и причину,
+    почему что-то осталось в пуле.
+    """
+
+    def test_deletes_every_listed_proxy(self, server, pool, db_path):
+        # add_remote возвращает первую строку пула, поэтому id собираются из
+        # списка: иначе три «разных» id совпали бы и дедуп ужат бы батч.
+        pool.add_lines([f"10.0.0.{octet}:8080" for octet in (1, 2, 3)])
+        ids = [row["id"] for row in pool.list_proxies()]
+
+        status, body, _ = call(
+            server, "/control/proxies/delete", method="POST", body={"ids": ids}
+        )
+
+        assert status == 200
+        assert body == {"deleted": 3, "skipped": 0, "problems": []}
+        assert pool_rows(db_path) == []
+
+    def test_in_use_and_missing_are_skipped_but_others_go(self, server, pool, db_path):
+        pool.add_lines(["10.0.0.1:8080", "10.0.0.2:8080"])
+        by_host = {row["host"]: row["id"] for row in pool.list_proxies()}
+        busy_id, free_id = by_host["10.0.0.1"], by_host["10.0.0.2"]
+        assign_worker(db_path, busy_id, "br-1", status="running")
+
+        status, body, _ = call(
+            server,
+            "/control/proxies/delete",
+            method="POST",
+            body={"ids": [busy_id, free_id, 424242]},
+        )
+
+        assert status == 200, "занятая строка не должна ронять весь батч"
+        assert body["deleted"] == 1
+        assert body["skipped"] == 2
+        assert len(body["problems"]) == 2
+        assert str(busy_id) in body["problems"][0]
+        assert "br-1" in body["problems"][0]
+        assert "424242" in body["problems"][1]
+        # Занятый прокси пережил запрос, свободный — ушёл.
+        remaining = {row["id"] for row in pool_rows(db_path)}
+        assert remaining == {busy_id}
+
+    def test_report_has_no_credentials(self, server, pool, db_path):
+        busy = add_remote(pool, "10.0.0.1", 8080)
+        assign_worker(db_path, busy["id"], "br-1", status="running")
+
+        _, _, raw = call(
+            server,
+            "/control/proxies/delete",
+            method="POST",
+            body={"ids": [busy["id"]]},
+        )
+
+        assert "s3cr3t" not in raw
+        assert "alice" not in raw
+
+    def test_stopped_worker_does_not_block_batch(self, server, pool, db_path):
+        added = add_remote(pool, "10.0.0.1", 8080)
+        assign_worker(db_path, added["id"], "br-1", status="stopped", pid=None)
+
+        status, body, _ = call(
+            server, "/control/proxies/delete", method="POST", body={"ids": [added["id"]]}
+        )
+
+        assert status == 200
+        assert body == {"deleted": 1, "skipped": 0, "problems": []}
+
+    def test_duplicate_ids_delete_once_without_a_ghost_problem(
+        self, server, pool, db_path
+    ):
+        added = add_remote(pool, "10.0.0.1", 8080)
+        proxy_id = added["id"]
+
+        status, body, _ = call(
+            server, "/control/proxies/delete", method="POST", body={"ids": [proxy_id, proxy_id]}
+        )
+
+        assert status == 200
+        assert body == {"deleted": 1, "skipped": 0, "problems": []}
+        assert pool_rows(db_path) == []
+
+    @pytest.mark.parametrize("value", [[], "5", 5, None, [True], ["5"], {"id": 1}])
+    def test_malformed_ids_is_invalid_request(self, server, value):
+        status, body, _ = call(
+            server, "/control/proxies/delete", method="POST", body={"ids": value}
+        )
+
+        assert status == 400
+        assert body["error"]["code"] == "invalid_request"
+
+    def test_body_without_id_or_ids_is_invalid_request(self, server):
+        status, body, _ = call(
+            server, "/control/proxies/delete", method="POST", body={"foo": 1}
+        )
+
+        assert status == 400
+        assert body["error"]["code"] == "invalid_request"
+
+    def test_batch_requires_token(self, server, pool):
+        added = add_remote(pool, "10.0.0.1", 8080)
+
+        status, _, _ = call(
+            server,
+            "/control/proxies/delete",
+            method="POST",
+            token=None,
+            body={"ids": [added["id"]]},
+        )
+
+        assert status == 401
 
 
 class TestProxyCheck:

@@ -197,8 +197,7 @@ describe("createProxiesApi: удаление и проверка", () => {
     });
     const api = createProxiesApi(transport);
 
-    await expect(api.remove(7)).rejects.toThrow("прокси закреплён за br-1");
-  });
+    await expect(api.remove(7)).rejects.toThrow("прокси закреплён за br-1");  });
 
   it("409 proxy_in_use без сообщения → читаемый текст про поток", async () => {
     const { transport } = transportOf({
@@ -440,5 +439,53 @@ describe("toProxyTableRow", () => {
     expect("password" in row).toBe(false);
     expect("username" in row).toBe(false);
     expect(JSON.stringify(row)).not.toContain("secret");
+  });
+});
+
+describe("createProxiesApi: батчевое удаление", () => {
+  it("ids уходят одним запросом, итог разбирается по контракту", async () => {
+    const { transport, calls } = transportOf({
+      "/control/proxies/delete": {
+        status: 200,
+        body: JSON.stringify({
+          deleted: 2,
+          skipped: 1,
+          problems: ["id=3: назначен воркеру br-1"],
+        }),
+      },
+    });
+    const api = createProxiesApi(transport);
+
+    const result = await api.removeMany([1, 2, 3]);
+
+    expect(calls).toEqual([
+      { path: "/control/proxies/delete", method: "POST", body: '{"ids":[1,2,3]}' },
+    ]);
+    expect(result).toEqual({
+      deleted: 2,
+      skipped: 1,
+      problems: ["id=3: назначен воркеру br-1"],
+    });
+  });
+
+  it("ответ без deleted/skipped/problems — ошибка, а не нули", async () => {
+    const { transport } = transportOf({
+      "/control/proxies/delete": { status: 200, body: '{"deleted":true}' },
+    });
+    const api = createProxiesApi(transport);
+
+    await expect(api.removeMany([1])).rejects.toThrow(/deleted\/skipped\/problems/);
+  });
+
+  it("409 на батче доходит текстом демона", async () => {
+    const { transport } = transportOf({
+      "/control/proxies/delete": {
+        status: 400,
+        body: errorBody("invalid_request", "поле ids должно быть непустым списком"),
+      },
+    });
+    const api = createProxiesApi(transport);
+
+    await expect(api.removeMany([])).rejects.toThrow("непустым списком");
   });
 });

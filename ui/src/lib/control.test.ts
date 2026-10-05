@@ -173,6 +173,13 @@ describe("proxiesRequest", () => {
       path: "/control/proxies/check",
       body: "{}",
     });
+    expect(
+      proxiesRequest({ kind: "deleteMany", ids: [3, 7, 9] }),
+    ).toEqual({
+      method: "POST",
+      path: "/control/proxies/delete",
+      body: '{"ids":[3,7,9]}',
+    });
     // Путь отдаёт демон: резолвится он от его каталога, у UI своего нет.
     expect(proxiesRequest({ kind: "file" })).toEqual({
       method: "GET",

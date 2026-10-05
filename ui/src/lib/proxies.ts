@@ -41,6 +41,20 @@ export interface ProxyChangeResult {
 }
 
 /**
+ * Итог батчевого удаления — ответ `{"ids": [...]}` на /control/proxies/delete.
+ *
+ * Форма намеренно совпадает с импортом (счётчик + причины): демон отвечает
+ * best-effort, и оператору нужны обе половины — сколько удалилось и почему
+ * остальное осталось.
+ */
+export interface ProxyDeleteResult {
+  deleted: number;
+  skipped: number;
+  /** Текст причины по каждому пропущенному id: занят воркером, не найден. */
+  problems: string[];
+}
+
+/**
  * Путь к файлу прокси — ответ GET /control/proxies/file.
  *
  * `path` уже абсолютный (его резолвит демон от своего каталога, тот же,
@@ -59,8 +73,10 @@ export interface ProxiesApi {
   list(): Promise<ProxyRow[]>;
   add(lines: string[]): Promise<ProxyChangeResult>;
   importFile(): Promise<ProxyChangeResult>;
-  /** Возвращает `deleted` из ответа демона. */
+  /** Возвращает `deleted` из ответа демона (счётчик, всегда 1). */
   remove(id: number): Promise<number>;
+  /** Батч best-effort: занятые и не найденные идут в skipped/problems. */
+  removeMany(ids: number[]): Promise<ProxyDeleteResult>;
   check(): Promise<void>;
   /** Абсолютный путь к proxies.txt для кнопки «открыть в системе». */
   filePath(): Promise<ProxyFilePath>;
@@ -181,6 +197,33 @@ function pickChangeResult(raw: unknown, path: string): ProxyChangeResult {
   };
 }
 
+/**
+ * Разбор итога батчевого удаления.
+ *
+ * Причины — строки (так их и шлёт демон), поэтому в отличие от
+ * [`pickChangeResult`] они доходят до алерта целиком: без них «пропущено 3»
+ * ничего не объясняет.
+ */
+function pickDeleteResult(raw: unknown, path: string): ProxyDeleteResult {
+  if (typeof raw !== "object" || raw === null) {
+    throw new Error(`не-JSON ответ демона на ${path}`);
+  }
+  const source = raw as Record<string, unknown>;
+  const { deleted, skipped, problems } = source;
+  if (
+    typeof deleted !== "number" ||
+    typeof skipped !== "number" ||
+    !Array.isArray(problems)
+  ) {
+    throw new Error(`ответ демона без deleted/skipped/problems на ${path}`);
+  }
+  return {
+    deleted,
+    skipped,
+    problems: problems.filter((problem): problem is string => typeof problem === "string"),
+  };
+}
+
 export function createProxiesApi(transport: Transport): ProxiesApi {
   async function send(action: ProxiesAction): Promise<unknown> {
     const request = proxiesRequest(action);
@@ -229,6 +272,13 @@ export function createProxiesApi(transport: Transport): ProxiesApi {
         throw new Error("ответ демона без deleted на /control/proxies/delete");
       }
       return (payload as { deleted: number }).deleted;
+    },
+
+    async removeMany(ids) {
+      return pickDeleteResult(
+        await send({ kind: "deleteMany", ids }),
+        "/control/proxies/delete",
+      );
     },
 
     async check() {

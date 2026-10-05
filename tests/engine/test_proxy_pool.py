@@ -393,6 +393,66 @@ class TestDelete:
         assert "s3cr3t" not in str(excinfo.value)
 
 
+class TestDeleteMany:
+    """Батчевое удаление: ни одно исключение не должно ронять весь запрос."""
+
+    @staticmethod
+    def _ids(pool, count):
+        pool.add_lines([f"10.0.0.{octet}:8080" for octet in range(1, count + 1)])
+        return [row["id"] for row in pool.list_proxies()]
+
+    def test_deletes_all_listed(self, pool, db_path):
+        ids = self._ids(pool, 3)
+
+        result = pool.delete_many(ids)
+
+        assert result == {"deleted": 3, "skipped": 0, "problems": []}
+        assert table_rows(db_path, "proxies") == []
+
+    def test_busy_and_missing_are_reported_not_raised(self, pool, db_path):
+        busy_id, free_id = self._ids(pool, 2)
+        assign_worker(db_path, busy_id, "br-1", status="running")
+
+        result = pool.delete_many([busy_id, free_id, 424242])
+
+        assert result["deleted"] == 1
+        assert result["skipped"] == 2
+        assert f"id={busy_id}: назначен воркеру br-1" in result["problems"]
+        assert "id=424242: прокси не найден" in result["problems"]
+        assert [row["id"] for row in table_rows(db_path, "proxies")] == [busy_id]
+
+    def test_duplicate_ids_count_once(self, pool, db_path):
+        (proxy_id,) = self._ids(pool, 1)
+
+        result = pool.delete_many([proxy_id, proxy_id])
+
+        assert result == {"deleted": 1, "skipped": 0, "problems": []}
+        assert table_rows(db_path, "proxies") == []
+
+    def test_empty_list_is_a_noop(self, pool):
+        assert pool.delete_many([]) == {"deleted": 0, "skipped": 0, "problems": []}
+
+    def test_non_integer_entry_is_a_problem_not_an_exception(self, pool, db_path):
+        (proxy_id,) = self._ids(pool, 1)
+
+        result = pool.delete_many(["5", proxy_id])
+
+        assert result["deleted"] == 1
+        assert result["skipped"] == 1
+        assert "неверный идентификатор" in result["problems"][0]
+        assert table_rows(db_path, "proxies") == []
+
+    def test_report_has_no_credentials(self, pool, db_path):
+        pool.add_lines(["alice:s3cr3t@10.0.0.1:8080"])
+        proxy_id = pool.list_proxies()[0]["id"]
+        assign_worker(db_path, proxy_id, "br-1", status="running")
+
+        result = pool.delete_many([proxy_id])
+
+        assert "s3cr3t" not in repr(result)
+        assert "alice" not in repr(result)
+
+
 class TestRecordUsage:
     def test_inserts_usage_row(self, pool, db_path):
         pool.add_lines(["alice:s3cr3t@10.0.0.1:8080"])

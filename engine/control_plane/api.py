@@ -426,8 +426,21 @@ class ControlPlaneHandler(BaseHTTPRequestHandler):
         return str(self.config.get("paths.proxy_file") or "")
 
     def _handle_proxies_delete(self) -> None:
-        self.proxy_pool.delete(self._requested_id())
-        self._send_json(200, {"deleted": True})
+        """Одиночное удаление — строго, батч — best-effort с отчётом.
+
+        ``{"id": n}`` (легаси-контракт UI) сохраняет 404/409: одна строка,
+        которую держит воркер, — понятная и нужная ошибка. ``{"ids": [...]}``
+        занятые и отсутствующие строки не роняет: иначе один занятый битый
+        прокси заблокировал бы «удалить все с ошибкой», а оператор ждёт
+        ровно обратного — удалить всё, что можно, и увидеть, что мешало.
+        """
+        ids, batch = self._requested_proxy_ids()
+        if not batch:
+            self.proxy_pool.delete(ids[0])
+            # Счётчик, а не булево: UI (как и add/import) ждёт число.
+            self._send_json(200, {"deleted": 1})
+            return
+        self._send_json(200, self.proxy_pool.delete_many(ids))
 
     def _handle_proxies_check(self) -> None:
         self._read_optional_object()
@@ -629,6 +642,31 @@ class ControlPlaneHandler(BaseHTTPRequestHandler):
         if isinstance(profile_id, bool) or not isinstance(profile_id, int):
             raise InvalidRequestError("поле id должно быть целым числом")
         return profile_id
+
+    def _requested_proxy_ids(self) -> tuple[list[int], bool]:
+        """Идентификаторы для удаления прокси: ``(ids, is_batch)``.
+
+        ``{"id": 7}`` — одиночное удаление (строгие 404/409),
+        ``{"ids": [...]}`` — батч best-effort. Дубли схлопываются с
+        сохранением порядка: повтор в списке не должен удалить строку, а
+        потом пожаловаться, что её уже нет.
+        """
+        raw = self._read_json_body()
+        if not isinstance(raw, dict):
+            raise InvalidRequestError("ожидается объект с полем id или ids")
+        if "ids" in raw:
+            ids = raw["ids"]
+            if not isinstance(ids, list) or not ids:
+                raise InvalidRequestError("поле ids должно быть непустым списком")
+            if not all(
+                isinstance(item, int) and not isinstance(item, bool) for item in ids
+            ):
+                raise InvalidRequestError("поле ids должно быть списком целых чисел")
+            return list(dict.fromkeys(ids)), True
+        single = raw.get("id")
+        if isinstance(single, bool) or not isinstance(single, int):
+            raise InvalidRequestError("поле id должно быть целым числом")
+        return [single], False
 
     def _read_optional_object(self) -> dict[str, Any]:
         """Тело-объект для endpoint'ов с пустым или необязательным телом."""

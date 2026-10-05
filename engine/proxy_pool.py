@@ -378,18 +378,11 @@ class ProxyPool:
                 ).fetchone()
                 if row is None:
                     raise ProxyNotFoundError(f"прокси id={proxy_id} не найден")
-                holder = conn.execute(
-                    f"""
-                    SELECT w.browser_id FROM workers w
-                    WHERE w.proxy_id = ? AND w.status IN ({_status_list()})
-                    ORDER BY w.id LIMIT 1
-                    """,
-                    (proxy_id,),
-                ).fetchone()
+                holder = _holder(conn, proxy_id)
                 if holder is not None:
                     raise ProxyInUseError(
                         f"прокси id={proxy_id} назначен воркеру "
-                        f"{holder['browser_id']} и не может быть удалён"
+                        f"{holder} и не может быть удалён"
                     )
                 conn.execute("DELETE FROM proxies WHERE id = ?", (proxy_id,))
                 conn.commit()
@@ -397,6 +390,55 @@ class ProxyPool:
                 conn.rollback()
                 raise
         return True
+
+    def delete_many(self, proxy_ids: Sequence[Any]) -> dict[str, Any]:
+        """Удаляет несколько прокси за одну транзакцию, не падая на занятых.
+
+        Семантика — как у импорта: назначенные живому воркеру и
+        отсутствующие строки не роняют операцию, а попадают в
+        ``skipped``/``problems``. Иначе один занятый битый прокси
+        заблокировал бы «удалить все с ошибкой». Проверка назначения и
+        удаление каждого id идут в одной транзакции — супервизор не успевает
+        назначить прокси между ними.
+
+        Дубли схлопываются: повторно запрошенный id не обязан исчезнуть из
+        отчёта как «не найден». Пустой список — no-op, валидация тела
+        (непустой список целых чисел) живёт в HTTP-слое.
+        """
+        if not proxy_ids:
+            return {"deleted": 0, "skipped": 0, "problems": []}
+
+        deleted = 0
+        problems: list[str] = []
+        seen: set[int] = set()
+
+        with self._lock, self._connect() as conn:
+            try:
+                for proxy_id in proxy_ids:
+                    if isinstance(proxy_id, bool) or not isinstance(proxy_id, int):
+                        problems.append(f"id={proxy_id!r}: неверный идентификатор")
+                        continue
+                    if proxy_id in seen:
+                        continue
+                    seen.add(proxy_id)
+                    row = conn.execute(
+                        "SELECT 1 FROM proxies WHERE id = ?", (proxy_id,)
+                    ).fetchone()
+                    if row is None:
+                        problems.append(f"id={proxy_id}: прокси не найден")
+                        continue
+                    holder = _holder(conn, proxy_id)
+                    if holder is not None:
+                        problems.append(f"id={proxy_id}: назначен воркеру {holder}")
+                        continue
+                    conn.execute("DELETE FROM proxies WHERE id = ?", (proxy_id,))
+                    deleted += 1
+                conn.commit()
+            except BaseException:
+                conn.rollback()
+                raise
+
+        return {"deleted": deleted, "skipped": len(problems), "problems": problems}
 
     # --- health-проверка -------------------------------------------------
 
@@ -466,6 +508,25 @@ def _status_list() -> str:
 
     Функция, а не строковая константа: значения фиксированы в
     ``_ALIVE_WORKER_STATUSES``, и расхождение между списком и проверкой
-    в ``delete()`` невозможно по построению.
+    назначения невозможно по построению.
     """
     return ", ".join(f"'{status}'" for status in _ALIVE_WORKER_STATUSES)
+
+
+def _holder(conn: sqlite3.Connection, proxy_id: int) -> str | None:
+    """``browser_id`` живого воркера, держащего прокси, либо ``None``.
+
+    Общая проверка для ``delete`` и ``delete_many``: оба места обязаны
+    считать прокси «занятым» одинаково, иначе одиночное удаление и батч
+    разъезжались бы на одних и тех же данных. Вызывается внутри открытой
+    транзакции — так проверка и удаление не расходятся по времени.
+    """
+    row = conn.execute(
+        f"""
+        SELECT w.browser_id FROM workers w
+        WHERE w.proxy_id = ? AND w.status IN ({_status_list()})
+        ORDER BY w.id LIMIT 1
+        """,
+        (proxy_id,),
+    ).fetchone()
+    return None if row is None else str(row["browser_id"])

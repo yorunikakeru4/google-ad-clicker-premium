@@ -42,6 +42,17 @@ const forwardedSlots = computed(() =>
 
 const search = ref("");
 const selected = ref<Row[]>([]);
+
+/**
+ * Снять выделение снаружи: после батчевого удаления выбранные строки уходят
+ * из `items`, но Vuetify не чистит `selected` сам — панель «Удалить
+ * выбранные» залипала бы на несуществующих id.
+ */
+function clearSelection(): void {
+  selected.value = [];
+}
+
+defineExpose({ clearSelection });
 </script>
 
 <template>
@@ -66,7 +77,7 @@ const selected = ref<Row[]>([]);
     <v-divider />
 
     <div v-if="selected.length" class="d-flex align-center flex-wrap ga-2 px-4 py-2">
-      <slot name="bulk" :count="selected.length">
+      <slot name="bulk" :count="selected.length" :selected="selected">
         <v-chip color="primary">Выбрано: {{ selected.length }}</v-chip>
       </slot>
     </div>

@@ -9,6 +9,7 @@ import { createProxies, PROXIES_POLL_MS } from "./useProxies";
 import type {
   ProxiesApi,
   ProxyChangeResult,
+  ProxyDeleteResult,
   ProxyFilePath,
   ProxyRow,
 } from "../lib/proxies";
@@ -42,6 +43,8 @@ function fakeApi(initial: ProxyRow[] = []) {
     importError: null as Error | null,
     removed: 1,
     removeError: null as Error | null,
+    deleteManyResult: { deleted: 0, skipped: 0, problems: [] } as ProxyDeleteResult,
+    deleteManyError: null as Error | null,
     checkError: null as Error | null,
     file: { path: "/data/proxies.txt", exists: true } as ProxyFilePath,
     fileError: null as Error | null,
@@ -63,6 +66,10 @@ function fakeApi(initial: ProxyRow[] = []) {
     remove: vi.fn(async () => {
       if (state.removeError) throw state.removeError;
       return state.removed;
+    }),
+    removeMany: vi.fn(async () => {
+      if (state.deleteManyError) throw state.deleteManyError;
+      return { ...state.deleteManyResult, problems: [...state.deleteManyResult.problems] };
     }),
     check: vi.fn(async () => {
       if (state.checkError) throw state.checkError;
@@ -454,6 +461,78 @@ describe("createProxies: открытие proxies.txt", () => {
     release();
     expect(await first).toBe(true);
     expect(fake.api.filePath).toHaveBeenCalledTimes(1);
+    proxies.stop();
+  });
+});
+
+describe("createProxies: батчевое удаление", () => {
+  it("отчёт демона виден в deleteResult, список перечитан", async () => {
+    const fake = fakeApi([proxyRow({ id: 1 }), proxyRow({ id: 2 })]);
+    const proxies = createProxies(fake.api);
+    await proxies.start();
+    fake.state.rows = [];
+    fake.state.deleteManyResult = {
+      deleted: 1,
+      skipped: 1,
+      problems: ["id=2: назначен воркеру br-1"],
+    };
+
+    const ok = await proxies.removeMany([1, 2]);
+
+    expect(ok).toBe(true);
+    expect(fake.api.removeMany).toHaveBeenCalledWith([1, 2]);
+    expect(proxies.deleteResult.value).toEqual({
+      deleted: 1,
+      skipped: 1,
+      problems: ["id=2: назначен воркеру br-1"],
+    });
+    expect(proxies.actionError.value).toBeNull();
+    expect(proxies.rows.value).toEqual([]);
+    expect(proxies.pending.value).toBeNull();
+    proxies.stop();
+  });
+
+  it("пустой список id не уходит в сеть", async () => {
+    const fake = fakeApi();
+    const proxies = createProxies(fake.api);
+    await proxies.start();
+
+    const ok = await proxies.removeMany([]);
+
+    expect(ok).toBe(false);
+    expect(fake.api.removeMany).not.toHaveBeenCalled();
+    proxies.stop();
+  });
+
+  it("ошибка батча идёт в actionError и снимает прошлый отчёт", async () => {
+    const fake = fakeApi([proxyRow({ id: 1 })]);
+    const proxies = createProxies(fake.api);
+    await proxies.start();
+    proxies.deleteResult.value = { deleted: 3, skipped: 0, problems: [] };
+    fake.state.deleteManyError = new Error("нет соединения с демоном");
+
+    const ok = await proxies.removeMany([1]);
+
+    expect(ok).toBe(false);
+    expect(proxies.actionError.value).toContain("нет соединения");
+    expect(proxies.deleteResult.value).toBeNull();
+    proxies.stop();
+  });
+
+  it("параллельный батч не стартует, пока идёт первый", async () => {
+    const fake = fakeApi([proxyRow({ id: 1 })]);
+    const proxies = createProxies(fake.api);
+    await proxies.start();
+
+    fake.api.removeMany = vi.fn(
+      () => new Promise<ProxyDeleteResult>(() => {}),
+    );
+    const first = proxies.removeMany([1]);
+    const second = await proxies.removeMany([2]);
+
+    expect(second).toBe(false);
+    expect(fake.api.removeMany).toHaveBeenCalledTimes(1);
+    void first;
     proxies.stop();
   });
 });

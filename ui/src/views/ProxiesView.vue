@@ -14,6 +14,10 @@
 // Файл proxies.txt открывается внешней программой (opener), а не здесь:
 // путь к нему отдаёт демон (`GET /control/proxies/file`) абсолютным — UI
 // не знает каталога, от которого резолвится относительный путь конфига.
+//
+// Массовое удаление — best-effort: и выбор в таблице, и кнопка «Удалить с
+// ошибкой» шлют один батч `{"ids": [...]}`, а занятые воркером строки
+// возвращаются в отчёте под таблицей, а не ошибкой.
 
 import { computed, onMounted, onUnmounted, ref } from "vue";
 import ConfirmDialog from "../components/forms/ConfirmDialog.vue";
@@ -102,6 +106,65 @@ async function confirmDelete(): Promise<void> {
   // 409 «прокси назначен потоку» придёт в actionError над таблицей.
   await proxies.remove(target.id);
 }
+
+// --- батчевое удаление ---------------------------------------------------
+
+/** Ссылка на таблицу — нужна, чтобы снять выбор после удаления строк. */
+const table = ref<InstanceType<typeof DataTablePage> | null>(null);
+
+/** Цель подтверждения батча: id и подписи диалога; null — диалог закрыт. */
+interface BulkTarget {
+  ids: number[];
+  title: string;
+  text: string;
+}
+
+const bulkTarget = ref<BulkTarget | null>(null);
+
+const bulkDialog = computed({
+  get: () => bulkTarget.value !== null,
+  set: (open: boolean) => {
+    if (!open) bulkTarget.value = null;
+  },
+});
+
+/** Строки со статусом «ошибка» — цель кнопки «Удалить с ошибкой». */
+const failedRows = computed(() =>
+  tableRows.value.filter((row) => row.status === "error"),
+);
+
+function askBulkDelete(ids: number[], title: string, text: string): void {
+  if (ids.length === 0) return;
+  // Итог прошлой операции не должен пережить новое подтверждение.
+  proxies.deleteResult.value = null;
+  bulkTarget.value = { ids, title, text };
+}
+
+function askDeleteSelected(rows: ReadonlyArray<{ id: number }>): void {
+  askBulkDelete(
+    rows.map((row) => row.id),
+    `Удалить выбранные (${rows.length})?`,
+    `${rows.length} прокси уйдёт из пула. Назначенные живому воркеру останутся — они попадут в отчёт под таблицей.`,
+  );
+}
+
+function askDeleteFailed(): void {
+  const rows = failedRows.value;
+  askBulkDelete(
+    rows.map((row) => row.id),
+    `Удалить прокси со статусом «ошибка» (${rows.length})?`,
+    `Будут удалены ${rows.length} прокси с неудачной проверкой. Назначенные живому воркеру останутся — они попадут в отчёт под таблицей.`,
+  );
+}
+
+async function confirmBulkDelete(): Promise<void> {
+  const target = bulkTarget.value;
+  bulkTarget.value = null;
+  if (target === null) return;
+  const ok = await proxies.removeMany(target.ids);
+  // Удалённых строк больше нет в items, но Vuetify selection не чистит сам.
+  if (ok) table.value?.clearSelection();
+}
 </script>
 
 <template>
@@ -141,12 +204,32 @@ async function confirmDelete(): Promise<void> {
       </div>
     </v-alert>
 
+    <v-alert
+      v-if="proxies.deleteResult.value"
+      type="success"
+      variant="tonal"
+      class="mb-4"
+      closable
+      data-test="proxies-delete-result"
+      @click:close="proxies.deleteResult.value = null"
+    >
+      Удалено {{ proxies.deleteResult.value.deleted }}, пропущено
+      {{ proxies.deleteResult.value.skipped }}.
+      <div
+        v-for="problem in proxies.deleteResult.value.problems"
+        :key="problem"
+      >
+        {{ problem }}
+      </div>
+    </v-alert>
+
     <DataTablePage
+      ref="table"
       :headers="headers"
       :items="tableRows"
       :loading="proxies.loading.value"
       :error="proxies.error.value"
-      :selectable="false"
+      :selectable="true"
       empty-icon="mdi-earth"
       empty-title="Добавьте первый прокси"
       empty-hint="Импортируйте список из proxies.txt или добавьте вручную"
@@ -165,7 +248,41 @@ async function confirmDelete(): Promise<void> {
         </v-chip>
       </template>
 
+      <template #bulk="{ count, selected }">
+        <v-btn
+          size="small"
+          color="error"
+          variant="tonal"
+          prepend-icon="mdi-delete"
+          data-test="proxies-delete-selected"
+          @click="askDeleteSelected(selected as ProxyTableRow[])"
+        >
+          Удалить выбранные ({{ count }})
+        </v-btn>
+        <v-btn
+          size="small"
+          variant="text"
+          data-test="proxies-clear-selection"
+          @click="table?.clearSelection()"
+        >
+          Снять выбор
+        </v-btn>
+      </template>
+
       <template #actions>
+        <v-btn
+          size="small"
+          variant="outlined"
+          color="error"
+          prepend-icon="mdi-delete-sweep"
+          :disabled="failedRows.length === 0"
+          :loading="proxies.pending.value === 'delete'"
+          data-test="proxies-delete-failed"
+          @click="askDeleteFailed()"
+        >
+          Удалить с ошибкой ({{ failedRows.length }})
+        </v-btn>
+
         <v-btn
           size="small"
           variant="outlined"
@@ -348,6 +465,16 @@ async function confirmDelete(): Promise<void> {
       destructive
       data-test="proxies-delete-dialog"
       @confirm="confirmDelete"
+    />
+
+    <ConfirmDialog
+      v-model="bulkDialog"
+      :title="bulkTarget?.title ?? 'Удалить прокси?'"
+      :text="bulkTarget?.text"
+      confirm-label="Удалить"
+      destructive
+      data-test="proxies-bulk-delete-dialog"
+      @confirm="confirmBulkDelete"
     />
   </PageLayout>
 </template>
