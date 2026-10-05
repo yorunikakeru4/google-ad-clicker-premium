@@ -625,6 +625,7 @@ mod tests {
         assert!(allowed_path("/control/proxies/import"));
         assert!(allowed_path("/control/proxies/delete"));
         assert!(allowed_path("/control/proxies/check"));
+        assert!(allowed_path("/control/proxies/file"));
 
         // Строки с обходом, регистром и запросом не проходят.
         assert!(!allowed_path("/control/proxies/"));

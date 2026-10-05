@@ -9,6 +9,7 @@ import { createProxies, PROXIES_POLL_MS } from "./useProxies";
 import type {
   ProxiesApi,
   ProxyChangeResult,
+  ProxyFilePath,
   ProxyRow,
 } from "../lib/proxies";
 
@@ -42,6 +43,8 @@ function fakeApi(initial: ProxyRow[] = []) {
     removed: 1,
     removeError: null as Error | null,
     checkError: null as Error | null,
+    file: { path: "/data/proxies.txt", exists: true } as ProxyFilePath,
+    fileError: null as Error | null,
   };
 
   const api: ProxiesApi = {
@@ -63,6 +66,10 @@ function fakeApi(initial: ProxyRow[] = []) {
     }),
     check: vi.fn(async () => {
       if (state.checkError) throw state.checkError;
+    }),
+    filePath: vi.fn(async () => {
+      if (state.fileError) throw state.fileError;
+      return { ...state.file };
     }),
   };
 
@@ -374,6 +381,79 @@ describe("createProxies: проверка", () => {
     expect(ok).toBe(false);
     expect(proxies.actionError.value).toContain("Проверка уже идёт");
     expect(proxies.checking.value).toBe(false);
+    proxies.stop();
+  });
+});
+
+describe("createProxies: открытие proxies.txt", () => {
+  it("путь из демона уходит в opener, прошлая ошибка снимается", async () => {
+    const fake = fakeApi();
+    const opener = vi.fn(async () => {});
+    const proxies = createProxies(fake.api, PROXIES_POLL_MS, opener);
+    await proxies.start();
+    proxies.actionError.value = "старая ошибка";
+
+    const ok = await proxies.openFile();
+
+    expect(ok).toBe(true);
+    expect(fake.api.filePath).toHaveBeenCalledTimes(1);
+    expect(opener).toHaveBeenCalledWith("/data/proxies.txt");
+    expect(proxies.actionError.value).toBeNull();
+    expect(proxies.pending.value).toBeNull();
+    proxies.stop();
+  });
+
+  it("файла нет на диске — своя причина, opener не вызывается", async () => {
+    const fake = fakeApi();
+    fake.state.file = { path: "/data/proxies.txt", exists: false };
+    const opener = vi.fn(async () => {});
+    const proxies = createProxies(fake.api, PROXIES_POLL_MS, opener);
+    await proxies.start();
+
+    const ok = await proxies.openFile();
+
+    expect(ok).toBe(false);
+    expect(opener).not.toHaveBeenCalled();
+    expect(proxies.actionError.value).toContain("не найден");
+    expect(proxies.actionError.value).toContain("/data/proxies.txt");
+    proxies.stop();
+  });
+
+  it("отказ opener доходит в actionError, а не валит экран", async () => {
+    const fake = fakeApi();
+    const opener = vi.fn(async () => {
+      throw new Error("нет приложения по умолчанию");
+    });
+    const proxies = createProxies(fake.api, PROXIES_POLL_MS, opener);
+    await proxies.start();
+
+    const ok = await proxies.openFile();
+
+    expect(ok).toBe(false);
+    expect(proxies.actionError.value).toContain("нет приложения по умолчанию");
+    proxies.stop();
+  });
+
+  it("повторный вызов во время первого не идёт параллельно", async () => {
+    const fake = fakeApi();
+    let release!: () => void;
+    fake.api.filePath = vi.fn(
+      () =>
+        new Promise<ProxyFilePath>((resolve) => {
+          release = () => resolve({ path: "/data/proxies.txt", exists: true });
+        }),
+    );
+    const opener = vi.fn(async () => {});
+    const proxies = createProxies(fake.api, PROXIES_POLL_MS, opener);
+    await proxies.start();
+
+    const first = proxies.openFile();
+    const second = await proxies.openFile();
+
+    expect(second).toBe(false);
+    release();
+    expect(await first).toBe(true);
+    expect(fake.api.filePath).toHaveBeenCalledTimes(1);
     proxies.stop();
   });
 });

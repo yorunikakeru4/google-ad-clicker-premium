@@ -10,6 +10,10 @@
 //
 // Креды в данных отсутствуют на всех уровнях: Rust-читалка не выбирает
 // username/password, API-слой собирает строку только из контрактных полей.
+//
+// Файл proxies.txt открывается внешней программой (opener), а не здесь:
+// путь к нему отдаёт демон (`GET /control/proxies/file`) абсолютным — UI
+// не знает каталога, от которого резолвится относительный путь конфига.
 
 import { computed, onMounted, onUnmounted, ref } from "vue";
 import ConfirmDialog from "../components/forms/ConfirmDialog.vue";
@@ -162,6 +166,17 @@ async function confirmDelete(): Promise<void> {
       </template>
 
       <template #actions>
+        <v-btn
+          size="small"
+          variant="outlined"
+          prepend-icon="mdi-open-in-new"
+          :loading="proxies.pending.value === 'file'"
+          data-test="proxies-open-file"
+          @click="void proxies.openFile()"
+        >
+          Открыть proxies.txt
+        </v-btn>
+
         <v-btn
           size="small"
           variant="outlined"

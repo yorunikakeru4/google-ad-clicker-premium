@@ -40,6 +40,21 @@ export interface ProxyChangeResult {
   problems: string[];
 }
 
+/**
+ * Путь к файлу прокси — ответ GET /control/proxies/file.
+ *
+ * `path` уже абсолютный (его резолвит демон от своего каталога, тот же,
+ * от которого читает импорт), `exists` — лежит ли файл на диске: его может
+ * ещё не быть, и тогда opener получил бы путь в никуда.
+ */
+export interface ProxyFilePath {
+  path: string;
+  exists: boolean;
+}
+
+/** Открыватель файла в системной программе; подменяется в тестах. */
+export type FileOpener = (path: string) => Promise<void>;
+
 export interface ProxiesApi {
   list(): Promise<ProxyRow[]>;
   add(lines: string[]): Promise<ProxyChangeResult>;
@@ -47,6 +62,8 @@ export interface ProxiesApi {
   /** Возвращает `deleted` из ответа демона. */
   remove(id: number): Promise<number>;
   check(): Promise<void>;
+  /** Абсолютный путь к proxies.txt для кнопки «открыть в системе». */
+  filePath(): Promise<ProxyFilePath>;
 }
 
 /**
@@ -216,6 +233,18 @@ export function createProxiesApi(transport: Transport): ProxiesApi {
 
     async check() {
       await send({ kind: "check" });
+    },
+
+    async filePath() {
+      const payload = await send({ kind: "file" });
+      if (typeof payload !== "object" || payload === null) {
+        throw new Error("не-JSON ответ демона на /control/proxies/file");
+      }
+      const source = payload as { path?: unknown; exists?: unknown };
+      if (typeof source.path !== "string" || source.path === "") {
+        throw new Error("ответ демона без path на /control/proxies/file");
+      }
+      return { path: source.path, exists: source.exists === true };
     },
   };
 }

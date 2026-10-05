@@ -7,10 +7,12 @@
 // строка из списка на момент запуска не обновилась (или не исчезла).
 
 import { computed, ref, type ComputedRef, type Ref } from "vue";
+import { openPath } from "@tauri-apps/plugin-opener";
 import { errorMessage } from "../lib/control";
 import { tauriTransport } from "../lib/daemonApi";
 import {
   createProxiesApi,
+  type FileOpener,
   type ProxiesApi,
   type ProxyChangeResult,
   type ProxyRow,
@@ -20,7 +22,7 @@ import {
 export const PROXIES_POLL_MS = 3000;
 
 /** Какое действие сейчас в полёте; null — ничего. */
-export type ProxiesPending = "add" | "import" | "delete" | "check";
+export type ProxiesPending = "add" | "import" | "delete" | "check" | "file";
 
 /** Прогресс проверки: сколько строк уже перепроверено из сколько. */
 export interface CheckProgress {
@@ -53,11 +55,14 @@ export interface ProxiesState {
   importFile(): Promise<boolean>;
   remove(id: number): Promise<boolean>;
   runCheck(): Promise<boolean>;
+  /** Открыть proxies.txt в системной программе по умолчанию. */
+  openFile(): Promise<boolean>;
 }
 
 export function createProxies(
   api: ProxiesApi = createProxiesApi(tauriTransport),
   pollMs: number = PROXIES_POLL_MS,
+  opener: FileOpener = openPath,
 ): ProxiesState {
   const rows = ref<ProxyRow[]>([]);
   const loading = ref(false);
@@ -207,6 +212,28 @@ export function createProxies(
     }
   }
 
+  async function openFile(): Promise<boolean> {
+    if (pending.value !== null) return false;
+    pending.value = "file";
+    try {
+      const file = await api.filePath();
+      // Файла может ещё не быть (чистая установка): opener в этом случае
+      // получил бы путь в никуда, поэтому причина показывается наша.
+      if (!file.exists) {
+        actionError.value = `Файл прокси не найден: ${file.path}`;
+        return false;
+      }
+      await opener(file.path);
+      actionError.value = null;
+      return true;
+    } catch (caught) {
+      actionError.value = errorMessage(caught);
+      return false;
+    } finally {
+      pending.value = null;
+    }
+  }
+
   async function start(): Promise<void> {
     desired = true;
     if (timer !== null) return;
@@ -244,6 +271,7 @@ export function createProxies(
     importFile,
     remove,
     runCheck,
+    openFile,
   };
 }
 

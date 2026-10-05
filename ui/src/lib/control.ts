@@ -45,7 +45,8 @@ export type ProxiesAction =
   | { kind: "add"; lines: string[] }
   | { kind: "import" }
   | { kind: "delete"; id: number }
-  | { kind: "check" };
+  | { kind: "check" }
+  | { kind: "file" };
 
 export interface ProxiesRequest {
   method: "GET" | "POST";
@@ -81,6 +82,10 @@ export function proxiesRequest(action: ProxiesAction): ProxiesRequest {
       };
     case "check":
       return { method: "POST", path: "/control/proxies/check", body: "{}" };
+    case "file":
+      // Путь к файлу демон резолвит сам: он относительный в конфиге, а
+      // каталог данных UI неизвестен. Тела нет — брать нечего.
+      return { method: "GET", path: "/control/proxies/file" };
   }
 }
 

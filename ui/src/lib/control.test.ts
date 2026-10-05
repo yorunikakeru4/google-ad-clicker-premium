@@ -173,6 +173,11 @@ describe("proxiesRequest", () => {
       path: "/control/proxies/check",
       body: "{}",
     });
+    // Путь отдаёт демон: резолвится он от его каталога, у UI своего нет.
+    expect(proxiesRequest({ kind: "file" })).toEqual({
+      method: "GET",
+      path: "/control/proxies/file",
+    });
   });
 
   it("тело собирается из payload, а не из глобального состояния", () => {

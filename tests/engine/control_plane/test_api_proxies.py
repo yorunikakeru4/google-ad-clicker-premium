@@ -3,7 +3,7 @@
 Сервер настоящий (loopback, свободный порт), как в ``test_api.py``. Здесь
 проверяется то, что нельзя сломать без поломки UI:
 
-- пять маршрутов ``/control/proxies*`` с форматами ответов из контракта;
+- шесть маршрутов ``/control/proxies*`` с форматами ответов из контракта;
 - креды в сыром тексте ответа: ни логина, ни пароля — только ``SECRET_MASK``;
 - путь импорта берётся из конфига, а не из запроса;
 - ``409 proxy_in_use`` и ``409 check_in_progress`` — состояния, а не ошибки.
@@ -14,6 +14,7 @@ from __future__ import annotations
 import json
 import urllib.error
 import urllib.request
+from pathlib import Path
 
 import pytest
 
@@ -519,6 +520,83 @@ class TestProxyCheck:
         status, _, _ = call(server, "/control/proxies/check")
 
         assert status == 405
+
+
+class TestProxyFilePath:
+    """GET /control/proxies/file: путь для «открыть proxies.txt» из UI.
+
+    UI не знает каталога демона, поэтому путь отдаётся уже абсолютным —
+    ровно тем, от которого читает ``import_file``. Запрос не может указать
+    другой файл: значения в теле нет вообще.
+    """
+
+    @staticmethod
+    def _server_with_file(make_server, path: str):
+        config = Config.from_dict(config_module.default_config()).patch(
+            {"paths": {"proxy_file": path}}
+        )
+        return make_server(config_instance=config)
+
+    def test_absolute_path_is_returned_untouched(self, make_server, tmp_path):
+        target = tmp_path / "proxies.txt"
+        target.write_text("10.0.0.1:8080\n", encoding="utf-8")
+        instance = self._server_with_file(make_server, str(target))
+
+        status, body, _ = call(instance, "/control/proxies/file")
+
+        assert status == 200
+        assert body == {"path": str(target), "exists": True}
+        assert Path(body["path"]).is_absolute()
+
+    def test_relative_path_resolves_from_process_cwd(self, make_server, tmp_path, monkeypatch):
+        (tmp_path / "proxies.txt").write_text("10.0.0.1:8080\n", encoding="utf-8")
+        instance = self._server_with_file(make_server, "proxies.txt")
+        monkeypatch.chdir(tmp_path)
+
+        status, body, _ = call(instance, "/control/proxies/file")
+
+        assert status == 200
+        assert Path(body["path"]).resolve() == (tmp_path / "proxies.txt").resolve()
+        assert body["exists"] is True
+
+    def test_missing_file_is_200_with_exists_false(self, make_server, tmp_path):
+        instance = self._server_with_file(make_server, str(tmp_path / "nope.txt"))
+
+        status, body, _ = call(instance, "/control/proxies/file")
+
+        assert status == 200, "отсутствие файла — не ошибка запроса, а условие"
+        assert body == {"path": str(tmp_path / "nope.txt"), "exists": False}
+
+    def test_without_configured_file_is_400(self, server):
+        status, body, _ = call(server, "/control/proxies/file")
+
+        assert status == 400
+        assert body["error"]["code"] == "invalid_request"
+
+    def test_file_requires_token(self, server):
+        status, _, _ = call(server, "/control/proxies/file", token=None)
+
+        assert status == 401
+
+    def test_post_on_file_path_is_405(self, server):
+        status, _, _ = call(server, "/control/proxies/file", method="POST", body={})
+
+        assert status == 405
+
+    def test_request_body_cannot_point_at_another_file(self, make_server, tmp_path):
+        """Path traversal закрыт: путь в теле запроса не читается вовсе."""
+        other = tmp_path / "other.txt"
+        other.write_text("bob:s3cr3t@10.9.9.9:9999\n", encoding="utf-8")
+        configured = tmp_path / "proxies.txt"
+        configured.write_text("10.0.0.1:8080\n", encoding="utf-8")
+        instance = self._server_with_file(make_server, str(configured))
+
+        status, body, _ = call(
+            instance, "/control/proxies/file", method="GET", body={"path": str(other)}
+        )
+
+        assert status == 200
+        assert body["path"] == str(configured)
 
 
 def pool_rows(db_path):

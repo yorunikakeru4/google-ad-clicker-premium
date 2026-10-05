@@ -244,6 +244,63 @@ describe("createProxiesApi: удаление и проверка", () => {
   });
 });
 
+describe("createProxiesApi: путь к файлу", () => {
+  it("filePath бьёт в GET /control/proxies/file и отдаёт путь с exists", async () => {
+    const { transport, calls } = transportOf({
+      "/control/proxies/file": {
+        status: 200,
+        body: JSON.stringify({ path: "/data/proxies.txt", exists: true }),
+      },
+    });
+    const api = createProxiesApi(transport);
+
+    const file = await api.filePath();
+
+    expect(file).toEqual({ path: "/data/proxies.txt", exists: true });
+    expect(calls).toEqual([
+      { path: "/control/proxies/file", method: "GET", body: undefined },
+    ]);
+  });
+
+  it("отсутствующий файл — exists false, а не ошибка запроса", async () => {
+    const { transport } = transportOf({
+      "/control/proxies/file": {
+        status: 200,
+        body: JSON.stringify({ path: "/data/proxies.txt", exists: false }),
+      },
+    });
+    const api = createProxiesApi(transport);
+
+    await expect(api.filePath()).resolves.toEqual({
+      path: "/data/proxies.txt",
+      exists: false,
+    });
+  });
+
+  it("ответ без path — читаемая ошибка, а не пустая строка в opener", async () => {
+    const { transport } = transportOf({
+      "/control/proxies/file": { status: 200, body: '{"exists":true}' },
+    });
+    const api = createProxiesApi(transport);
+
+    await expect(api.filePath()).rejects.toThrow(/без path/);
+  });
+
+  it("путь в теле запроса не учитывается — его не существует вовсе", async () => {
+    const { transport, calls } = transportOf({
+      "/control/proxies/file": {
+        status: 200,
+        body: JSON.stringify({ path: "/data/proxies.txt", exists: true }),
+      },
+    });
+    const api = createProxiesApi(transport);
+
+    await api.filePath();
+
+    expect(calls[0].body).toBeUndefined();
+  });
+});
+
 describe("proxyApiError", () => {
   it("известный 409 без message берёт локальный текст", () => {
     expect(proxyApiError(409, errorBody("proxy_in_use"))).toMatch(

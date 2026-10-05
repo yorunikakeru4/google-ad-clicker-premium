@@ -387,12 +387,43 @@ class ControlPlaneHandler(BaseHTTPRequestHandler):
         # Тело читается, чтобы битый JSON дал привычный 400, но его
         # содержимое игнорируется: путь берётся только из конфига.
         self._read_optional_object()
-        path = str(self.config.get("paths.proxy_file") or "")
+        path = self._proxy_file_setting()
         if not path:
             raise ProxyImportError(
                 "paths.proxy_file не задан в конфиге — импорт из файла невозможен"
             )
         self._send_json(200, self.proxy_pool.import_file(path))
+
+    def _handle_proxies_file(self) -> None:
+        """Абсолютный путь к файлу прокси — для «открыть в системе» из UI.
+
+        Путь отдаёт демон, а не UI: в конфиге он обычно относительный
+        (``proxies.txt``), а разрешается он от текущего каталога демона —
+        того же, от которого читает ``proxy_pool.import_file``. UI этот
+        каталог не знает и не должен знать: opener-плагину нужен готовый
+        абсолютный путь.
+
+        ``exists`` грузится в ответ намеренно: файла может ещё не быть
+        (чистая установка), и UI показывает понятное «файл не найден»
+        вместо ошибки системы при открытии.
+        """
+        path = self._proxy_file_setting()
+        if not path:
+            raise InvalidRequestError("paths.proxy_file не задан в конфиге")
+        source = Path(path)
+        if not source.is_absolute():
+            source = Path.cwd() / source
+        self._send_json(200, {"path": str(source), "exists": source.is_file()})
+
+    def _proxy_file_setting(self) -> str:
+        """``paths.proxy_file`` из конфига; пустая строка — значение не задано.
+
+        Один источник пути для импорта и для «открыть файл»: две ветки,
+        читающие конфиг по-своему, могли бы разъехаться. Пустое значение не
+        поднимает исключение здесь — код ответа у импорта и у чтения пути
+        разный (``proxy_import_failed`` против ``invalid_request``).
+        """
+        return str(self.config.get("paths.proxy_file") or "")
 
     def _handle_proxies_delete(self) -> None:
         self.proxy_pool.delete(self._requested_id())
@@ -705,6 +736,7 @@ _ROUTES: dict[tuple[str, str], str] = {
     ("GET", "/control/proxies"): "_handle_proxies_list",
     ("POST", "/control/proxies"): "_handle_proxies_add",
     ("POST", "/control/proxies/import"): "_handle_proxies_import",
+    ("GET", "/control/proxies/file"): "_handle_proxies_file",
     ("POST", "/control/proxies/delete"): "_handle_proxies_delete",
     ("POST", "/control/proxies/check"): "_handle_proxies_check",
     ("GET", "/control/profiles"): "_handle_profiles_list",
