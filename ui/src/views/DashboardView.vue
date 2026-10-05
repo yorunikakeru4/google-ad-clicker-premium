@@ -299,7 +299,7 @@ const uptimeShare = computed(() =>
       <v-col cols="12" md="6" lg="4">
         <BarChartCard
           title="CAPTCHA по часам"
-          hint="события из логов (категория captcha), 24 часа"
+          hint="события из captcha_events, 24 часа"
           :labels="dash.series.value.labels"
           :values="dash.series.value.captcha"
           color-token="warning"

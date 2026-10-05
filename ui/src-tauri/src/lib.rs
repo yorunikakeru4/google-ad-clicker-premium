@@ -10,9 +10,9 @@ use std::collections::HashMap;
 use tauri::Manager;
 
 use commands::{
-    active_workers, captcha_share, clicks_per_hour, count_logs, db_open, db_size,
-    list_captcha_events, list_diagnostics, list_logs, list_logs_page, list_profiles, list_proxies,
-    requests_last_hour, runs_summary, uptime_summary, DbState,
+    active_workers, captcha_share, captchas_per_hour, clicks_per_hour, count_logs, db_open,
+    db_size, list_captcha_events, list_diagnostics, list_logs, list_logs_page, list_profiles,
+    list_proxies, requests_last_hour, runs_summary, uptime_summary, DbState,
 };
 use daemon::{DaemonSpec, DaemonStatus, DaemonSupervisor, SupervisorOptions};
 
@@ -98,6 +98,7 @@ pub fn run() {
             count_logs,
             runs_summary,
             clicks_per_hour,
+            captchas_per_hour,
             requests_last_hour,
             captcha_share,
             active_workers,

@@ -155,6 +155,19 @@ describe("createDbApi", () => {
     expect(calls[5].args).toEqual({ now: 5000, thresholdSecs: 15 });
   });
 
+  it("captchasPerHour уходит в captchas_per_hour с теми же аргументами", async () => {
+    const reply = [{ bucket: 3600, count: 2 }];
+    const { calls, invoke } = fakeInvoke(reply);
+    const api = createDbApi(invoke);
+
+    const points = await api.captchasPerHour(1000, 24);
+
+    expect(points).toEqual(reply);
+    expect(calls).toEqual([
+      { command: "captchas_per_hour", args: { since: 1000, buckets: 24 } },
+    ]);
+  });
+
   it("uptimeSummary уходит в uptime_summary с окном в часах", async () => {
     const reply = {
       ratio: 0.99,

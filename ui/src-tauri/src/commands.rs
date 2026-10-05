@@ -15,7 +15,9 @@ use crate::db::{
     CaptchaEventRow, DbError, DbReader, DbSize, DiagnosticRow, LogEntry, LogFilters, LogPageEntry,
     ProfileRow, ProxyRow,
 };
-use crate::metrics::{ActiveWorker, HourlyClicks, RequestsLastHour, RunsSummary, UptimeSummary};
+use crate::metrics::{
+    ActiveWorker, HourlyCaptchas, HourlyClicks, RequestsLastHour, RunsSummary, UptimeSummary,
+};
 
 /// Имя переменной окружения с путём к БД — зеркало `DB_ENV_VAR` из
 /// `engine/log.py`.
@@ -248,6 +250,20 @@ pub fn clicks_per_hour(
     buckets: u32,
 ) -> Result<Vec<HourlyClicks>, DbError> {
     with_reader(&state.0, |reader| reader.clicks_per_hour(since, buckets))
+}
+
+/// События CAPTCHA по часовым бакетам — график «CAPTCHA по часам».
+///
+/// Источник — `captcha_events`, а не логи: в `logs` той же категорией
+/// помечена и строка «No captcha seen», и поэтому график мог показывать
+/// столбцы при нуле настоящих событий.
+#[tauri::command]
+pub fn captchas_per_hour(
+    state: State<'_, DbState>,
+    since: f64,
+    buckets: u32,
+) -> Result<Vec<HourlyCaptchas>, DbError> {
+    with_reader(&state.0, |reader| reader.captchas_per_hour(since, buckets))
 }
 
 /// Запросы в скользящем окне последнего часа плюс нагрузка по воркерам.

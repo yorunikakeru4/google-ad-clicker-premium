@@ -15,9 +15,7 @@ import {
   type RunsSummary,
   type UptimeSummary,
 } from "../lib/dbApi";
-import type { LogRow } from "../lib/logMerge";
-import { collectAllRows } from "../lib/logMerge";
-import { alignCounts, buildHourlyBuckets, countByHour, hourLabel } from "../lib/series";
+import { alignCounts, buildHourlyBuckets, hourLabel } from "../lib/series";
 import { useDaemonStatus } from "./useDaemonStatus";
 import { useDb } from "./useDb";
 
@@ -40,13 +38,6 @@ export const DASHBOARD_REFRESH_MS = 5000;
  * engine/control_plane/supervisor.py.
  */
 export const ACTIVE_WORKER_STALE_SECS = 15;
-
-/** Категория логов с событиями CAPTCHA — зеркало CATEGORIES в engine/log.py. */
-const CAPTCHA_CATEGORY = "captcha";
-
-/** Потолок выгрузки логов CAPTCHA для графика: страниц × строк на страницу. */
-const CAPTCHA_SERIES_PAGE = 100;
-const CAPTCHA_SERIES_MAX_ROWS = 1000;
 
 export interface DashboardSeries {
   /** Часовые метки окна, локальные HH:MM. */
@@ -110,22 +101,6 @@ export function createDashboard(api: DbApi = dbApi): DashboardState {
 
   let timer: ReturnType<typeof setInterval> | null = null;
 
-  /** Логи с категорией CAPTCHA в окне — источник графика «CAPTCHA по часам». */
-  async function loadCaptchaRows(since: number): Promise<LogRow[]> {
-    const query = {
-      level: null,
-      category: CAPTCHA_CATEGORY,
-      browserId: null,
-      since,
-      until: null,
-    };
-    return collectAllRows(
-      (cursor, limit) => api.listLogsPage({ query, limit, cursor }),
-      CAPTCHA_SERIES_PAGE,
-      CAPTCHA_SERIES_MAX_ROWS,
-    );
-  }
-
   async function refresh(): Promise<void> {
     if (db.phase.value !== "open" || loading.value) return;
 
@@ -135,14 +110,14 @@ export function createDashboard(api: DbApi = dbApi): DashboardState {
       const since = now - DASHBOARD_WINDOW_SECONDS;
       const buckets = buildHourlyBuckets(since, now);
 
-      const [summary, clicks, load, share, active, captchaRows, uptimeSummary] =
+      const [summary, clicks, load, share, active, captchas, uptimeSummary] =
         await Promise.all([
           api.runsSummary(since),
           api.clicksPerHour(since, buckets.length),
           api.requestsLastHour(now),
           api.captchaShare(since),
           api.activeWorkers(now, ACTIVE_WORKER_STALE_SECS),
-          loadCaptchaRows(since),
+          api.captchasPerHour(since, buckets.length),
           api.uptimeSummary(UPTIME_WINDOW_HOURS),
         ]);
 
@@ -154,7 +129,7 @@ export function createDashboard(api: DbApi = dbApi): DashboardState {
       series.value = {
         labels: buckets.map(hourLabel),
         clicks: alignCounts(clicks, buckets),
-        captcha: countByHour(captchaRows, buckets),
+        captcha: alignCounts(captchas, buckets),
         loadLabels: load.per_browser.map((row) => row.browser_id ?? "—"),
         loadValues: load.per_browser.map((row) => row.count),
       };

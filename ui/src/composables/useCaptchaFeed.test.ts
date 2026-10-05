@@ -13,6 +13,7 @@ import {
 } from "./useCaptchaFeed";
 import {
   CAPTCHA_FEED_LIMIT,
+  CAPTCHA_FEED_WINDOW_SECONDS,
   CAPTCHA_UNSOLVED_WINDOW_SECONDS,
   type CaptchaEvent,
 } from "../lib/captcha";
@@ -332,6 +333,45 @@ describe("createCaptchaFeed: подсветка и скриншот", () => {
 
     expect(opener).not.toHaveBeenCalled();
     expect(feed.screenshotError.value).toBeTruthy();
+    feed.stop();
+  });
+});
+
+describe("createCaptchaFeed: окно ленты в сутки", () => {
+  it("события старше суток в ленту не попадают, свежие — попадают", async () => {
+    const fake = fakeApi([
+      event(1, { ts: NOW - 60 }),
+      event(2, { ts: NOW - CAPTCHA_FEED_WINDOW_SECONDS - 60 }),
+    ]);
+    const feed = createCaptchaFeed(
+      fake.api as Pick<DbApi, "listCaptchaEvents">,
+      options(),
+    );
+
+    await feed.start();
+
+    expect(feed.events.value.map((row) => row.id)).toEqual([1]);
+    feed.stop();
+  });
+
+  it("вчерашнее событие не поднимает всплывашку и не светит в подсветке", async () => {
+    const fake = fakeApi([event(1, { ts: NOW - 60 })]);
+    const feed = createCaptchaFeed(
+      fake.api as Pick<DbApi, "listCaptchaEvents">,
+      options(),
+    );
+    await feed.start();
+    expect(feed.notices.value).toHaveLength(0);
+
+    // Вторым тиком приезжает строка, которой раньше не было, но ей больше суток.
+    fake.state.rows = [
+      event(1, { ts: NOW - 60 }),
+      event(2, { ts: NOW - CAPTCHA_FEED_WINDOW_SECONDS - 60 }),
+    ];
+    await feed.tick();
+
+    expect(feed.events.value.map((row) => row.id)).toEqual([1]);
+    expect(feed.notices.value).toHaveLength(0);
     feed.stop();
   });
 });

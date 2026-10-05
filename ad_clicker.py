@@ -214,7 +214,17 @@ def run_scenario(
                 ),
                 fields={"proxy": proxy.split("@")[-1]},
             )
-            log.mark_degraded("google captcha on proxy ip" if captcha else "proxy pre-check failed")
+            # Причина уходит в workers.last_error и видна на Dashboard в
+            # колонке «последняя ошибка»: без уточнения читалась бы как
+            # «капча сейчас», хотя Chrome здесь не запускался вовсе — так
+            # капчу увидел только безбраузерный probe. Ветка None сохраняет
+            # прежнюю строку: её контракт проверяется тестом и она нарочно
+            # не должна содержать слово captcha.
+            log.mark_degraded(
+                "google captcha on proxy ip (probe only, browser not started)"
+                if captcha
+                else "proxy pre-check failed"
+            )
             return False
 
     driver, country_code = create_webdriver(proxy, user_agent, plugin_folder_name)

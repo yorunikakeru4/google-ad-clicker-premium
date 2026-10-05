@@ -9,7 +9,7 @@
 
 import { openPath } from "@tauri-apps/plugin-opener";
 import { errorMessage } from "./control";
-import { formatClockTime } from "./format";
+import { formatLocalDateTime } from "./format";
 
 /** Событие `captcha_events` — контракт команды `list_captcha_events`. */
 export interface CaptchaEvent {
@@ -33,12 +33,33 @@ export const CAPTCHA_UNSOLVED_WINDOW_SECONDS = 30 * 60;
 /** Сколько последних событий держит лента: хватает экрану, не раздувает память. */
 export const CAPTCHA_FEED_LIMIT = 20;
 
+/**
+ * Окно ленты — сутки, как у всех блоков Dashboard.
+ *
+ * Без окна карточка показывала бы события прошлых дней как «последние»:
+ * лента читает последние 20 строк без фильтра, и недельная давность была
+ * видна только по времени, которого в ячейке и не было.
+ */
+export const CAPTCHA_FEED_WINDOW_SECONDS = 24 * 60 * 60;
+
+/** Событие попадает в окно ленты относительно момента `nowSeconds`. */
+export function inFeedWindow(ts: number, nowSeconds: number): boolean {
+  return Number.isFinite(ts) && ts >= nowSeconds - CAPTCHA_FEED_WINDOW_SECONDS;
+}
+
 /** Предел подписи страницы: длинная ссылка не должна растягивать колонку. */
 export const CAPTCHA_URL_LABEL_MAX = 60;
 
-/** Время события: локальные HH:MM:SS из эпохи в секундах. */
+/**
+ * Время события: локальные `YYYY-MM-DD HH:MM:SS` из эпохи в секундах.
+ *
+ * Дата обязательна: окно ленты — сутки, и одни часы вчерашнего дня
+ * читались бы как «только что».
+ */
 export function formatEventTime(ts: number): string {
-  return formatClockTime(ts * 1000);
+  if (!Number.isFinite(ts)) return "—";
+  const seconds = String(new Date(ts * 1000).getSeconds()).padStart(2, "0");
+  return `${formatLocalDateTime(ts)}:${seconds}`;
 }
 
 /**

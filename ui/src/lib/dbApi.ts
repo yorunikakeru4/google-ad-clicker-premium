@@ -38,6 +38,18 @@ export interface HourlyClicks {
   count: number;
 }
 
+/**
+ * Часовой бакет событий CAPTCHA — ответ captchas_per_hour.
+ *
+ * Отдельный тип при том же виде, что у [`HourlyClicks`]: у команд разные
+ * контракты, и путаница «клики/капчи» в коде UI стоит дороже совпадения
+ * полей.
+ */
+export interface HourlyCaptchas {
+  bucket: number;
+  count: number;
+}
+
 export interface BrowserRequests {
   browser_id: string | null;
   count: number;
@@ -91,6 +103,8 @@ export interface DbApi {
   countLogs(query: LogQueryFilters): Promise<number>;
   runsSummary(since: number): Promise<RunsSummary>;
   clicksPerHour(since: number, buckets: number): Promise<HourlyClicks[]>;
+  /** События CAPTCHA по часам — график «CAPTCHA по часам» на Dashboard. */
+  captchasPerHour(since: number, buckets: number): Promise<HourlyCaptchas[]>;
   requestsLastHour(now: number): Promise<RequestsLastHour>;
   captchaShare(since: number): Promise<number | null>;
   activeWorkers(now: number, thresholdSecs: number): Promise<ActiveWorker[]>;
@@ -180,6 +194,9 @@ export function createDbApi(call: DbInvoke = invoke): DbApi {
 
     clicksPerHour: (since, buckets) =>
       call("clicks_per_hour", { since, buckets }) as Promise<HourlyClicks[]>,
+
+    captchasPerHour: (since, buckets) =>
+      call("captchas_per_hour", { since, buckets }) as Promise<HourlyCaptchas[]>,
 
     requestsLastHour: (now) =>
       call("requests_last_hour", { now }) as Promise<RequestsLastHour>,

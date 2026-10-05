@@ -1,4 +1,4 @@
-// Лента CAPTCHA на Dashboard (план §5, фаза 8): опрос последних событий,
+// Лента CAPTCHA на Dashboard (план §5, фаза 8): опрос событий за сутки,
 // всплывающее уведомление о новом событии и производная подсветка воркеров.
 //
 // Опрос — паттерн useProxies/useDiagnostics: тик по интервалу, дедупликация
@@ -14,6 +14,7 @@
 import { computed, ref, type ComputedRef, type Ref } from "vue";
 import {
   CAPTCHA_FEED_LIMIT,
+  inFeedWindow,
   openScreenshot,
   toNotice,
   unsolvedBrowserIds,
@@ -91,18 +92,22 @@ export function createCaptchaFeed(
   /** Лента уже хотя бы раз читалась: скелетон больше не нужен. */
   let loaded = false;
 
-  /** Разбор выборки: базовая линия либо очередь новых уведомлений. */
+  /** Разбор выборки: окно суток, базовая линия либо очередь новых уведомлений. */
   function accept(rows: CaptchaEvent[]): void {
-    events.value = rows;
+    // Окно режется здесь, а не в БД: читалка отдаёт просто последние N
+    // строк, и без этой проверки лента показывала бы события прошлых дней
+    // как «последние» — Dashboard живёт в окне суток.
+    const visible = rows.filter((row) => inFeedWindow(row.ts, now() / 1000));
+    events.value = visible;
 
     if (!baselined) {
-      for (const row of rows) seen.add(row.id);
+      for (const row of visible) seen.add(row.id);
       baselined = true;
       return;
     }
 
-    const fresh = rows.filter((row) => !seen.has(row.id));
-    for (const row of rows) seen.add(row.id);
+    const fresh = visible.filter((row) => !seen.has(row.id));
+    for (const row of visible) seen.add(row.id);
     if (fresh.length > 0) {
       notices.value = [...notices.value, ...fresh.map(toNotice)];
     }

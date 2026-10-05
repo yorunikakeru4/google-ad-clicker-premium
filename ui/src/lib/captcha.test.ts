@@ -6,10 +6,12 @@
 
 import { describe, expect, it, vi } from "vitest";
 import {
+  CAPTCHA_FEED_WINDOW_SECONDS,
   CAPTCHA_UNSOLVED_WINDOW_SECONDS,
   captchaNoticeText,
   formatElapsed,
   formatEventTime,
+  inFeedWindow,
   openScreenshot,
   pageUrlLabel,
   toNotice,
@@ -33,9 +35,13 @@ function event(overrides: Partial<CaptchaEvent> & { id: number }): CaptchaEvent 
 }
 
 describe("formatEventTime и formatElapsed", () => {
-  it("время события — локальные HH:MM:SS из эпохи в секундах", () => {
+  it("время события — локальные YYYY-MM-DD HH:MM:SS из эпохи в секундах", () => {
     const ts = new Date(2026, 8, 30, 7, 5, 9).getTime() / 1000;
-    expect(formatEventTime(ts)).toBe("07:05:09");
+    expect(formatEventTime(ts)).toBe("2026-09-30 07:05:09");
+  });
+
+  it("битое время — тире, а не Invalid Date в ячейке", () => {
+    expect(formatEventTime(Number.NaN)).toBe("—");
   });
 
   it("длительность: миллисекунды, секунды и отсутствие значения", () => {
@@ -44,6 +50,24 @@ describe("formatEventTime и formatElapsed", () => {
     expect(formatElapsed(0)).toBe("0 мс");
     expect(formatElapsed(null)).toBe("—");
     expect(formatElapsed(undefined)).toBe("—");
+  });
+});
+
+describe("inFeedWindow: окно ленты в сутки", () => {
+  const NOW = 1_760_000_000;
+
+  it("свежее событие и событие ровно на границе — в окне", () => {
+    expect(inFeedWindow(NOW - 60, NOW)).toBe(true);
+    expect(inFeedWindow(NOW - CAPTCHA_FEED_WINDOW_SECONDS, NOW)).toBe(true);
+  });
+
+  it("вчерашнее и старее событие в ленту не попадает", () => {
+    expect(inFeedWindow(NOW - CAPTCHA_FEED_WINDOW_SECONDS - 1, NOW)).toBe(false);
+    expect(inFeedWindow(0, NOW)).toBe(false);
+  });
+
+  it("битое время не проходит в окно", () => {
+    expect(inFeedWindow(Number.NaN, NOW)).toBe(false);
   });
 });
 

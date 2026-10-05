@@ -34,6 +34,17 @@ pub struct HourlyClicks {
     pub count: i64,
 }
 
+/// Часовой бакет событий CAPTCHA: `bucket` — unix-секунды начала часа.
+///
+/// Отдельный тип, а не `HourlyClicks` под другим именем: сериализуется он
+/// одинаково, но у команд разные контракты — путаница между «клики» и
+/// «капчи» на стороне UI стоит дороже дублирования из семи строк.
+#[derive(Debug, Clone, PartialEq, Serialize)]
+pub struct HourlyCaptchas {
+    pub bucket: i64,
+    pub count: i64,
+}
+
 /// Скользящее окно «запросы/час» плюс разбивка по воркерам.
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct RequestsLastHour {
@@ -200,6 +211,47 @@ impl DbReader {
             .map(|row| row.map_err(read_failed))
             .collect::<Result<Vec<_>, _>>()?;
         // SQL отдаёт самые свежие часы первыми — дашборду нужен хронология.
+        points.reverse();
+        Ok(points)
+    }
+
+    /// События CAPTCHA по часовым бакетам — источник графика «CAPTCHA по
+    /// часам».
+    ///
+    /// Читается `captcha_events`, а не `logs` с категорией `captcha`: в
+    /// логах той же категорией помечены и «No captcha seen», и ошибки
+    /// конфигурации 2captcha, из-за чего график рисовал столбцы при нуле
+    /// настоящих событий. Контракт бакетов — тот же, что у
+    /// [`Self::clicks_per_hour`].
+    pub fn captchas_per_hour(
+        &self,
+        since: f64,
+        buckets: u32,
+    ) -> Result<Vec<HourlyCaptchas>, DbError> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT CAST(ts / 3600 AS INTEGER) AS bucket, COUNT(*) AS n \
+                 FROM captcha_events \
+                 WHERE ts >= ?1 \
+                 GROUP BY bucket \
+                 ORDER BY bucket DESC \
+                 LIMIT ?2",
+            )
+            .map_err(read_failed)?;
+        let rows = stmt
+            .query_map(rusqlite::params![since, buckets], |row| {
+                let index: i64 = row.get(0)?;
+                Ok(HourlyCaptchas {
+                    bucket: index * 3600,
+                    count: row.get(1)?,
+                })
+            })
+            .map_err(read_failed)?;
+
+        let mut points = rows
+            .map(|row| row.map_err(read_failed))
+            .collect::<Result<Vec<_>, _>>()?;
         points.reverse();
         Ok(points)
     }
@@ -712,6 +764,87 @@ mod tests {
                 },
             ],
             "при равном счёте — browser_id по возрастанию, NULL первый"
+        );
+    }
+
+    // --- captchas_per_hour ------------------------------------------------
+
+    #[test]
+    fn captchas_per_hour_on_empty_db_returns_no_buckets() {
+        let tmp = TempDb::new();
+        let path = tmp.path();
+        let _writer = seed(&path);
+
+        let reader = DbReader::open(&path).expect("БД открывается");
+        let buckets = reader
+            .captchas_per_hour(0.0, 24)
+            .expect("пустая база — пустой график, а не ошибка");
+
+        assert!(buckets.is_empty());
+    }
+
+    #[test]
+    fn captchas_per_hour_groups_by_hour_with_inclusive_lower_boundary() {
+        let tmp = TempDb::new();
+        let path = tmp.path();
+        let writer = seed(&path);
+        for ts in [0.0, 59.9, 3600.0, 7199.5, 7200.0] {
+            insert_captcha_event(&writer, ts);
+        }
+
+        let reader = DbReader::open(&path).expect("БД открывается");
+        let buckets = reader
+            .captchas_per_hour(0.0, 10)
+            .expect("бакеты читаются");
+
+        assert_eq!(
+            buckets,
+            vec![
+                HourlyCaptchas {
+                    bucket: 0,
+                    count: 2
+                },
+                HourlyCaptchas {
+                    bucket: 3600,
+                    count: 2
+                },
+                HourlyCaptchas {
+                    bucket: 7200,
+                    count: 1
+                },
+            ],
+            "час [t0, t0+3600): граница начинает новый час, пропусков нет"
+        );
+    }
+
+    #[test]
+    fn captchas_per_hour_counts_events_only_and_respects_window_and_limit() {
+        let tmp = TempDb::new();
+        let path = tmp.path();
+        let writer = seed(&path);
+        // Событие старше since не считается; два свежих часа ограничиваются
+        // потолком buckets — тот же контракт, что у clicks_per_hour.
+        insert_captcha_event(&writer, 100.0);
+        insert_captcha_event(&writer, 3700.0);
+        insert_captcha_event(&writer, 3800.0);
+        insert_captcha_event(&writer, 7300.0);
+
+        let reader = DbReader::open(&path).expect("БД открывается");
+        let buckets = reader.captchas_per_hour(3600.0, 2).expect("бакеты читаются");
+
+        assert_eq!(
+            buckets,
+            vec![
+                HourlyCaptchas {
+                    bucket: 3600,
+                    count: 2
+                },
+                HourlyCaptchas {
+                    bucket: 7200,
+                    count: 1
+                },
+            ],
+            "событие до since выпадает, свежие часы — не больше buckets"
         );
     }
 
