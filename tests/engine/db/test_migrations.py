@@ -105,6 +105,29 @@ _LEGACY_PROFILES = [
     ("legacy-c", "key-c", "new"),
 ]
 
+# Снимок таблицы proxies ДО миграции 004 — с колонкой country. Свежий
+# migrate() уже её удалил: без пересоздания накат 004 на такую БД упал бы
+# на «no such column», и тест проверял бы миграцию против самой себя.
+_LEGACY_PROXIES_DDL = """
+CREATE TABLE proxies (
+    id             INTEGER PRIMARY KEY,
+    label          TEXT,
+    scheme         TEXT    NOT NULL DEFAULT 'http',
+    host           TEXT    NOT NULL,
+    port           INTEGER NOT NULL,
+    username       TEXT,
+    password       TEXT,
+    country        TEXT,
+    latency_ms     INTEGER,
+    is_alive       INTEGER NOT NULL DEFAULT 1,
+    fail_count     INTEGER NOT NULL DEFAULT 0,
+    last_checked_at REAL,
+    last_error     TEXT,
+    created_at     REAL     NOT NULL DEFAULT (CAST(strftime('%s', 'now') AS REAL)),
+    UNIQUE (host, port, username)
+);
+"""
+
 # Снимок таблицы logs ДО миграции 003 — без колонки day. Тот же DDL нужен и
 # для БД версии 1, и для версии 2: logs не менялась миграцией 002, поэтому
 # «очередная» БД до 003 выглядит именно так.
@@ -136,6 +159,17 @@ def _recreate_logs_without_day(conn: sqlite3.Connection) -> None:
     conn.execute("CREATE INDEX idx_logs_browser_id ON logs (browser_id)")
 
 
+def _recreate_proxies_with_country(conn: sqlite3.Connection) -> None:
+    """Вернуть proxies в вид до миграции 004 (с колонкой country).
+
+    Индекс proxies уходит вместе с таблицей и создаётся заново — иначе
+    DROP TABLE оставил бы висячий idx_proxies_alive.
+    """
+    conn.execute("DROP TABLE proxies")
+    conn.execute(_LEGACY_PROXIES_DDL)
+    conn.execute("CREATE INDEX idx_proxies_alive ON proxies (is_alive)")
+
+
 def _make_version_database(db_path, version: int) -> None:
     """Собрать БД указанной версии из текущей схемы.
 
@@ -150,8 +184,10 @@ def _make_version_database(db_path, version: int) -> None:
     conn = sqlite3.connect(db_path, isolation_level=None)
     try:
         conn.execute("PRAGMA foreign_keys = OFF")
-        # 002 меняла profiles, 003 — logs: чем моложе целевая версия, тем
-        # больше таблиц надо вернуть в прежний вид.
+        # 002 меняла profiles, 003 — logs, 004 — proxies: чем моложе
+        # целевая версия, тем больше таблиц надо вернуть в прежний вид.
+        if version < 4:
+            _recreate_proxies_with_country(conn)
         if version < 3:
             _recreate_logs_without_day(conn)
         if version < 2:

@@ -25,6 +25,7 @@
 мёртвого прокси занимает не больше ``CHECK_TIMEOUT_SECONDS``, а не сумму
 таймаутов по всем прокси. Цель по умолчанию — ``DEFAULT_CHECK_TARGET``;
 тесты подменяют её на loopback, и за пределы 127.0.0.1 тесты не ходят.
+
 """
 
 from __future__ import annotations

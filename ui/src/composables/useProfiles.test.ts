@@ -33,7 +33,6 @@ function proxyRow(id: number): ProxyRow {
     scheme: "http",
     host: `host-${id}.example`,
     port: 8080,
-    country: null,
     latency_ms: null,
     is_alive: true,
     fail_count: 0,

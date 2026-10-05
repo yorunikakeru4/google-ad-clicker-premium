@@ -29,11 +29,11 @@ from engine.diagnostics import (
     DiagnosticSnapshot,
     EchoResult,
     observe_signal,
-    proxy_context,
     read_signal,
     request_signal,
     reset_session_state,
     session_checkpoint,
+    worker_proxy_id,
 )
 from engine.log import StructuredLogger
 from engine.store import StoreWriter
@@ -429,17 +429,18 @@ class TestFailureIsolation:
         assert checkpoint(FakeDriver(), store=store, logger=None) is False
 
 
-# --- прокси и страна -----------------------------------------------------------
+# --- прокси воркера -------------------------------------------------------------
 
 
-class TestProxyContext:
+class TestWorkerProxyId:
+    """В снимок уходит id прокси воркера; страна из пула не читается."""
+
     @staticmethod
-    def _add_proxy(db_path, *, country=None):
+    def _add_proxy(db_path):
         with sqlite3.connect(db_path) as conn:
             cursor = conn.execute(
-                "INSERT INTO proxies (host, port, username, password, country) "
-                "VALUES ('10.0.0.1', 8080, 'alice', 's3cr3t', ?)",
-                (country,),
+                "INSERT INTO proxies (host, port, username, password) "
+                "VALUES ('10.0.0.1', 8080, 'alice', 's3cr3t')"
             )
             conn.commit()
             return cursor.lastrowid
@@ -454,25 +455,19 @@ class TestProxyContext:
             )
             conn.commit()
 
-    def test_assigned_proxy_gives_id_and_country(self, store, db_path):
-        proxy_id = self._add_proxy(db_path, country="DE")
+    def test_assigned_proxy_gives_its_id(self, store, db_path):
+        proxy_id = self._add_proxy(db_path)
         self._assign(db_path, "br-1", proxy_id)
 
-        assert proxy_context(store, "br-1") == (proxy_id, "DE")
-
-    def test_proxy_without_a_country_gives_none(self, store, db_path):
-        proxy_id = self._add_proxy(db_path, country=None)
-        self._assign(db_path, "br-1", proxy_id)
-
-        assert proxy_context(store, "br-1") == (proxy_id, None)
+        assert worker_proxy_id(store, "br-1") == proxy_id
 
     def test_worker_without_a_proxy(self, store, db_path):
         StateStore(db_path).register_worker("br-1", 999)
 
-        assert proxy_context(store, "br-1") == (None, None)
+        assert worker_proxy_id(store, "br-1") is None
 
     def test_unknown_worker(self, store):
-        assert proxy_context(store, "nope") == (None, None)
+        assert worker_proxy_id(store, "nope") is None
 
 
 # --- строка в БД целиком --------------------------------------------------------
@@ -504,8 +499,8 @@ class TestRowInDatabase:
     def test_no_secrets_from_the_proxy_land_in_the_snapshot(self, store, db_path, writer):
         with sqlite3.connect(db_path) as conn:
             cursor = conn.execute(
-                "INSERT INTO proxies (host, port, username, password, country) "
-                "VALUES ('10.0.0.1', 8080, 'alice', 's3cr3t', 'DE')"
+                "INSERT INTO proxies (host, port, username, password) "
+                "VALUES ('10.0.0.1', 8080, 'alice', 's3cr3t')"
             )
             proxy_id = cursor.lastrowid
             conn.execute(
@@ -522,12 +517,16 @@ class TestRowInDatabase:
         assert "s3cr3t" not in blob
         assert "alice" not in blob
 
-    def test_language_flag_uses_the_proxy_country(self, store, db_path, writer):
-        """Страна в правиле «язык ↔ страна» приходит из строки прокси
-        воркера, а не из гео: именно её закрепляет супервизор."""
+    def test_language_flag_uses_the_geo_country(self, store, db_path, writer):
+        """Страна в правиле «язык ↔ страна» — гео exit-IP сессии.
+
+        Пул прокси страну не хранит: единственный источник, отражающий
+        именно тот exit-IP, которым шла сессия, — гео, записанное драйвером
+        в ``_geo_country`` при старте браузера.
+        """
         with sqlite3.connect(db_path) as conn:
             cursor = conn.execute(
-                "INSERT INTO proxies (host, port, country) VALUES ('10.0.0.1', 8080, 'DE')"
+                "INSERT INTO proxies (host, port) VALUES ('10.0.0.1', 8080)"
             )
             conn.execute(
                 "INSERT INTO workers (browser_id, status, proxy_id) VALUES "
@@ -538,8 +537,10 @@ class TestRowInDatabase:
 
         logger = StructuredLogger(writer, browser_id="br-1")
         page = dict(PAGE, accept_language="ru-RU,ru;q=0.9")
+        driver = FakeDriver(page)
+        driver._geo_country = "DE"
 
-        checkpoint(FakeDriver(page), store=store, logger=logger)
+        checkpoint(driver, store=store, logger=logger)
 
         row = diagnostics_rows(db_path)[0]
         assert row["country"] == "DE"

@@ -43,7 +43,6 @@ CREATE TABLE IF NOT EXISTS proxies (
     port           INTEGER NOT NULL,
     username       TEXT,
     password       TEXT,
-    country        TEXT,
     latency_ms     INTEGER,
     is_alive       INTEGER NOT NULL DEFAULT 1,
     fail_count     INTEGER NOT NULL DEFAULT 0,

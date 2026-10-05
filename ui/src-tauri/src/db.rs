@@ -116,7 +116,6 @@ pub struct ProxyRow {
     pub scheme: String,
     pub host: String,
     pub port: i64,
-    pub country: Option<String>,
     pub latency_ms: Option<i64>,
     pub is_alive: bool,
     pub fail_count: i64,
@@ -376,7 +375,7 @@ impl DbReader {
         let mut stmt = self
             .conn
             .prepare(
-                "SELECT p.id, p.label, p.scheme, p.host, p.port, p.country, \
+                "SELECT p.id, p.label, p.scheme, p.host, p.port, \
                         p.latency_ms, p.is_alive, p.fail_count, p.last_checked_at, \
                         p.last_error, \
                         (SELECT w.browser_id FROM workers w \
@@ -391,44 +390,26 @@ impl DbReader {
 
         let rows = stmt
             .query_map([], |row| {
-                let is_alive: i64 = row.get(7)?;
+                let is_alive: i64 = row.get(6)?;
                 Ok(ProxyRow {
                     id: row.get(0)?,
                     label: row.get(1)?,
                     scheme: row.get(2)?,
                     host: row.get(3)?,
                     port: row.get(4)?,
-                    country: row.get(5)?,
-                    latency_ms: row.get(6)?,
+                    latency_ms: row.get(5)?,
                     is_alive: is_alive != 0,
-                    fail_count: row.get(8)?,
-                    last_checked_at: row.get(9)?,
-                    last_error: row.get(10)?,
-                    assigned_browser_id: row.get(11)?,
-                    usage_count: row.get(12)?,
+                    fail_count: row.get(7)?,
+                    last_checked_at: row.get(8)?,
+                    last_error: row.get(9)?,
+                    assigned_browser_id: row.get(10)?,
+                    usage_count: row.get(11)?,
                 })
             })
             .map_err(read_failed)?;
 
         rows.map(|row| row.map_err(read_failed)).collect()
     }
-
-    /// Список профилей для экрана Profiles: строки `profiles` плюс назначенный
-    /// воркер, прокси и сырые `fields`. Порядок — по `id`, как у
-    /// [`Self::list_proxies`]: стабильный и совпадает с порядком вставки.
-    ///
-    /// Назначение — подзапросом, а не JOIN: два воркера на одном профиле
-    /// размножили бы строку, а экрану нужен ровно один профиль на строку. При
-    /// нескольких воркерах отдаётся первый `browser_id` по алфавиту — выбор
-    /// детерминирован, а не зависит от порядка в таблице.
-    ///
-    /// Прокси — LEFT JOIN: профиль может быть без прокси, и в этом случае
-    /// `proxy_id`/`proxy_label`/`proxy_address` остаются NULL.
-    ///
-    /// Колонки `fields` в схеме ещё нет (миграция 002 параллельной ветки):
-    /// читалка спрашивает `pragma_table_info` и до миграции отдаёт NULL, а не
-    /// падает с «no such column». Это терпимо для read-only читалки, потому что
-    /// сама БД остаётся старой — ошибка возникла бы на каждом вызове.
     pub fn list_profiles(&self) -> Result<Vec<ProfileRow>, DbError> {
         let has_fields = self
             .conn
@@ -1810,9 +1791,9 @@ mod tests {
 
         writer
             .execute(
-                "INSERT INTO proxies (label, scheme, host, port, country, latency_ms, \
+                "INSERT INTO proxies (label, scheme, host, port, latency_ms, \
                   is_alive, fail_count, last_checked_at, last_error, username, password) \
-                 VALUES ('проверенный', 'socks5', 'live.example', 1080, 'DE', 150, \
+                 VALUES ('проверенный', 'socks5', 'live.example', 1080, 150, \
                   1, 0, 1000.0, NULL, 'user', 'secret-password')",
                 [],
             )
@@ -1840,7 +1821,6 @@ mod tests {
         assert_eq!(live.scheme, "socks5");
         assert_eq!(live.host, "live.example");
         assert_eq!(live.port, 1080);
-        assert_eq!(live.country.as_deref(), Some("DE"));
         assert_eq!(live.latency_ms, Some(150));
         assert_eq!(live.last_checked_at, Some(1000.0));
         assert_eq!(live.last_error, None);
@@ -1854,7 +1834,6 @@ mod tests {
         assert_eq!(dead.fail_count, 3);
         assert_eq!(dead.last_error.as_deref(), Some("connection refused"));
         assert_eq!(dead.label, None);
-        assert_eq!(dead.country, None);
         assert_eq!(dead.latency_ms, None);
         assert_eq!(dead.last_checked_at, None);
 
@@ -1878,7 +1857,6 @@ mod tests {
             "scheme",
             "host",
             "port",
-            "country",
             "latency_ms",
             "is_alive",
             "fail_count",

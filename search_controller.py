@@ -29,7 +29,7 @@ from clicklogs_db import ClickLogsDB
 from config_reader import config
 from engine.captcha_policy import CAPTCHA_POLICIES, DEFAULT_CAPTCHA_POLICY
 from engine.control_plane.state import StateStore
-from engine.diagnostics import proxy_context
+from engine.diagnostics import worker_proxy_id
 from engine.log import get_logger, resolve_db_path
 from engine.profile_apply import (
     add_profile_cookies,
@@ -1612,7 +1612,7 @@ class SearchController:
         """``(proxy_id, run_id, store)`` события — как у снимка сессии.
 
         Прокси берётся из строки воркера тем же
-        ``engine.diagnostics.proxy_context``, что и диагностика; run —
+        ``engine.diagnostics.worker_proxy_id``, что и диагностика; run —
         активная строка ``runs`` для этого ``browser_id``: счётчики пишет сам
         воркер, а его ``run_id`` процессу неизвестен. Ошибка чтения не роняет
         событие — контекст становится пустым, строка пишется в любом случае.
@@ -1621,7 +1621,7 @@ class SearchController:
             return None, None, None
         try:
             store = StateStore(resolve_db_path())
-            proxy_id, _country = proxy_context(store, browser_id)
+            proxy_id = worker_proxy_id(store, browser_id)
             return proxy_id, store.active_run_id(browser_id), store
         except Exception as exp:  # noqa: BLE001 - контекст не важнее события
             log.warning(

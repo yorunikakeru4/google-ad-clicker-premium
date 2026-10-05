@@ -185,7 +185,6 @@ class TestProxyListContract:
             "port",
             "username",
             "password",
-            "country",
             "latency_ms",
             "is_alive",
             "fail_count",

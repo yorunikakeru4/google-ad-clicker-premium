@@ -35,7 +35,9 @@ MIGRATIONS_DIR = DB_DIR / "migrations"
 # (migrations/002_profile_fields.sql).
 # 3 — колонка logs.day (локальная дата от ts), бэкалф истории и индекс
 # (day, level, browser_id) (migrations/003_logs_day.sql).
-SCHEMA_VERSION = 3
+# 4 — колонка proxies.country удалена: страна прокси это геолокация exit-IP
+# в момент снимка, а не состояние строки пула (004_drop_proxies_country.sql).
+SCHEMA_VERSION = 4
 
 # Движок пишет из нескольких воркеров, UI читает одновременно. WAL снимает
 # блокировку между ними, busy_timeout ждёт освобождения вместо ошибки.

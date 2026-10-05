@@ -50,7 +50,6 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
-from engine.db import migrations
 
 # --- константы -----------------------------------------------------------------
 
@@ -715,7 +714,6 @@ def collect_snapshot(
     browser_id: str,
     ts: float | None = None,
     proxy_id: int | None = None,
-    country: str | None = None,
     echo_fetcher: Callable[[Any], Any] | None = None,
     local_ip_fetcher: Callable[[Any], Any] | None = None,
     locales: Mapping[str, Sequence[str]] | None = None,
@@ -723,9 +721,10 @@ def collect_snapshot(
     """Собрать полный снимок у живого драйвера.
 
     Страница обязательна (без неё собрано нечего, исключение уходит вызывающему
-    чекпоинту), echo и внутренний IP — best effort. ``country`` без явного
-    значения берётся из гео прокси, запомненного драйвером
-    (``_geo_country``, см. ``webdriver.create_webdriver``); ``geo_timezone``
+    чекпоинту), echo и внутренний IP — best effort. Страна берётся из гео
+    прокси, запомненного драйвером (``_geo_country``, см.
+    ``webdriver.create_webdriver``): это единственный источник, который
+    отражает тот exit-IP, которым реально шла сессия. ``geo_timezone``
     читается оттуда же — это значение из ``get_location`` до приоритета профиля.
     """
     page = parse_page_payload(driver.execute_script(PAGE_SNIPPET))
@@ -734,14 +733,14 @@ def collect_snapshot(
 
     capabilities = getattr(driver, "capabilities", None)
     geo_timezone = _text(getattr(driver, "_geo_timezone", None))
-    effective_country = _text(country) or _text(getattr(driver, "_geo_country", None))
+    country = _text(getattr(driver, "_geo_country", None))
 
     snapshot = DiagnosticSnapshot(
         ts=time.time() if ts is None else ts,
         browser_id=browser_id,
         proxy_id=proxy_id,
         ip=echo.ip,
-        country=effective_country,
+        country=country,
         user_agent=page.user_agent,
         accept_language=page.accept_language,
         timezone_id=page.timezone_id,
@@ -773,30 +772,20 @@ def collect_snapshot(
 # --- прокси воркера ------------------------------------------------------------------
 
 
-def proxy_context(store: Any, browser_id: str) -> tuple[int | None, str | None]:
-    """``(proxy_id, country)`` текущего прокси воркера.
+def worker_proxy_id(store: Any, browser_id: str) -> int | None:
+    """``proxy_id`` текущего прокси воркера либо None.
 
     Источник — строка воркера в БД: ``proxy_id`` закрепляет супервизор при
-    спавне (``StateStore.assign_proxy``), а страна читается из строки прокси.
-    В снимок уходят только эти два значения — ни кредов, ни адреса прокси
-    (их в БД нет причини, а API прокси их маскирует).
+    спавне (``StateStore.assign_proxy``). В снимок уходит только этот id —
+    ни кредов, ни адреса прокси (их в БД нет причин, а API прокси их
+    маскирует); страна в снимок не идёт из пула — она берётся из гео
+    драйвера (см. ``collect_snapshot``).
     """
     worker = store.get_worker(browser_id)
     proxy_id = worker.get("proxy_id") if worker else None
     if not isinstance(proxy_id, int) or isinstance(proxy_id, bool):
-        return None, None
-    return proxy_id, _proxy_country(getattr(store, "db_path", None), proxy_id)
-
-
-def _proxy_country(db_path: Any, proxy_id: int) -> str | None:
-    if db_path is None:
         return None
-    conn = migrations.connect(db_path)
-    try:
-        row = conn.execute("SELECT country FROM proxies WHERE id = ?", (proxy_id,)).fetchone()
-    finally:
-        conn.close()
-    return _text(row["country"]) if row is not None else None
+    return proxy_id
 
 
 # --- kv-сигнал ------------------------------------------------------------------------
@@ -1010,13 +999,12 @@ def session_checkpoint(
 
     recorded = False
     try:
-        proxy_id, country = proxy_context(store, browser_id)
+        proxy_id = worker_proxy_id(store, browser_id)
         snapshot = collect_snapshot(
             driver,
             browser_id=browser_id,
             ts=now,
             proxy_id=proxy_id,
-            country=country,
             echo_fetcher=echo_fetcher,
             local_ip_fetcher=local_ip_fetcher,
             locales=load_country_locales() if locales is None else locales,

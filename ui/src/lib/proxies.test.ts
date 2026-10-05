@@ -21,7 +21,6 @@ const PROXY_JSON = {
   scheme: "http",
   host: "a.example",
   port: 8080,
-  country: "DE",
   latency_ms: 120,
   is_alive: true,
   fail_count: 0,
@@ -369,7 +368,6 @@ describe("toProxyTableRow", () => {
       scheme: "http",
       host: "a.example",
       port: 8080,
-      country: "DE",
       latency_ms: 120,
       is_alive: true,
       fail_count: 2,
@@ -383,7 +381,6 @@ describe("toProxyTableRow", () => {
       id: 1,
       address: "a.example:8080",
       label: "дефолт",
-      country: "DE",
       latency_ms: 120,
       status: "ok",
       fail_count: 2,
@@ -398,7 +395,6 @@ describe("toProxyTableRow", () => {
       scheme: "http",
       host: "b.example",
       port: 3128,
-      country: null,
       latency_ms: null,
       is_alive: 0,
       fail_count: 0,
@@ -410,7 +406,6 @@ describe("toProxyTableRow", () => {
 
     expect(dead.address).toBe("b.example:3128");
     expect(dead.label).toBe("—");
-    expect(dead.country).toBe("—");
     expect(dead.assigned_browser_id).toBe("—");
     expect(dead.status).toBe("error");
     expect(dead.latency_ms).toBeNull();
@@ -423,7 +418,6 @@ describe("toProxyTableRow", () => {
       scheme: "http",
       host: "a.example",
       port: 8080,
-      country: null,
       latency_ms: null,
       is_alive: true,
       fail_count: 0,

@@ -393,7 +393,6 @@ class TestCollectSnapshot:
             browser_id="br-1",
             ts=1700000000.0,
             proxy_id=7,
-            country=None,
             echo_fetcher=lambda _driver: self._echo_ok(),
             local_ip_fetcher=lambda _driver: "10.0.0.5",
             locales={"DE": ["de-DE"]},
@@ -422,20 +421,25 @@ class TestCollectSnapshot:
         assert snapshot.geo_timezone == "Europe/Berlin"
         assert snapshot.suspicion_flags == []
 
-    def test_explicit_proxy_country_wins_over_the_geo_one(self):
+    def test_country_comes_from_the_geo_the_driver_recorded(self):
+        """Страна снимка — гео exit-IP, запомненное при старте сессии.
+
+        Пул прокси страну не хранит: единственный источник, который
+        отражает именно тот exit-IP, которым шла сессия, — гео,
+        записанное драйвером в ``_geo_country``.
+        """
         driver = FakeDriver(dict(FULL_PAGE), capabilities={})
         driver._geo_country = "DE"
 
         snapshot = collect_snapshot(
             driver,
             browser_id="br-1",
-            country="TR",
             echo_fetcher=lambda _driver: EchoResult(None, None, "нет сети"),
             local_ip_fetcher=lambda _driver: None,
-            locales={"TR": ["tr-TR"]},
+            locales={"DE": ["de-DE"]},
         )
 
-        assert snapshot.country == "TR"
+        assert snapshot.country == "DE"
 
     def test_unavailable_echo_gives_null_fields_and_a_flag(self):
         driver = FakeDriver(dict(FULL_PAGE))

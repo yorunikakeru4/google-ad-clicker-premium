@@ -20,7 +20,6 @@ export interface ProxyRow {
   scheme: string;
   host: string;
   port: number;
-  country: string | null;
   latency_ms: number | null;
   /** Демон может отдать и 0/1: UI нормализует через Boolean(). */
   is_alive: boolean | number;
@@ -163,7 +162,6 @@ function pickProxy(raw: unknown): ProxyRow {
     scheme: typeof source.scheme === "string" ? source.scheme : "http",
     host: source.host,
     port: source.port,
-    country: asStringOrNull(source.country),
     latency_ms: asNumberOrNull(source.latency_ms),
     is_alive:
       typeof source.is_alive === "boolean" || typeof source.is_alive === "number"
@@ -350,7 +348,6 @@ export interface ProxyTableRow {
   /** host:port — адрес в том виде, в каком его показывает список. */
   address: string;
   label: string;
-  country: string;
   latency_ms: number | null;
   status: "ok" | "error";
   fail_count: number;
@@ -362,12 +359,10 @@ export interface ProxyTableRow {
 
 export function toProxyTableRow(row: ProxyRow): ProxyTableRow {
   const label = row.label?.trim();
-  const country = row.country?.trim();
   return {
     id: row.id,
     address: `${row.host}:${row.port}`,
     label: label ? label : "—",
-    country: country ? country : "—",
     latency_ms: row.latency_ms,
     status: row.is_alive ? "ok" : "error",
     fail_count: row.fail_count,

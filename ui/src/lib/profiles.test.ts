@@ -198,7 +198,6 @@ describe("createProfilesApi: список", () => {
               scheme: "http",
               host: "a.example",
               port: 8080,
-              country: null,
               latency_ms: null,
               is_alive: true,
               fail_count: 0,

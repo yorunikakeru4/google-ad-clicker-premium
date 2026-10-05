@@ -20,7 +20,6 @@ function proxyRow(overrides: Partial<ProxyRow> & { id: number }): ProxyRow {
     scheme: "http",
     host: `host-${overrides.id}.example`,
     port: 8080,
-    country: null,
     latency_ms: null,
     is_alive: true,
     fail_count: 0,

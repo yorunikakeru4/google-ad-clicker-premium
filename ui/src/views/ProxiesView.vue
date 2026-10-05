@@ -40,7 +40,6 @@ onUnmounted(() => proxies.stop());
 const headers: DataTableHeader[] = [
   { key: "address", title: "Адрес", sortable: true },
   { key: "label", title: "Метка", sortable: true },
-  { key: "country", title: "Страна", sortable: true },
   { key: "latency_ms", title: "Задержка", sortable: true },
   { key: "status", title: "Статус", sortable: false },
   { key: "fail_count", title: "Неудач", sortable: true },

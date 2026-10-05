@@ -321,7 +321,7 @@ class ProxyPool:
         """
         sql = f"""
             SELECT p.id, p.label, p.scheme, p.host, p.port, p.username, p.password,
-                   p.country, p.latency_ms, p.is_alive, p.fail_count,
+                   p.latency_ms, p.is_alive, p.fail_count,
                    p.last_checked_at, p.last_error,
                    (SELECT w.browser_id FROM workers w
                      WHERE w.proxy_id = p.id
