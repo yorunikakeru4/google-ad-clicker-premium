@@ -718,3 +718,42 @@ def test_probe_passes_proxy_credentials_to_requests(monkeypatch):
         "http": "http://user:pass@proxy.host:8080",
         "https": "http://user:pass@proxy.host:8080",
     }
+
+
+# --- require_german_exit ----------------------------------------------------------
+
+
+class TestRequireGermanExit:
+    """Гейт «только Германия»: срабатывает до старта Chrome, без кредов в тексте."""
+
+    @pytest.mark.parametrize("code", ["DE", "de", " dE "])
+    def test_germany_passes(self, code):
+        assert utils.require_german_exit(code, "user:s3cr3t@proxy.host:8080") == "DE"
+
+    @pytest.mark.parametrize("code", ["TR", "FR", "US", "ke"])
+    def test_any_other_country_blocks(self, code):
+        with pytest.raises(utils.ProxyCountryError) as excinfo:
+            utils.require_german_exit(code, "user:s3cr3t@proxy.host:8080")
+
+        message = str(excinfo.value)
+        assert code.upper() in message
+        assert "proxy.host:8080" in message, "адрес нужен для причины в логе"
+        # Креды не должны дойти ни до лога, ни до workers.last_error.
+        assert "s3cr3t" not in message
+        assert "user:" not in message
+
+    @pytest.mark.parametrize("code", [None, "", "   "])
+    def test_unknown_country_blocks_too(self, code):
+        """Непроверенный exit не гарантирует Германию — это тоже отказ."""
+        with pytest.raises(utils.ProxyCountryError) as excinfo:
+            utils.require_german_exit(code, "proxy.host:8080")
+
+        assert "страна не определена" in str(excinfo.value)
+
+    def test_error_carries_parts_for_the_structured_log(self):
+        with pytest.raises(utils.ProxyCountryError) as excinfo:
+            utils.require_german_exit("CY", "user:s3cr3t@proxy.host:8080")
+
+        error = excinfo.value
+        assert error.reason.startswith("exit-IP не Германия: CY")
+        assert error.proxy_address == "proxy.host:8080"

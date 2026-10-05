@@ -15,6 +15,7 @@ import urllib.request
 import pytest
 
 import proxy
+import utils
 import webdriver
 
 
@@ -302,10 +303,15 @@ def install_plugin_stub(monkeypatch):
 
 @pytest.fixture
 def no_geolocation(monkeypatch):
-    """Без реального запроса геолокации: только готовые значения."""
+    """Без реального запроса геолокации: только готовые значения.
+
+    Страна DE — чтобы не срабатывал гейт ``require_german_exit``: эти тесты
+    проверяют маршрут и настройки драйвера, а не выбор страны (см.
+    ``TestGermanExitGate``).
+    """
 
     monkeypatch.setattr(
-        webdriver, "get_location", lambda client, proxy: (None, None, "US", "Europe/Berlin")
+        webdriver, "get_location", lambda client, proxy: (None, None, "DE", "Europe/Berlin")
     )
 
 
@@ -961,6 +967,50 @@ class TestSeleniumBaseTransport:
 # --- Настройки профиля: локаль и часовой пояс против гео-вычислений ----------
 
 
+class TestGermanExitGate:
+    """Только немецкий exit: отказ до создания Chrome, обе ветки транспорта."""
+
+    def test_non_german_exit_blocks_before_chrome_starts(
+        self, isolated_tempdir, fake_chrome, config, monkeypatch, transport
+    ):
+        transport("direct")
+        monkeypatch.setattr(
+            webdriver,
+            "get_location",
+            lambda client, proxy: (None, None, "TR", "Europe/Istanbul"),
+        )
+
+        with pytest.raises(utils.ProxyCountryError) as excinfo:
+            webdriver.create_webdriver(PROXY, "Mozilla/5.0", "abcde")
+
+        assert "TR" in str(excinfo.value)
+        assert PROXY.split("@")[-1] in str(excinfo.value)
+        assert fake_chrome == [], "Chrome не должен создаваться на чужом exit-IP"
+
+    def test_unknown_geo_blocks_too(self, isolated_tempdir, fake_chrome, config, monkeypatch, transport):
+        """Страну не удалось определить — запускаться нельзя, это не «пропустить»."""
+        transport("direct")
+        monkeypatch.setattr(config.webdriver, "language_from_proxy", True)
+        monkeypatch.setattr(
+            webdriver, "get_location", lambda client, proxy: (None, None, None, None)
+        )
+
+        with pytest.raises(utils.ProxyCountryError) as excinfo:
+            webdriver.create_webdriver(PROXY, "Mozilla/5.0", "abcde")
+
+        assert "страна не определена" in str(excinfo.value)
+        assert fake_chrome == []
+
+    def test_german_exit_starts_the_driver_as_usual(
+        self, isolated_tempdir, fake_chrome, geolocated_proxy, transport
+    ):
+        transport("direct")
+
+        driver, _ = webdriver.create_webdriver(PROXY, "Mozilla/5.0", "abcde")
+
+        assert fake_chrome, "немецкий exit не должен блокировать запуск"
+
+
 class TestProfileSettings:
     """Профильные locale/timezone главнее гео-вычислений (UC-режим).
 
@@ -1060,25 +1110,6 @@ class TestProfileSettings:
 
         prefs = driver.options.experimental_options.get("prefs", {})
         assert "intl.accept_languages" not in prefs
-
-    def test_failed_geo_lookup_does_not_force_english_locale(
-        self, isolated_tempdir, fake_chrome, config, monkeypatch, transport
-    ):
-        # Гео упало (нет страны) при включённом language_from_proxy:
-        # раньше уходил get_locale_language(None)="en" → Accept-Language: en
-        # (одиночный "en" — редкий паттерн, читается как аномалия, отчёт §4.1).
-        # Теперь локаль не ставится вовсе — браузер шлёт свой честный дефолт.
-        transport("direct")
-        monkeypatch.setattr(config.webdriver, "language_from_proxy", True)
-        monkeypatch.setattr(
-            webdriver, "get_location", lambda client, proxy: (None, None, None, None)
-        )
-
-        driver, _ = webdriver.create_webdriver(PROXY, "Mozilla/5.0", "abcde")
-
-        prefs = driver.options.experimental_options.get("prefs", {})
-        assert "intl.accept_languages" not in prefs
-        assert "--lang=en" not in driver.options.arguments
 
     def test_profile_locale_is_applied_without_a_proxy(
         self, isolated_tempdir, fake_chrome, assign_profile, transport

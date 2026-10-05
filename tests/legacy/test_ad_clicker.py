@@ -15,6 +15,7 @@ import pytest
 
 import ad_clicker
 from ad_clicker import get_arg_parser, resolve_proxy, resolve_query
+from utils import ProxyCountryError
 
 
 def parse(argv):
@@ -406,6 +407,45 @@ class TestProxyHealthCheck:
 
         assert ad_clicker.run_scenario(query="usb hub", proxy="u:p@proxy.host:80") is False
         assert ("degraded", "proxy pre-check failed") in records
+
+    def test_non_german_exit_skips_the_round_and_marks_degraded(self, monkeypatch):
+        """Гейт до Chrome: раунд не начинается, причина уходит супервизору.
+
+        Проба сети уже прошла (прокси жив), но exit-IP не Германия — раунд
+        заведомо проигран, поэтому он пропускается тем же путём, что и
+        отбраковка пробой: warning в лог и mark_degraded на ротацию.
+        """
+        records = []
+
+        class _Log:
+            def warning(self, *args, **kwargs):
+                records.append(("warning", args, kwargs))
+
+            def mark_degraded(self, reason):
+                records.append(("degraded", reason))
+
+            def __getattr__(self, name):
+                return lambda *args, **kwargs: None
+
+        monkeypatch.setattr(ad_clicker, "log", _Log())
+        monkeypatch.setattr(ad_clicker, "probe_proxy_captcha", lambda proxy: False)
+        monkeypatch.setattr(
+            ad_clicker,
+            "create_webdriver",
+            lambda *args, **kwargs: (_ for _ in ()).throw(
+                ProxyCountryError("exit-IP не Германия: TR", "proxy.host:8080")
+            ),
+        )
+
+        assert ad_clicker.run_scenario(query="usb hub", proxy="u:p@proxy.host:80") is False
+
+        assert ("degraded", "exit-IP не Германия: TR (proxy.host:8080)") in records
+        warnings = [entry for entry in records if entry[0] == "warning"]
+        assert warnings, "отказ гейта обязан быть виден в логе"
+        fields = warnings[0][2]["fields"]
+        assert fields["reason"] == "exit-IP не Германия: TR"
+        assert fields["proxy"] == "proxy.host:8080", "креды не должны попасть в лог"
+        assert "u:p@" not in str(records)
 
     def test_clean_probe_starts_the_round(self, monkeypatch):
         completed, probes, started = self._run(monkeypatch, False)

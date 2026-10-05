@@ -19,6 +19,7 @@ from logger import update_log_formats
 from proxy import get_proxies
 from search_controller import SearchController
 from utils import (
+    ProxyCountryError,
     get_domains,
     is_mobile_user_agent,
     probe_proxy_captcha,
@@ -227,7 +228,20 @@ def run_scenario(
             )
             return False
 
-    driver, country_code = create_webdriver(proxy, user_agent, plugin_folder_name)
+    try:
+        driver, country_code = create_webdriver(proxy, user_agent, plugin_folder_name)
+    except ProxyCountryError as exp:
+        # Гейт до запуска Chrome (см. utils.require_german_exit): раунд на
+        # не-немецком exit-IP заведомо проигран, а смена прокси — задача
+        # супервизора, ровно как для отбракованного пробой IP. Причина уходит
+        # в workers.last_error и видна в UI.
+        log.warning(
+            "proxy",
+            "proxy exit is not Germany, round skipped",
+            fields={"proxy": exp.proxy_address, "reason": exp.reason},
+        )
+        log.mark_degraded(str(exp))
+        return False
 
     # Старт сессии: автосбор один раз за жизнь процесса + запрос из UI,
     # пришедший, пока браузера не было. До поиска и до cookies — снимок

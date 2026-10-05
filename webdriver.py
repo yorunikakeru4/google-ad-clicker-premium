@@ -35,7 +35,7 @@ from engine.proxy_auth import (
 )
 from geolocation_db import GeolocationDB
 from proxy import close_pac_service, install_plugin, open_pac_service
-from utils import get_location, get_locale_language, get_random_sleep
+from utils import get_location, get_locale_language, get_random_sleep, require_german_exit
 
 
 log = get_logger()
@@ -632,6 +632,9 @@ def create_webdriver(
 
         # get location of the proxy IP
         lat, long, country_code, timezone = get_location(geolocation_db_client, proxy)
+        # Гейт до старта Chrome: exit-IP обязан быть немецким, иначе раунд
+        # заведомо проигран (см. utils.require_german_exit).
+        require_german_exit(country_code, proxy)
         # До resolve_timezone: дальше пояс может заменить профильный, а
         # гео-значение для диагностики должно остаться именно гео.
         geo_country, geo_timezone = country_code, timezone
@@ -803,6 +806,8 @@ def create_seleniumbase_driver(
 
         # get location of the proxy IP
         lat, long, country_code, timezone = get_location(geolocation_db_client, proxy)
+        # Гейт до старта Chrome: та же проверка, что и в UC-ветке.
+        require_german_exit(country_code, proxy)
         # Как в UC-ветке: гео-пояс фиксируется до приоритета профиля — его
         # читает диагностика.
         geo_country, geo_timezone = country_code, timezone

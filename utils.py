@@ -374,6 +374,52 @@ def get_location(geolocation_db_client: GeolocationDB, proxy: str) -> tuple[floa
             return (None, None, None, None)
 
 
+class ProxyCountryError(RuntimeError):
+    """Exit-IP прокси не подтверждён как Германия — раунд не начинается.
+
+    Требование продукта: трафик идёт только с немецкого exit-IP. Любое
+    другое значение (TR, FR, US, …) означает либо неподходящий прокси,
+    либо смену exit-узла живой сессией — в обоих случаях раунд заведомо
+    проигран, а Google видит регион, на который заточено поведение
+    браузера. Исключение поднимается до старта Chrome
+    (см. ``webdriver.create_webdriver``), поэтому браузер не тратит время
+    и трафик на проигранный круг.
+
+    Креды в текст не попадают: сообщение собирается из кода страны и уже
+    замаскированного адреса прокси.
+    """
+
+    def __init__(self, reason: str, proxy_address: str) -> None:
+        super().__init__(f"{reason} ({proxy_address})")
+        self.reason = reason
+        self.proxy_address = proxy_address
+
+
+def require_german_exit(country_code: Optional[str], proxy: str) -> str:
+    """Подтверждает, что exit-IP прокси — Германия; иначе ``ProxyCountryError``.
+
+    :type country_code: Optional[str]
+    :param country_code: страна из :func:`get_location`
+    :type proxy: str
+    :param proxy: строка прокси, возможно с кредами
+    :rtype: str
+    :returns: код страны (``"DE"``)
+
+    **Не определена — тоже отказ.** Непроверенный exit не гарантирует
+    Германию, а требование — ровно никакой возможности выйти не из
+    Германии. У :func:`get_location` три источника и локальный кэш, поэтому
+    пустой ответ на уже прошедшую пробу сеть означает отказ всех сервисов.
+
+    Страна сравнивается без учёта регистра: код приходит от разных
+    сервисов, и нормализуют его по-разному.
+    """
+    code = (country_code or "").strip().upper()
+    if code == "DE":
+        return code
+    reason = "exit-IP не Германия: " + (code or "страна не определена")
+    raise ProxyCountryError(reason, proxy.split("@")[-1])
+
+
 def get_queries() -> list[str]:
     """Get queries from file
 
