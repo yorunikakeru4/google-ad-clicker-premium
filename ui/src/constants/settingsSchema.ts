@@ -58,7 +58,7 @@ export const settingsSections: SettingSection[] = [
       {
         key: "filtered_domains",
         type: "path",
-        hint: "Файл с доменами, результаты которых исключаются из выдачи",
+        hint: "Файл с доменами-исключениями: ссылки на них не кликаются, по одному домену в строке",
         default: "domains.txt",
       },
     ],
@@ -199,7 +199,13 @@ export const settingsSections: SettingSection[] = [
       {
         key: "excludes",
         type: "string",
-        hint: "Строки-исключения: запрос с таким вхождением пропускается",
+        hint: "Слова-исключения через запятую: ссылки и объявления с ними не кликаются",
+        default: "",
+      },
+      {
+        key: "own_domain",
+        type: "string",
+        hint: "Наш домен (хост или URL): попадает в чёрный список клика автоматически",
         default: "",
       },
       {

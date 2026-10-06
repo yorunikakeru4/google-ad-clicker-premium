@@ -26,6 +26,7 @@
         "max_scroll_limit": 0,
         "check_shopping_ads": true,
         "excludes": "",
+        "own_domain": "",
         "random_mouse": false,
         "custom_cookies": false,
         "click_order": 5,

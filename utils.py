@@ -27,6 +27,9 @@ except ImportError:
     from openpyxl.styles import Alignment, Font
 
 from config_reader import config
+# normalize_domain/domain_matches — реэкспорт engine.domains: legacy-код и его
+# тесты исторически ищут их в utils, а сравнивать хосты умеет только engine.
+from engine.domains import domain_matches, normalize_domain  # noqa: F401
 from engine.log import get_logger
 from geolocation_db import GeolocationDB
 from proxy import get_proxies
@@ -443,10 +446,19 @@ def get_queries() -> list[str]:
 
 
 def get_domains() -> list[str]:
-    """Get domains from file
+    """Чёрный список доменов: строки файла плюс наш домен.
+
+    Список **запрещает** клик (план §5, фаза 13): любая ссылка, чей хост
+    совпадает с доменом из списка или является его поддоменом, не кликается —
+    ни в рекламе, ни в shopping, ни в органике. Раньше список работал как
+    селектор non-ad ссылок, и кликер кликал только ссылки на домен из файла.
+
+    ``behavior.own_domain`` добавляется автоматически: наш домен не должен
+    кликаться никогда, а держать его в файле руками — лишняя работа, о
+    которой легко забыть.
 
     :rtype: list
-    :returns: List of domains
+    :returns: нормализованные хосты без дублей
     """
 
     filepath = Path(config.paths.filtered_domains)
@@ -455,15 +467,20 @@ def get_domains() -> list[str]:
         raise SystemExit(f"Couldn't find domains file: {filepath}")
 
     with open(filepath, encoding="utf-8") as domainsfile:
-        domains = [
-            domain.strip().replace("'", "").replace('"', "")
-            for domain in domainsfile.read().splitlines()
-        ]
+        entries = domainsfile.read().splitlines()
 
-    log.debug("click", "Domains", fields={"domains": domains})
+    behavior = getattr(config, "behavior", None)
+    own_domain = normalize_domain(getattr(behavior, "own_domain", "") if behavior else "")
 
-    # blank lines would match any domain
-    return [domain for domain in domains if domain]
+    domains: list[str] = []
+    for entry in [*entries, own_domain]:
+        domain = normalize_domain(entry)
+        if domain and domain not in domains:
+            domains.append(domain)
+
+    log.debug("click", "Blocked domains", fields={"domains": domains})
+
+    return domains
 
 
 def add_cookies(driver: undetected_chromedriver.Chrome) -> None:

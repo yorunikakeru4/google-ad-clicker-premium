@@ -153,6 +153,7 @@ The followings are the default values in the config file.
         "max_scroll_limit": 0,
         "check_shopping_ads": true,
         "excludes": "",
+        "own_domain": "",
         "random_mouse": false,
         "custom_cookies": false,
         "click_order": 5,
@@ -177,7 +178,7 @@ The followings are the default values in the config file.
 
 * **user_agents**: File path to read user agents. Default value is `user_agents.txt`.
 
-* **filtered_domains**: File path to read domains to filter for clicking non-ad links. Default value is `domains.txt` in the project directory. If you don't want to filter non-ad domains, simply leave the `domains.txt` file empty and 3 links will be randomly selected.
+* **filtered_domains**: File path to the **blacklist** of domains: no link whose host is one of these domains (or its subdomain) is ever clicked — neither ads, nor shopping ads, nor organic results. Default value is `domains.txt` in the project directory, one domain per line (a URL is normalized to its host). Leave the file empty if you don't want to block any domain.
 
 * **proxy**: Use the given proxy with `ad_clicker.py`. The `proxy_file` and `proxy` parameters can not have a value at the same time.
 
@@ -220,9 +221,11 @@ The followings are the default values in the config file.
 
 * **check_shopping_ads**: Enable checking and clicking shopping ads seen on top up to 5 if exists. It is more likely to see shopping ads if you use residential proxies.
 
-* **excludes**: Exclude the ads that contain given words in url or title.
-    * A value like "amazon.com,mediamarkt.com,for 2022,Soundbar" click links except the ones containing the given words in url or title.
+* **excludes**: Comma-separated words that block a click: any ad, shopping ad or organic link whose URL, title or text contains one of them is skipped.
+    * A value like "amazon.com,mediamarkt.com,for 2022,Soundbar" skips links except the ones containing the given words in url or title.
     * Separate multiple exclude items with comma.
+
+* **own_domain**: Your own domain (a host or a URL, e.g. "example.com"): it is added to the `domains.txt` blacklist automatically, so the clicker never clicks your own links even if the file is edited by hand.
 
 * **random_mouse**: Enable random mouse movements on pages.
 
