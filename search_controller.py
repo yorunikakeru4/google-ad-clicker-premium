@@ -137,7 +137,7 @@ AllLinks = list[Union[AdList, NonAdList]]
 
 
 class SearchController:
-    """Search controller for ad clicker
+    """Search controller for Premium Bot
 
     :type driver: selenium.webdriver
     :param driver: Selenium Chrome webdriver instance

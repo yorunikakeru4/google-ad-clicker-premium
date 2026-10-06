@@ -1,7 +1,7 @@
 [project]
 name = "ad-clicker-engine"
 version = "0.1.0"
-description = "Движок Google Ad Clicker: демон, супервизор воркеров, CDP-авторизация прокси"
+description = "Движок Premium Bot: демон, супервизор воркеров, CDP-авторизация прокси"
 requires-python = ">=3.11"
 
 # Зависимости окружения приходят из flake.nix (nix develop), а не из pip.

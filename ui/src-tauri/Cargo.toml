@@ -1,8 +1,8 @@
 [package]
 name = "ui"
 version = "0.1.0"
-description = "Google Ad Clicker Premium desktop UI (Tauri + Vue 3)"
-authors = ["Google Ad Clicker Premium contributors"]
+description = "Premium Bot desktop UI (Tauri + Vue 3)"
+authors = ["Premium Bot contributors"]
 edition = "2021"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html

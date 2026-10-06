@@ -94,7 +94,7 @@ function onSnackChange(open: boolean) {
   <v-app>
     <v-app-bar color="surface" flat height="68">
       <template #title>
-        <span class="brand">Ad Clicker Premium</span>
+        <span class="brand">Premium Bot</span>
       </template>
 
       <template #append>

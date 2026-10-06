@@ -1,4 +1,4 @@
-# Ad Clicker Premium for Google
+# Premium Bot for Google
 
 This command-line tool clicks ads for a certain query on Google search using [undetected_chromedriver](https://github.com/ultrafunkamsterdam/undetected-chromedriver) or [SeleniumBase](https://github.com/seleniumbase/SeleniumBase) packages. Supports proxy, running multiple simultaneous browsers, ad targeting/exclusion, and running in loop.
 
@@ -108,7 +108,7 @@ See [here](https://github.com/coskundeniz/ad_clicker/wiki/Setup-for-Windows) for
     The packaged app needs no environment: on launch it generates the control
     token itself, spawns the bundled `engine` sidecar, and looks for
     `config.json` in the app data directory
-    (`~/Library/Application Support/Google Ad Clicker` on macOS) because a
+    (`~/Library/Application Support/Premium Bot` on macOS) because a
     Finder launch has no project tree above its working directory.
 * Run `python ad_clicker.py --report_clicks` for generating click report.
 * Run `python ad_clicker.py --report_clicks --date` for generating click report for the given date in DD-MM-YYYY format.

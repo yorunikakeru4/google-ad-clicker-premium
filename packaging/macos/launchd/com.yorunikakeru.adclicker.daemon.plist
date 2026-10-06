@@ -1,7 +1,7 @@
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <!--
-  launchd-конфиг демона Google Ad Clicker (план.md, фаза 11).
+  launchd-конфиг демона Premium Bot (план.md, фаза 11).
 
   Установка (отредактировав оба REPLACE_ME):
     1. Скопировать в ~/Library/LaunchAgents/com.yorunikakeru.adclicker.daemon.plist
@@ -12,7 +12,7 @@
   - WorkingDirectory — каталог с config.json, queries.txt, user_agents.txt,
     proxies.txt, domains.txt: legacy-движок читает их из cwd (см. отчёт
     фазы 11 про бандл ресурсов). В установке это каталог данных приложения
-    (~/Library/Application Support/Google Ad Clicker), НЕ каталог .app.
+    (~/Library/Application Support/Premium Bot), НЕ каталог .app.
   - ADCLICKER_CONTROL_TOKEN — тот же токен, что видит UI-приложение. Если у
     приложения переменная не задана, оно генерирует свой токен на каждый
     запуск и с этим демоном общей подписи не будет (401) — тогда задайте
@@ -33,11 +33,11 @@
 
     <key>ProgramArguments</key>
     <array>
-        <string>/Applications/Google Ad Clicker Premium.app/Contents/MacOS/engine</string>
+        <string>/Applications/Premium Bot.app/Contents/MacOS/engine</string>
     </array>
 
     <key>WorkingDirectory</key>
-    <string>/Users/REPLACE_ME/Library/Application Support/Google Ad Clicker</string>
+    <string>/Users/REPLACE_ME/Library/Application Support/Premium Bot</string>
 
     <key>EnvironmentVariables</key>
     <dict>

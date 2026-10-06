@@ -1,4 +1,4 @@
-# Google Ad Clicker Premium — UI
+# Premium Bot — UI
 
 Desktop UI: **Tauri 2 + Vue 3 + TypeScript + Vuetify 3 + vue-router**.
 
@@ -113,7 +113,7 @@ and `src-tauri/src/resources.rs`):
   `pnpm tauri dev` stays on `python3` from sources even though tauri copies a
   frozen sidecar next to the dev binary;
 - working directory — project tree above the launch directory, otherwise the
-  app data dir (`~/Library/Application Support/Google Ad Clicker` on macOS,
+  app data dir (`~/Library/Application Support/Premium Bot` on macOS,
   the same path as `WorkingDirectory` in the launchd plist);
 - data files — `config.json`, `queries.txt`, `proxies.txt`,
   `user_agents.txt`, `domains.txt`, `domain_mapping.json`, `cookies.txt` are

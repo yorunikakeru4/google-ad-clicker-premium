@@ -1,6 +1,6 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "Google Ad Clicker Premium",
+  "productName": "Premium Bot",
   "version": "0.1.0",
   "identifier": "com.googleadclicker.premium",
   "build": {
@@ -13,7 +13,7 @@
     "windows": [
       {
         "label": "main",
-        "title": "Google Ad Clicker Premium",
+        "title": "Premium Bot",
         "width": 1200,
         "height": 800,
         "minWidth": 940,
@@ -30,8 +30,8 @@
     "active": true,
     "targets": "all",
     "category": "Utility",
-    "shortDescription": "Google Ad Clicker Premium desktop app",
-    "longDescription": "Desktop UI for the Google Ad Clicker automation tool.",
+    "shortDescription": "Premium Bot desktop app",
+    "longDescription": "Desktop UI for the Premium Bot automation tool.",
     "resources": [
       "../../config.json",
       "../../queries.txt",

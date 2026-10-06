@@ -66,15 +66,29 @@ pub fn run() {
 
             // 2. Порт: чужой демон (401) или уже запущенный с нашим токеном —
             //    второй не спавним, иначе получим цикл падений на занятом
-            //    порту плюс 401 на каждый запрос UI.
+            //    порту плюс 401 на каждый запрос UI. Но и без демона не
+            //    остаёмся: если тот экземпляр уйдёт (догасает после прошлого
+            //    запуска, упал в терминале), recover_when_free поднимет наш,
+            //    как только порт освободится (план, фаза 13, проблема 4).
             let supervisor = app.state::<DaemonSupervisor>();
             match control::probe_daemon() {
                 control::DaemonProbe::AlreadyRunning => {
-                    eprintln!("на порту уже работает демон с этим же токеном — второй не спавним");
+                    eprintln!(
+                        "на порту уже работает демон с этим же токеном — второй не спавним, \
+                         но следим за портом"
+                    );
+                    match DaemonSpec::from_env() {
+                        Ok(spec) => supervisor.recover_when_free(spec),
+                        Err(error) => eprintln!("восстановление демона не настроено: {error}"),
+                    }
                 }
                 control::DaemonProbe::ForeignDaemon { detail } => {
                     eprintln!("{detail}");
                     supervisor.note_launch_error(&detail);
+                    match DaemonSpec::from_env() {
+                        Ok(spec) => supervisor.recover_when_free(spec),
+                        Err(error) => eprintln!("восстановление демона не настроено: {error}"),
+                    }
                 }
                 control::DaemonProbe::Free => match DaemonSpec::from_env() {
                     Ok(spec) => {

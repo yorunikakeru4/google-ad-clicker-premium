@@ -793,9 +793,7 @@ mod tests {
         }
 
         let reader = DbReader::open(&path).expect("БД открывается");
-        let buckets = reader
-            .captchas_per_hour(0.0, 10)
-            .expect("бакеты читаются");
+        let buckets = reader.captchas_per_hour(0.0, 10).expect("бакеты читаются");
 
         assert_eq!(
             buckets,
@@ -830,7 +828,9 @@ mod tests {
         insert_captcha_event(&writer, 7300.0);
 
         let reader = DbReader::open(&path).expect("БД открывается");
-        let buckets = reader.captchas_per_hour(3600.0, 2).expect("бакеты читаются");
+        let buckets = reader
+            .captchas_per_hour(3600.0, 2)
+            .expect("бакеты читаются");
 
         assert_eq!(
             buckets,

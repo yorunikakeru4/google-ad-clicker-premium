@@ -808,7 +808,7 @@ def legacy_source() -> WorkSource:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="adclicker-worker",
-        description="Воркер Google Ad Clicker: один процесс на браузер",
+        description="Воркер Premium Bot: один процесс на браузер",
     )
     parser.add_argument(
         "--browser-id",

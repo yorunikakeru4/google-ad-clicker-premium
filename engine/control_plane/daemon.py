@@ -19,7 +19,7 @@ import signal
 import sys
 import threading
 import time
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Any, Sequence
@@ -66,6 +66,26 @@ from engine.proxy_pool import ProxyError, ProxyPool
 # терминала, SIGTERM — systemd/stop-скрипт. Оба обязаны приводить к
 # одинаковой последовательности: SIGTERM -> grace -> SIGKILL по воркерам.
 SHUTDOWN_SIGNALS = (signal.SIGTERM, signal.SIGINT)
+
+# PID приложения-владельца, который приложение передаёт демону при спавне
+# (OWNER_PID_ENV в ui/src-tauri/src/daemon.rs — тот же ключ, независимых
+# объявлений быть не должно).
+#
+# Зачем: закрытие приложения и так гасит демон через stop(), но приложение
+# могут убить (crash, force quit) — тогда остановки не будет, а уцелевший
+# демон с прежним токеном ответит 401 на каждый запрос нового запуска.
+# Демон с таким pid добивает себя сам, и каждый новый запуск приложения
+# получает чистый порт под свой новый токен.
+OWNER_PID_ENV_VAR = "ADCLICKER_OWNER_PID"
+
+# Как часто владелец проверяется живым: один kill(pid, 0) в секунду на
+# фоне демона, который и так держит десятки потоков. Быстрее нет смысла —
+# закрытие приложения само по себе идёт секунды.
+OWNER_WATCH_INTERVAL_SECONDS = 1.0
+
+# Имя нити слежения — как у остальных job'ов, чтобы shutdown и тесты
+# находили её тем же способом.
+OWNER_WATCH_THREAD_NAME = "owner-watch"
 
 # Коды возврата main(). Разные, чтобы вызывающая сторона (тест, сервис,
 # скрипт установки) могла отличить "нет токена" от "сломан конфиг".
@@ -353,6 +373,40 @@ def previous_local_day(now: float) -> str:
     return (today - timedelta(days=1)).strftime("%Y-%m-%d")
 
 
+def owner_pid_from_environ(environ: Mapping[str, str] | None = None) -> int | None:
+    """PID приложения-владельца из окружения демона.
+
+    ``None`` — владелец не передан (запуск из терминала, launchd): следить
+    не за кем, и демон остаётся самостоятельным, как и раньше. Служебная
+    переменная, а не настройка: у неё нет осмысленного значения вне пары
+    «приложение → свой демон».
+    """
+    source = os.environ if environ is None else environ
+    raw = source.get(OWNER_PID_ENV_VAR)
+    try:
+        pid = int(str(raw).strip())
+    except (TypeError, ValueError):
+        return None
+    return pid if pid > 0 else None
+
+
+def owner_is_alive(pid: int) -> bool:
+    """Жив ли процесс-владелец.
+
+    ``kill(pid, 0)`` — проверка существования без отправки сигнала, тот же
+    приём, что у ``pid_alive`` в Rust-супервизоре. ``ESRCH`` (нет процесса)
+    — единственная причина считать владельца мёртвым: ``EPERM`` значит, что
+    процесс есть, но чужой, и гасить демон по чужому pid нельзя.
+    """
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except OSError:
+        return True
+    return True
+
+
 class Daemon:
     """Демон целиком: HTTP-сервер плюс супервизор в отдельном потоке."""
 
@@ -634,6 +688,56 @@ class Daemon:
             self._previous_handlers[signal_number] = signal.getsignal(signal_number)
             signal.signal(signal_number, self._on_signal)
 
+    def start_owner_watch(
+        self,
+        environ: Mapping[str, str] | None = None,
+        *,
+        interval: float = OWNER_WATCH_INTERVAL_SECONDS,
+    ) -> threading.Thread | None:
+        """Гасит демон, если приложение-владелец исчезло.
+
+        Штатное закрытие приложения и так останавливает демон через
+        ``stop()`` в ``RunEvent::ExitRequested``. Нить закрывает другой
+        путь: приложение убито (crash, force quit) и сигнал до демона не
+        дошёл. Без неё уцелевший остаток с прежним токеном отвечал бы 401
+        на каждый запрос следующего запуска, и приложение не смогло бы
+        поднять свой демон — порт занят чужим.
+
+        Возвращает поток или ``None``, если следить не за кем: запуск из
+        терминала или из launchd, владелец в окружении не передан.
+        """
+        owner_pid = owner_pid_from_environ(environ)
+        if owner_pid is None or owner_pid == os.getpid():
+            return None
+        thread = threading.Thread(
+            target=self._watch_owner,
+            args=(owner_pid, interval),
+            name=OWNER_WATCH_THREAD_NAME,
+            daemon=True,
+        )
+        thread.start()
+        return thread
+
+    def _watch_owner(self, owner_pid: int, interval: float) -> None:
+        """Цикл слежения: раз в интервал — существует ли владелец.
+
+        Сон через ``_stop_event.wait``: остановка демона пробуждает нить
+        сразу, и она выходит по флагу, не задерживая shutdown.
+        """
+        while not self._stop_event.is_set():
+            if not owner_is_alive(owner_pid):
+                self.store.log(
+                    "WARNING",
+                    "daemon",
+                    "приложение-владелец исчезло — остановка демона",
+                    {"owner_pid": owner_pid},
+                )
+                # Тот же путь, что и SIGTERM: только флаг и отдельный поток
+                # остановки, тяжёлая работа (воркеры, БД) — не в этой нити.
+                self._on_signal(signal.SIGTERM, None)
+                return
+            self._stop_event.wait(interval)
+
     def _on_signal(self, signal_number: int, frame: object) -> None:
         # Обработчик сигнала выполняется в главном потоке, и тяжёлая работа
         # (SIGTERM/SIGKILL воркерам, запись в БД) внутри него опасна: между
@@ -642,13 +746,19 @@ class Daemon:
         #
         # Ссылка на поток ставится ДО флага: ждущий в wait_for_shutdown()
         # просыпается по флагу и обязан тут же увидеть поток, иначе он
-        # вернётся, не дождавшись конца остановки.
+        # вернётся, не дождавшись конца остановки. Сам поток запускается
+        # тоже ДО флага: как только флаг взведён, join() легален, а до
+        # start() он падает с «cannot join thread before it is started».
+        # Порядок «ссылка → start → флаг» безопасен и в другую сторону:
+        # start() возвращает после _started.set() в bootstrap нити, так что
+        # к моменту пробуждения ждущего нить уже можно join'ить; а если
+        # shutdown() сам взведёт флаг чуть раньше — нить тоже уже запущена.
         thread = threading.Thread(
             target=self.shutdown, name="daemon-shutdown", daemon=True
         )
         self._shutdown_thread = thread
-        self._stop_event.set()
         thread.start()
+        self._stop_event.set()
 
     def _restore_from_main_thread(self) -> None:
         """Снимает перехват сигналов, но только из главного потока.
@@ -1367,7 +1477,7 @@ def build_daemon(
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="adclicker-daemon",
-        description="Демон Google Ad Clicker: супервизор воркеров и HTTP-управление",
+        description="Демон Premium Bot: супервизор воркеров и HTTP-управление",
     )
     parser.add_argument("--db", default="adclicker.db", help="путь к БД (по умолчанию adclicker.db)")
     parser.add_argument("--config", default="config.json", help="путь к config.json")
@@ -1418,6 +1528,9 @@ def main(argv: Sequence[str] | None = None) -> int:
 
     daemon.install_signal_handlers()
     daemon.start()
+    # После start(): нить останавливает демон тем же путём, что и SIGTERM,
+    # и должна застать его уже поднятым, иначе гонилась бы со стартом.
+    daemon.start_owner_watch()
     try:
         # timeout=None: демон живёт, пока не придёт SIGTERM/SIGINT, а не
         # фиксированное число секунд. Ctrl+C сюда не доходит — его перехватил

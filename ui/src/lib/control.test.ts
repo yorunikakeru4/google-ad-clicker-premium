@@ -424,7 +424,7 @@ describe("apiErrorMessage", () => {
     expect(apiErrorMessage(500, "")).toBe("HTTP 500");
   });
 
-  it("401 объясняет, что на порту демон с другим токеном", () => {
+  it("401 объясняет чужой демон и обещает поднять свой вместо ввода токена", () => {
     const body = JSON.stringify({
       error: { code: "unauthorized", message: "неверный токен" },
     });
@@ -434,6 +434,9 @@ describe("apiErrorMessage", () => {
     expect(message).toContain("неверный токен");
     expect(message).toContain("другим ADCLICKER_CONTROL_TOKEN");
     expect(message).toContain("lsof -nP -iTCP:8787");
+    // Поля ввода токена у приложения нет — совет ввести его недостижим.
+    expect(message).toContain("как только порт освободится");
+    expect(message).not.toContain("задайте тот же");
   });
 });
 

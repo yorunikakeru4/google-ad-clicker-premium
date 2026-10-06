@@ -8,6 +8,8 @@
 import json
 import os
 import signal
+import subprocess
+import sys
 import threading
 import urllib.error
 import urllib.request
@@ -375,6 +377,81 @@ class TestSignalHandling:
 
         assert daemon.wait_for_shutdown(timeout=10) is True
         assert registry.terminated == ["br-1"], "после флага остановки пул должен быть погашен"
+
+
+class TestOwnerWatch:
+    """Демон умирает вместе с приложением-владельцем.
+
+    Штатное закрытие приложения и так гасит демон через stop(); нить нужна
+    для аварийного исхода — приложение убито (crash, force quit), сигнал до
+    демона не дошёл. Без неё уцелевший остаток с прежним токеном ответил бы
+    401 на каждый запрос нового запуска, и приложение не смогло бы поднять
+    свой демон: порт занят чужим.
+    """
+
+    def test_owner_pid_is_read_from_environment(self):
+        environ = {daemon_module.OWNER_PID_ENV_VAR: " 1234 "}
+
+        assert daemon_module.owner_pid_from_environ(environ) == 1234
+
+    @pytest.mark.parametrize("value", ["", "   ", "не число", "0", "-5"])
+    def test_useless_owner_pid_values_are_ignored(self, value):
+        environ = {daemon_module.OWNER_PID_ENV_VAR: value}
+
+        assert daemon_module.owner_pid_from_environ(environ) is None
+
+    def test_absent_owner_pid_means_nothing_to_watch(self):
+        assert daemon_module.owner_pid_from_environ({}) is None
+
+    def test_owner_is_alive_for_this_process_and_gone_for_a_dead_one(self):
+        assert daemon_module.owner_is_alive(os.getpid()) is True
+
+        process = subprocess.Popen([sys.executable, "-c", "pass"])
+        process.wait()
+
+        assert daemon_module.owner_is_alive(process.pid) is False
+
+    def test_no_watch_is_started_without_an_owner(self, tmp_path, db_path, config_path, registry):
+        """Запуск из терминала или из launchd не должен менять поведение."""
+        daemon = make_daemon(tmp_path, db_path, config_path, registry)
+
+        assert daemon.start_owner_watch(environ={}) is None
+        assert daemon.wait_for_shutdown(timeout=0.05) is False
+
+    def test_daemon_stops_when_the_owner_disappears(
+        self, tmp_path, db_path, config_path, registry, monkeypatch
+    ):
+        """Путь нити проверяется на подменённой проверке живости.
+
+        Настоящий мёртвый pid здесь не берётся: в полном прогоне пид
+        освобождается и может достаться чужому процессу, запущенному другим
+        тестом, — наблюдение за «живым» владельцем не сработало бы. Сама
+        проверка живости покрыта отдельным тестом ниже.
+        """
+        monkeypatch.setattr(daemon_module, "owner_is_alive", lambda pid: False)
+
+        daemon = make_daemon(tmp_path, db_path, config_path, registry)
+        thread = daemon.start_owner_watch(
+            environ={daemon_module.OWNER_PID_ENV_VAR: "424242"},
+            interval=0.01,
+        )
+
+        assert thread is not None, "за мёртвым владельцем наблюдать обязаны"
+        assert daemon.wait_for_shutdown(timeout=10) is True
+
+    def test_watch_keeps_the_daemon_running_while_the_owner_lives(
+        self, tmp_path, db_path, config_path, registry
+    ):
+        daemon = make_daemon(tmp_path, db_path, config_path, registry)
+        daemon.start_owner_watch(
+            environ={daemon_module.OWNER_PID_ENV_VAR: str(os.getpid())},
+            interval=0.01,
+        )
+
+        assert daemon.wait_for_shutdown(timeout=0.2) is False, "живый владелец не должен гасить демон"
+
+        daemon._on_signal(signal.SIGTERM, None)
+        assert daemon.wait_for_shutdown(timeout=10) is True
 
 
 class TestMain:

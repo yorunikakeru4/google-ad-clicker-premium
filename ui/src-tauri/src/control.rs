@@ -80,7 +80,10 @@ pub struct Endpoint {
 ///   работающего демона (dev-shell, launchd plist);
 /// - генерируется один раз на процесс, на диск не пишется, в логи и ответы
 ///   не попадает — токен живёт в памяти процесса и уходит ребёнку при спавне
-///   демона;
+///   демона. Свежий токен на каждый запуск корректен только вместе с
+///   гарантией, что демон прошлого запуска уже мёртв: закрытие приложения
+///   гасит его (`stop()` в `RunEvent::ExitRequested`), а остаток, уцелевший
+///   после падения приложения, добивает сам демон по `ADCLICKER_OWNER_PID`;
 /// - перевод строки в заданном значении — ошибка, а не тихая подмена:
 ///   иначе сломанный env выглядел бы как рабочий.
 ///
@@ -218,8 +221,8 @@ pub fn probe(token: Option<&str>, base_url: Option<&str>) -> DaemonProbe {
     match request(token, base_url, "GET", "/health", None) {
         Ok(reply) if reply.status == 401 => DaemonProbe::ForeignDaemon {
             detail: format!(
-                "на {} уже работает демон с другим токеном — остановите его либо \
-                 задайте тот же {TOKEN_ENV} приложению",
+                "на {} уже работает демон с другим токеном ({TOKEN_ENV}) — порт занят; \
+                 приложение поднимёт свой демон, как только порт освободится",
                 base_url.unwrap_or(DEFAULT_BASE_URL)
             ),
         },
@@ -754,6 +757,27 @@ mod tests {
         let error =
             token_or_generate(Some("bad\ntoken")).expect_err("перевод строки должен быть отклонён");
         assert!(error.contains("перевод строки"), "{error}");
+    }
+
+    #[test]
+    fn foreign_daemon_detail_promises_its_own_daemon_not_token_entry() {
+        // У приложения нет поля ввода токена, поэтому «задайте тот же токен»
+        // — недостижимый совет. Баннер обязан сказать, что будет дальше:
+        // приложение поднимёт свой демон, как только порт освободится.
+        let (endpoint, _received, handle) = serve_once(response(
+            "HTTP/1.1 401 Unauthorized",
+            r#"{"error":{"code":"unauthorized","message":"неверный токен"}}"#,
+        ));
+        let base_url = format!("http://{}:{}", endpoint.host, endpoint.port);
+
+        let result = probe(Some("our-token"), Some(&base_url));
+        handle.join().unwrap();
+
+        let DaemonProbe::ForeignDaemon { detail } = result else {
+            panic!("ожидался ForeignDaemon");
+        };
+        assert!(detail.contains("как только порт освободится"), "{detail}");
+        assert!(!detail.contains("задайте"), "{detail}");
     }
 
     #[test]

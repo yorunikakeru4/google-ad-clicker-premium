@@ -1,5 +1,5 @@
 {
-  description = "Google Ad Clicker Premium - Python dev environment";
+  description = "Premium Bot - Python dev environment";
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";

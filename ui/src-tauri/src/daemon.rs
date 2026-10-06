@@ -68,7 +68,7 @@ const PROJECT_MARKER: &str = "config.json";
 /// Каталог данных приложения: куда установка кладёт `config.json` и
 /// остальные файлы, которые legacy читает из cwd. macOS-имя совпадает с
 /// `WorkingDirectory` в launchd plist.
-const APP_DATA_DIR_NAME: &str = "Google Ad Clicker";
+const APP_DATA_DIR_NAME: &str = "Premium Bot";
 
 /// Сколько уровней вверх разрешается подниматься при поиске корня проекта.
 const MAX_ROOT_SEARCH_UP: usize = 8;
@@ -92,10 +92,28 @@ pub const HEALTHY_RUN_AFTER: Duration = Duration::from_secs(30);
 pub const STOP_GRACE: Duration = Duration::from_secs(45);
 /// Как часто монитор спрашивает у процесса, жив ли он.
 pub const POLL_INTERVAL: Duration = Duration::from_millis(50);
+/// Как часто восстановительный цикл спрашивает, свободен ли порт демона.
+///
+/// Один HTTP-пинг на локальный loopback раз в пару секунд — цена того, чтобы
+/// приложение не осталось без демона, когда на порту стоял чужой экземпляр
+/// (см. [`DaemonSupervisor::recover_when_free`]).
+pub const RECOVERY_INTERVAL: Duration = Duration::from_secs(2);
 
 /// Токен control API. Одна константа на весь крейт: control.rs читает ровно
 /// её, а два независимых объявления разошлись бы при первом же переименовании.
 pub use crate::control::TOKEN_ENV;
+use crate::control::{self, DaemonProbe};
+
+/// PID приложения в окружении демона: он нужен демону, чтобы умереть вместе
+/// со своим владельцем (см. `Daemon.start_owner_watch` в
+/// `engine/control_plane/daemon.py` — там тот же ключ `OWNER_PID_ENV_VAR`).
+///
+/// Штатное закрытие приложения гасит демон через `stop()`, но приложение
+/// могут убить (crash, force quit) — тогда остановки не будет, а уцелевший
+/// демон с прежним токеном заблокирует следующий запуск (401 на каждый
+/// запрос). Явный pid надёжнее чтения ppid: после сиротства ppid становится
+/// единицей, а pid владельца остаётся тем же самым.
+pub const OWNER_PID_ENV: &str = "ADCLICKER_OWNER_PID";
 
 #[derive(Clone, Debug)]
 pub struct SupervisorOptions {
@@ -105,6 +123,7 @@ pub struct SupervisorOptions {
     pub max_consecutive_failures: u32,
     pub healthy_run_after: Duration,
     pub stop_grace: Duration,
+    pub recovery_interval: Duration,
 }
 
 impl Default for SupervisorOptions {
@@ -116,6 +135,7 @@ impl Default for SupervisorOptions {
             max_consecutive_failures: MAX_CONSECUTIVE_FAILURES,
             healthy_run_after: HEALTHY_RUN_AFTER,
             stop_grace: STOP_GRACE,
+            recovery_interval: RECOVERY_INTERVAL,
         }
     }
 }
@@ -190,6 +210,42 @@ pub fn decide_after_exit(
     }
 }
 
+/// Что делать восстановительному циклу по итогам одного прохода.
+///
+/// Решение вынесено из потока, чтобы тесты проверяли его без реального
+/// порта, реального спавна и реального времени ожидания.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RecoveryStep {
+    /// На порту кто-то есть — подождать следующего прохода.
+    Wait,
+    /// Порт свободен — пора поднять свой демон.
+    Spawn,
+    /// Ждать больше нечего: демон наш, остановка запрошена или супервизор
+    /// уже отказался от перезапусков.
+    Exit,
+}
+
+/// Решение восстановительного цикла: смотрим на порт и на своё состояние.
+///
+/// `owns_daemon` — супервизору принадлежит процесс либо жив монитор (тот
+/// ведёт демон через backoff сам, второй спавн здесь сломал бы гонку).
+/// `gave_up` — перезапуски прекращены: поднимать нового демона поверх
+/// решённого «пять падений подряд» — значит вернуть бесконечный цикл падений.
+pub fn recovery_step(
+    probe: &DaemonProbe,
+    owns_daemon: bool,
+    gave_up: bool,
+    stopped: bool,
+) -> RecoveryStep {
+    if stopped || owns_daemon || gave_up {
+        return RecoveryStep::Exit;
+    }
+    match probe {
+        DaemonProbe::Free => RecoveryStep::Spawn,
+        DaemonProbe::AlreadyRunning | DaemonProbe::ForeignDaemon { .. } => RecoveryStep::Wait,
+    }
+}
+
 /// Ищет каталог с `config.json`, поднимаясь вверх от `start`.
 ///
 /// Рабочий каталог приложения — `ui/src-tauri` при dev-запуске, а демону
@@ -230,7 +286,7 @@ fn env_value<'a>(vars: &'a HashMap<String, String>, key: &str) -> Option<&'a str
 /// Каталог данных приложения — фолбэк рабочего каталога демона.
 ///
 /// Установка кладёт туда `config.json`/`queries.txt` (в macOS-установке это
-/// `~/Library/Application Support/Google Ad Clicker`, тот же каталог, что
+/// `~/Library/Application Support/Premium Bot`, тот же каталог, что
 /// `WorkingDirectory` в launchd plist). Без фолбэка запуск из Finder падал
 /// бы с «не найден config.json»: cwd графического приложения — `/`, и
 /// подниматься оттуда некуда.
@@ -432,6 +488,14 @@ impl DaemonSpec {
             None => env_pairs.push((TOKEN_ENV.to_string(), token)),
         }
 
+        // Владелец всегда наш, а не унаследованный: ребёнок — демон этого
+        // процесса, и следить за ним он должен именно по этому pid.
+        let owner_pid = std::process::id().to_string();
+        match env_pairs.iter_mut().find(|(key, _)| key == OWNER_PID_ENV) {
+            Some((_, value)) => *value = owner_pid,
+            None => env_pairs.push((OWNER_PID_ENV.to_string(), owner_pid)),
+        }
+
         Ok(Self {
             program,
             args,
@@ -522,71 +586,39 @@ impl DaemonSupervisor {
 
     /// Порождает демона и запускает фоновый монитор. Повторный вызов — no-op.
     ///
-    /// Первый процесс создаётся синхронно, а не внутри монитора. Иначе
-    /// между вызовом и регистрацией в ``inner`` был бы зазор, в который
-    /// второй ``start()`` или ``stop()`` увидели бы пустое состояние и
-    /// породили бы двух демонов либо оставили бы сироту. Ошибка запуска
-    /// возвращается вызывающему: повторять «нет python» пять раз с бэкоффом
-    /// — не восстановление, а маскировка проблемы.
+    /// Явный запуск пользователя (`fresh` в [`start_on`]): сбрасывает флаг
+    /// остановки и счётчики падений — это и есть «Start» после «Kill».
     pub fn start(&self, spec: DaemonSpec) -> Result<(), String> {
-        let mut inner = self.shared.inner.lock().expect("mutex poisoned");
-        // Уже работает — повторный start это no-op, а не ошибка: двойной
-        // клик не должен ронять UI.
-        if inner.running || inner.child.is_some() {
-            return Ok(());
-        }
-        // monitor_alive обязателен: между падением демона и концом backoff-сна
-        // монитор держит ``running=false, child=None``, и без этой проверки
-        // второй start() спавнил бы второго демона, а проснувшийся первый
-        // перезаписал бы inner.child, бросив первый Child без остановки.
-        // Молчаливый no-op здесь недопустим: вызывающий поверил бы, что
-        // демон поднят.
-        if inner.monitor_alive {
-            return Err("монитор демона ещё не завершился — повторите запрос позже".to_string());
-        }
-        self.shared.stop.store(false, Ordering::SeqCst);
-        inner.gave_up = false;
-        inner.restarts = 0;
-        inner.consecutive_failures = 0;
-        inner.last_error = None;
+        start_on(&self.shared, spec, true)
+    }
 
-        let child = match spawn_daemon(&spec) {
-            Ok(child) => child,
-            Err(error) => {
-                // Причина обязана остаться в статусе: stderr сюда не попадает,
-                // а UI показывает ровно last_error.
-                inner.last_error = Some(error.clone());
-                return Err(error);
-            }
-        };
-        inner.pid = Some(child.id());
-        inner.running = true;
-        inner.child = Some(child);
-        inner.monitor_alive = true;
-        drop(inner);
-
+    /// Ждёт, пока порт демона освободится, и поднимает свой экземпляр.
+    ///
+    /// Нужно для ситуации из плана (фаза 13, проблема 4): при старте на
+    /// порту уже стоит демон, которого мы не спавнили, — экземпляр,
+    /// переживший закрытие прошлого приложения, либо демон из терминала. Со
+    /// своим токеном он принимается («уже работает, второй не спавним»), но
+    /// монитор за него не отвечает: если он уйдёт — например, догасает
+    /// после SIGTERM прошлого запуска, — приложение останется без демона и
+    /// без способа его поднять, потому что повторный `start()` пользователю
+    /// недоступен. Цикл закрывает эту дыру: как только порт свободен,
+    /// поднимается наш экземпляр и сразу попадает под наблюдение.
+    ///
+    /// `probe` — функция без аргументов: тесты подменяют проверку порта и не
+    /// открывают сокеты.
+    fn spawn_recovery(&self, spec: DaemonSpec, probe: fn() -> DaemonProbe) {
         let shared = Arc::clone(&self.shared);
-        let spawned = thread::Builder::new()
-            .name("daemon-monitor".into())
-            .spawn(move || monitor(shared, spec, Instant::now()));
-
-        if let Err(error) = spawned {
-            // Монитор не родился — снимаем флаг и гасим процесс сами, иначе
-            // start() навсегда вернётся в «монитор жив», а демон повиснет.
-            let orphan = {
-                let mut inner = self.shared.inner.lock().expect("mutex poisoned");
-                inner.monitor_alive = false;
-                inner.running = false;
-                inner.pid = None;
-                inner.last_error = Some(format!("монитор демона не запустился: {error}"));
-                inner.child.take()
-            };
-            if let Some(mut child) = orphan {
-                terminate(&mut child, self.shared.options.stop_grace);
-            }
-            return Err(format!("монитор демона не запустился: {error}"));
+        if let Err(error) = thread::Builder::new()
+            .name("daemon-recovery".into())
+            .spawn(move || recover(shared, spec, probe))
+        {
+            eprintln!("восстановление демона не запустилось: {error}");
         }
-        Ok(())
+    }
+
+    /// Боевой вход восстановления: проверка порта — реальный probe.
+    pub fn recover_when_free(&self, spec: DaemonSpec) {
+        self.spawn_recovery(spec, control::probe_daemon)
     }
 
     /// Гасит демон: SIGTERM, выдержка, SIGKILL. Повторный вызов безопасен.
@@ -617,6 +649,118 @@ impl DaemonSupervisor {
                 return;
             }
             thread::sleep(self.shared.options.poll_interval);
+        }
+    }
+}
+
+/// Общий код спавна демона: и явный `start()`, и восстановление порта.
+///
+/// Первый процесс создаётся синхронно, а не внутри монитора. Иначе между
+/// вызовом и регистрацией в ``inner`` был бы зазор, в который второй вызов
+/// или ``stop()`` увидели бы пустое состояние и породили бы двух демонов либо
+/// оставили бы сироту. Ошибка запуска возвращается вызывающему: повторять
+/// «нет python» пять раз с бэкоффом — не восстановление, а маскировка
+/// проблемы.
+///
+/// `fresh = true` — явный запуск пользователя: сбрасываются флаг остановки и
+/// счётчики падений, это «Start» после «Kill». `fresh = false` —
+/// восстановление порта: флаг остановки не трогается, а при выставленном
+/// спавн отменяется под замком — поток восстановления не мог бы поднять
+/// демона уже после `stop()` и оставить его сиротой на выходящем приложении.
+fn start_on(shared: &Arc<Shared>, spec: DaemonSpec, fresh: bool) -> Result<(), String> {
+    let mut inner = shared.inner.lock().expect("mutex poisoned");
+    // Уже работает — повторный start это no-op, а не ошибка: двойной
+    // клик не должен ронять UI.
+    if inner.running || inner.child.is_some() {
+        return Ok(());
+    }
+    // monitor_alive обязателен: между падением демона и концом backoff-сна
+    // монитор держит ``running=false, child=None``, и без этой проверки
+    // второй start() спавнил бы второго демона, а проснувшийся первый
+    // перезаписал бы inner.child, бросив первый Child без остановки.
+    // Молчаливый no-op здесь недопустим: вызывающий поверил бы, что
+    // демон поднят.
+    if inner.monitor_alive {
+        return Err("монитор демона ещё не завершился — повторите запрос позже".to_string());
+    }
+    if !fresh && shared.stop.load(Ordering::SeqCst) {
+        return Err("остановка запрошена — спавн демона отменён".to_string());
+    }
+    if fresh {
+        shared.stop.store(false, Ordering::SeqCst);
+        inner.gave_up = false;
+        inner.restarts = 0;
+        inner.consecutive_failures = 0;
+    }
+    inner.last_error = None;
+
+    let child = match spawn_daemon(&spec) {
+        Ok(child) => child,
+        Err(error) => {
+            // Причина обязана остаться в статусе: stderr сюда не попадает,
+            // а UI показывает ровно last_error.
+            inner.last_error = Some(error.clone());
+            return Err(error);
+        }
+    };
+    inner.pid = Some(child.id());
+    inner.running = true;
+    inner.child = Some(child);
+    inner.monitor_alive = true;
+    drop(inner);
+
+    let monitor_shared = Arc::clone(shared);
+    let spawned = thread::Builder::new()
+        .name("daemon-monitor".into())
+        .spawn(move || monitor(monitor_shared, spec, Instant::now()));
+
+    if let Err(error) = spawned {
+        // Монитор не родился — снимаем флаг и гасим процесс сами, иначе
+        // start() навсегда вернётся в «монитор жив», а демон повиснет.
+        let orphan = {
+            let mut inner = shared.inner.lock().expect("mutex poisoned");
+            inner.monitor_alive = false;
+            inner.running = false;
+            inner.pid = None;
+            inner.last_error = Some(format!("монитор демона не запустился: {error}"));
+            inner.child.take()
+        };
+        if let Some(mut child) = orphan {
+            terminate(&mut child, shared.options.stop_grace);
+        }
+        return Err(format!("монитор демона не запустился: {error}"));
+    }
+    Ok(())
+}
+
+/// Цикл восстановления порта: ждать свободного места и поднять демон.
+///
+/// Выход — как только подняли (или поднять больше не нужно): дальше жизнью
+/// процесса владеет монитор, запущенный в [`start_on`]. Проверка состояния
+/// идёт под замком вместе со спавном, поэтому `stop()` либо успевает
+/// выставить флаг до спавна (цикл отменяется), либо забирает и гасит уже
+/// зарегистрированного ребёнка.
+fn recover(shared: Arc<Shared>, spec: DaemonSpec, probe: fn() -> DaemonProbe) {
+    loop {
+        let (owns_daemon, gave_up, stopped) = {
+            let inner = shared.inner.lock().expect("mutex poisoned");
+            (
+                inner.child.is_some() || inner.monitor_alive,
+                inner.gave_up,
+                shared.stop.load(Ordering::SeqCst),
+            )
+        };
+        match recovery_step(&probe(), owns_daemon, gave_up, stopped) {
+            RecoveryStep::Exit => return,
+            RecoveryStep::Wait => thread::sleep(shared.options.recovery_interval),
+            RecoveryStep::Spawn => {
+                if let Err(error) = start_on(&shared, spec, false) {
+                    if !shared.stop.load(Ordering::SeqCst) {
+                        eprintln!("демон не поднялся после освобождения порта: {error}");
+                    }
+                }
+                return;
+            }
         }
     }
 }
@@ -895,6 +1039,7 @@ mod tests {
             max_consecutive_failures: 3,
             healthy_run_after: Duration::from_secs(3600),
             stop_grace: Duration::from_millis(700),
+            recovery_interval: Duration::from_millis(5),
         }
     }
 
@@ -970,6 +1115,50 @@ mod tests {
         assert!(matches!(decision.next, NextStep::Restart { .. }));
     }
 
+    #[test]
+    fn recovery_step_waits_while_the_port_is_taken() {
+        let foreign = DaemonProbe::ForeignDaemon {
+            detail: "порт занят".to_string(),
+        };
+
+        assert_eq!(
+            recovery_step(&foreign, false, false, false),
+            RecoveryStep::Wait,
+            "чужой демон — повод подождать, а не воевать"
+        );
+        assert_eq!(
+            recovery_step(&DaemonProbe::AlreadyRunning, false, false, false),
+            RecoveryStep::Wait,
+            "свой, но не нами запущенный демон — тоже ждём его судьбы"
+        );
+        assert_eq!(
+            recovery_step(&DaemonProbe::Free, false, false, false),
+            RecoveryStep::Spawn,
+            "порт свободен — поднимаем свой экземпляр"
+        );
+    }
+
+    #[test]
+    fn recovery_step_exits_when_there_is_nothing_to_recover() {
+        let free = DaemonProbe::Free;
+
+        assert_eq!(
+            recovery_step(&free, false, false, true),
+            RecoveryStep::Exit,
+            "после stop() цикл обязан выйти, а не поднять демона на выходе"
+        );
+        assert_eq!(
+            recovery_step(&free, true, false, false),
+            RecoveryStep::Exit,
+            "свой демон под наблюдением — вмешиваться не нужно"
+        );
+        assert_eq!(
+            recovery_step(&free, false, true, false),
+            RecoveryStep::Exit,
+            "потолок падений открыт — второй шанс дал бы бесконечный цикл"
+        );
+    }
+
     // --- спецификация запуска ---------------------------------------------
 
     #[test]
@@ -992,8 +1181,36 @@ mod tests {
                 .any(|(key, value)| key == TOKEN_ENV && value == "provided-token"),
             "токен обязан дойти до демона как есть"
         );
-        let _ = fs::remove_dir_all(&root);
     }
+
+    #[test]
+    fn spec_passes_its_own_pid_as_the_daemon_owner() {
+        // Демон должен умереть вместе с приложением даже после его
+        // аварийной смерти, для этого он получает pid именно этого процесса,
+        // а не унаследованный из окружения (тот мог принадлежать
+        // запускающему скрипту или старому приложению).
+        let root = env::temp_dir().join(format!("adclicker-owner-{}", std::process::id()));
+        fs::create_dir_all(&root).expect("каталог создаётся");
+        fs::write(root.join(PROJECT_MARKER), "{}").expect("маркер пишется");
+
+        let mut vars = HashMap::new();
+        vars.insert(TOKEN_ENV.to_string(), "provided-token".to_string());
+        vars.insert(OWNER_PID_ENV.to_string(), "999999".to_string());
+        let spec = DaemonSpec::resolve(&vars, root, None).expect("спецификация собирается");
+
+        let own_pid = std::process::id().to_string();
+        let passed = spec
+            .env
+            .iter()
+            .find(|(key, _)| key == OWNER_PID_ENV)
+            .map(|(_, value)| value.as_str());
+        assert_eq!(
+            passed,
+            Some(own_pid.as_str()),
+            "демон обязан получить pid этого процесса, а не унаследованный"
+        );
+    }
+
 
     #[test]
     fn spec_honours_overrides_and_existing_token() {
@@ -1162,20 +1379,20 @@ mod tests {
         assert_eq!(
             app_data_dir(&vars, true).as_deref(),
             Some(Path::new(
-                "/home/user/Library/Application Support/Google Ad Clicker"
+                "/home/user/Library/Application Support/Premium Bot"
             )),
             "macOS: тот же каталог, что WorkingDirectory в launchd plist"
         );
         assert_eq!(
             app_data_dir(&vars, false).as_deref(),
-            Some(Path::new("/custom/data/Google Ad Clicker")),
+            Some(Path::new("/custom/data/Premium Bot")),
             "XDG_DATA_HOME сильнее дефолта"
         );
 
         let no_xdg = HashMap::from([("HOME".to_string(), "/home/user".to_string())]);
         assert_eq!(
             app_data_dir(&no_xdg, false).as_deref(),
-            Some(Path::new("/home/user/.local/share/Google Ad Clicker"))
+            Some(Path::new("/home/user/.local/share/Premium Bot"))
         );
 
         assert_eq!(
@@ -1321,7 +1538,7 @@ mod tests {
         let base = env::temp_dir().join(format!("{prefix}-{}", std::process::id()));
         let macos = base.join("App.app/Contents/MacOS");
         fs::create_dir_all(&macos).expect("структура бандла создаётся");
-        let exe = macos.join("Google Ad Clicker Premium");
+        let exe = macos.join("Premium Bot");
         fs::write(&exe, "").expect("бинарник создаётся");
         fs::write(macos.join(SIDECAR_NAME), "").expect("sidecar создаётся");
         (base, exe)
@@ -1534,5 +1751,79 @@ mod tests {
         );
 
         supervisor.stop();
+    }
+
+    // --- восстановление порта (план, фаза 13, проблема 4) ------------------
+
+    fn always_free() -> DaemonProbe {
+        DaemonProbe::Free
+    }
+
+    /// Порт занят первые два прохода, потом освобождается — ровно то, что
+    /// происходит с догасающим демоном прошлого запуска приложения.
+    fn busy_twice_then_free() -> DaemonProbe {
+        use std::sync::atomic::AtomicU32;
+        static CALLS: AtomicU32 = AtomicU32::new(0);
+        if CALLS.fetch_add(1, Ordering::SeqCst) < 2 {
+            return DaemonProbe::ForeignDaemon {
+                detail: "демон прошлого запуска ещё гаснет".to_string(),
+            };
+        }
+        DaemonProbe::Free
+    }
+
+    #[test]
+    fn recovery_waits_out_the_old_daemon_and_then_starts_its_own() {
+        let root = env::temp_dir().join(format!("adclicker-recovery-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(&root).expect("каталог создаётся");
+        let marker = root.join("spawned");
+
+        let supervisor = DaemonSupervisor::new(fast_options());
+        let command = format!("touch {}", marker.display());
+        supervisor.spawn_recovery(spec(&command), busy_twice_then_free);
+
+        assert!(
+            wait_until(Duration::from_secs(5), || marker.exists()),
+            "когда порт освободился, приложение обязано поднять свой демон"
+        );
+        assert!(
+            supervisor.status().running,
+            "поднятый демон сразу берётся под наблюдение"
+        );
+
+        supervisor.stop();
+    }
+
+    #[test]
+    fn recovery_leaves_an_owned_daemon_alone() {
+        let supervisor = DaemonSupervisor::new(fast_options());
+        supervisor.start(spec("sleep 60")).expect("старт");
+        let owned = supervisor.status().pid;
+
+        supervisor.spawn_recovery(spec("exit 0"), always_free);
+        thread::sleep(Duration::from_millis(50));
+
+        assert_eq!(
+            supervisor.status().pid,
+            owned,
+            "демон под наблюдением не должен подменяться"
+        );
+
+        supervisor.stop();
+    }
+
+    #[test]
+    fn stop_cancels_the_pending_recovery() {
+        let supervisor = DaemonSupervisor::new(fast_options());
+        supervisor.stop();
+
+        supervisor.spawn_recovery(spec("exit 0"), always_free);
+        thread::sleep(Duration::from_millis(50));
+
+        assert!(
+            !supervisor.status().running,
+            "после остановки восстановление не вправе поднять демона"
+        );
     }
 }

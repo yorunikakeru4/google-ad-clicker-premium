@@ -36,7 +36,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         log.info("scheduler", "Chat ID", fields={"chat_id": update.effective_chat.id})
         chat_id_file.write(str(update.effective_chat.id))
 
-    response = "Started Ad Clicker Premium Notifier! Please end the script with CTRL+C"
+    response = "Started Premium Bot Notifier! Please end the script with CTRL+C"
 
     await context.bot.send_message(chat_id=update.effective_chat.id, text=response)
 
