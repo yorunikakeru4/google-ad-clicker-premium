@@ -103,8 +103,68 @@ export function proxiesRequest(action: ProxiesAction): ProxiesRequest {
   }
 }
 
-/** Действия API диагностики (контракт /control/diagnostics/collect). */
-export type DiagnosticsAction =
+/** Действия API списков (контракт /control/queries*, /control/domains*). */
+export type WordlistAction =
+  | { kind: "list" }
+  | { kind: "add"; lines: string[] }
+  | { kind: "delete"; values: string[] }
+  | { kind: "deleteAll" }
+  | { kind: "file" };
+
+export interface WordlistRequest {
+  method: "GET" | "POST";
+  path: string;
+  /** JSON-тело POST; у GET его нет вовсе. */
+  body?: string;
+}
+
+/**
+ * Билдер запросов к списку.
+ *
+ * Оба списка устроены одинаково (план §5, фаза 13), поэтому у них один
+ * билдер: различаются только базовый путь и ключ тела удаления — «queries»
+ * у запросов, «domains» у доменов. Тела собираются здесь, как у прокси:
+ * контракт демона живёт в одном месте и виден в тестах.
+ */
+export function wordlistRequest(
+  base: string,
+  key: string,
+  action: WordlistAction,
+): WordlistRequest {
+  switch (action.kind) {
+    case "list":
+      return { method: "GET", path: base };
+    case "add":
+      return {
+        method: "POST",
+        path: base,
+        body: JSON.stringify({ lines: action.lines }),
+      };
+    case "delete":
+      return {
+        method: "POST",
+        path: `${base}/delete`,
+        body: JSON.stringify({ [key]: action.values }),
+      };
+    case "deleteAll":
+      // Список значений для «удалить всё» собирает демон, не UI.
+      return { method: "POST", path: `${base}/delete`, body: '{"all":true}' };
+    case "file":
+      return { method: "GET", path: `${base}/file` };
+  }
+}
+
+/** Запросы (Key Words): /control/queries*. */
+export function queriesRequest(action: WordlistAction): WordlistRequest {
+  return wordlistRequest("/control/queries", "queries", action);
+}
+
+/** Домены: /control/domains*. */
+export function domainsRequest(action: WordlistAction): WordlistRequest {
+  return wordlistRequest("/control/domains", "domains", action);
+}
+
+/** Действия API диагностики (контракт /control/diagnostics/collect). */export type DiagnosticsAction =
   | { kind: "collect"; browserId: string }
   | { kind: "collectAll" };
 

@@ -229,7 +229,7 @@ class TestDetectionBranches:
         controller = make_controller(captcha_env, driver)
 
         with pytest.raises(SystemExit):
-            controller.search_for_ads(non_ad_domains=[])
+            controller.search_for_ads(blocked_domains=[])
 
         rows = _events(captcha_env.db, captcha_env.browser_id)
         assert len(rows) == 1, "детект на входе даёт ровно одно событие"
@@ -255,7 +255,7 @@ class TestDetectionBranches:
         controller = make_controller(captcha_env, driver)
 
         with pytest.raises(SystemExit):
-            controller.search_for_ads(non_ad_domains=[])
+            controller.search_for_ads(blocked_domains=[])
 
         rows = _events(captcha_env.db, captcha_env.browser_id)
         assert len(rows) == 1
@@ -270,7 +270,7 @@ class TestDetectionBranches:
         controller = make_controller(captcha_env, driver)
 
         with pytest.raises(SystemExit):
-            controller.search_for_ads(non_ad_domains=[])
+            controller.search_for_ads(blocked_domains=[])
 
         rows = _events(captcha_env.db, captcha_env.browser_id)
         assert len(rows) == 1

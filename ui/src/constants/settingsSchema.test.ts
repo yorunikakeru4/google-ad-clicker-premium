@@ -53,6 +53,7 @@ const ENGINE_SCHEMA: Record<string, Record<string, EngineField>> = {
     max_scroll_limit: { type: "int", default: 0 },
     check_shopping_ads: { type: "bool", default: true },
     excludes: { type: "str", default: "" },
+    own_domain: { type: "str", default: "" },
     random_mouse: { type: "bool", default: false },
     custom_cookies: { type: "bool", default: false },
     click_order: { type: "int", default: 5 },
@@ -154,11 +155,11 @@ describe("settingsSchema: секции и поля против _SCHEMA", () => 
   // Счётчик — смотри на сумму ключей _SCHEMA, а не на него самого: он ловит
   // потерю поля и дубль пути разом. Меняется только вместе с _SCHEMA
   // (36 полей до политики CAPTCHA + 3 под неё + 3 про хранение логов = 42
-  // + 2 про очистку профилей = 44).
-  it("в форме ровно 44 поля, без повторов пути", () => {
+  // + 2 про очистку профилей = 44 + 1 про наш домен = 45).
+  it("в форме ровно 45 полей, без повторов пути", () => {
     const paths = allFields().map((row) => row.path);
     expect(new Set(paths).size, "пути полей повторяются").toBe(paths.length);
-    expect(paths).toHaveLength(44);
+    expect(paths).toHaveLength(45);
   });
 
   it("типы формы соответствуют типам движка", () => {

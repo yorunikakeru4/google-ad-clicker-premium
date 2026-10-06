@@ -203,7 +203,46 @@ def test_get_domains_skips_blank_lines(set_paths, tmp_path):
     domains_file.write_text("www.booking.com\n\n  \nwww.sixt.com\n", "utf-8")
     set_paths(filtered_domains=domains_file)
 
-    assert utils.get_domains() == ["www.booking.com", "www.sixt.com"]
+    # Нормализация до хоста без www: список — чёрный, а матчинг сравнивает
+    # хосты, поэтому «www.booking.com» и «booking.com» — один и тот же домен.
+    assert utils.get_domains() == ["booking.com", "sixt.com"]
+
+
+def test_get_domains_normalizes_urls_and_dedupes(set_paths, tmp_path):
+    domains_file = tmp_path / "domains.txt"
+    domains_file.write_text(
+        "https://www.edelind.de\nedelind.de/\nwww.edelind.de\nEDelind.DE\n", "utf-8"
+    )
+    set_paths(filtered_domains=domains_file)
+
+    assert utils.get_domains() == ["edelind.de"]
+
+
+def test_get_domains_appends_own_domain(set_paths, tmp_path, monkeypatch, behavior):
+    domains_file = tmp_path / "domains.txt"
+    domains_file.write_text("booking.com\n", "utf-8")
+    set_paths(filtered_domains=domains_file)
+    monkeypatch.setattr(behavior, "own_domain", "https://www.edelind.de/goldkette")
+
+    assert utils.get_domains() == ["booking.com", "edelind.de"]
+
+
+def test_get_domains_own_domain_works_with_empty_file(set_paths, tmp_path, monkeypatch, behavior):
+    domains_file = tmp_path / "domains.txt"
+    domains_file.write_text("\n", "utf-8")
+    set_paths(filtered_domains=domains_file)
+    monkeypatch.setattr(behavior, "own_domain", "edelind.de")
+
+    assert utils.get_domains() == ["edelind.de"]
+
+
+def test_get_domains_own_domain_duplicates_file_entry(set_paths, tmp_path, monkeypatch, behavior):
+    domains_file = tmp_path / "domains.txt"
+    domains_file.write_text("www.edelind.de\n", "utf-8")
+    set_paths(filtered_domains=domains_file)
+    monkeypatch.setattr(behavior, "own_domain", "edelind.de")
+
+    assert utils.get_domains() == ["edelind.de"]
 
 
 def test_get_domains_returns_empty_list_when_file_has_only_blank_lines(set_paths, tmp_path):
@@ -242,7 +281,7 @@ def test_get_domains_strips_whitespace_and_quotes(set_paths, tmp_path):
     domains_file.write_text(" 'www.booking.com' \n\"www.sixt.com\"\n", "utf-8")
     set_paths(filtered_domains=domains_file)
 
-    assert utils.get_domains() == ["www.booking.com", "www.sixt.com"]
+    assert utils.get_domains() == ["booking.com", "sixt.com"]
 
 
 def test_get_domains_exits_when_file_is_missing(set_paths, tmp_path):
@@ -252,6 +291,38 @@ def test_get_domains_exits_when_file_is_missing(set_paths, tmp_path):
         utils.get_domains()
 
     assert "Couldn't find domains file" in str(excinfo.value)
+
+
+# --- domain_matches: матчинг хоста чёрного списка ---------------------------------
+
+
+@pytest.mark.parametrize(
+    ("url", "domain", "expected"),
+    [
+        # апекс и поддомен — одно совпадение
+        ("https://edelind.de/goldkette", "edelind.de", True),
+        ("https://www.edelind.de/goldkette", "edelind.de", True),
+        ("https://shop.edelind.de/x?a=1", "edelind.de", True),
+        # www в записи списка тоже снимается
+        ("https://edelind.de/", "www.edelind.de", True),
+        # подстрока хоста не совпадает: not-edelind.de ≠ edelind.de
+        ("https://notedelind.de/", "edelind.de", False),
+        ("https://edelind.de.evil.example/", "edelind.de", False),
+        # домен в query/fragment — это не хост
+        ("https://example.com/?next=edelind.de", "edelind.de", False),
+        ("https://example.com/#edelind.de", "edelind.de", False),
+        # порт и raw-строка без схемы (такие строки лежат в файле)
+        ("https://edelind.de:8443/x", "edelind.de", True),
+        ("edelind.de/goldkette", "edelind.de", True),
+        ("www.edelind.de", "edelind.de", True),
+        # пустые значения ничего не блокируют
+        ("https://edelind.de/", "", False),
+        ("", "edelind.de", False),
+        (None, "edelind.de", False),
+    ],
+)
+def test_domain_matches_compares_hosts_not_substrings(url, domain, expected):
+    assert utils.domain_matches(url, domain) is expected
 
 
 def test_get_user_agents_strips_whitespace_and_quotes(tmp_path):

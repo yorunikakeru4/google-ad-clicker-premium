@@ -43,6 +43,7 @@ from utils import (
     Direction,
     add_cookies,
     solve_recaptcha,
+    domain_matches,
     get_random_sleep,
     resolve_redirect,
     boost_requests,
@@ -177,6 +178,10 @@ class SearchController:
         self._driver = driver
         self._search_query, self._filter_words = self._process_query(query)
         self._exclude_list = None
+        # Чёрный список клика (план §5, фаза 13): домены из
+        # paths.filtered_domains плюс behavior.own_domain. Заполняется в
+        # search_for_ads — его сюда приносит ad_clicker из utils.get_domains.
+        self._blocked_domains: list[str] = []
         self._random_mouse_enabled = config.behavior.random_mouse
         self._use_custom_cookies = config.behavior.custom_cookies
         # Строка профиля читается один раз на прогон: её видят и применение
@@ -246,18 +251,77 @@ class SearchController:
             },
         )
 
+    def _is_blocked_target(
+        self,
+        *urls: Optional[str],
+        title: str = "",
+        text: str = "",
+        domains: Optional[list[str]] = None,
+    ) -> bool:
+        """Цель клика в чёрном списке (план §5, фаза 13).
+
+        Блокирует ссылку, если её хост — домен из ``paths.filtered_domains``
+        или ``behavior.own_domain``, либо если в URL/заголовке/тексте есть
+        слово из ``behavior.excludes``. Проверяются **все** переданные URL:
+        у рекламы ``href`` (перенаправление Google) и ``data-pcu`` (реальная
+        цель) — это разные строки, и достаточно совпадения в любой из них.
+
+        Раньше excludes смотрели только на рекламу и только по заголовку с
+        ``data-pcu``, а органика не проверялась вовсе — из-за этого кликер
+        кликал и ссылки на наш домен, и слова из списка исключений.
+
+        :param urls: известные варианты цели клика (href, data-pcu, ...)
+        :param title: заголовок объявления
+        :param text: видимый текст ссылки (органика)
+        :param domains: чёрный список; по умолчанию из ``self._blocked_domains``
+        :rtype: bool
+        :returns: True — кликать нельзя
+        """
+
+        blocked = self._blocked_domains if domains is None else domains
+
+        for domain in blocked:
+            for url in urls:
+                if url and domain_matches(url, domain):
+                    log.debug(
+                        "click",
+                        "Excluding: blocked domain",
+                        fields={"url": url, "domain": domain},
+                    )
+                    return True
+
+        haystack = "\n".join(
+            [*(url.lower() for url in urls if url), title.lower(), text.lower()]
+        )
+        for word in self._exclude_list or []:
+            if word and word.lower() in haystack:
+                log.debug(
+                    "click",
+                    "Excluding: matched word",
+                    fields={"word": word, "title": title, "text": text},
+                )
+                return True
+
+        return False
+
     def search_for_ads(
-        self, non_ad_domains: Optional[list[str]] = None
+        self, blocked_domains: Optional[list[str]] = None
     ) -> tuple[AdList, NonAdList]:
         """Start search for the given query and return ads if any
 
-        Also, get non-ad links including domains given.
+        Also, get non-ad links, skipping the domains that must never be
+        clicked (``paths.filtered_domains`` + ``behavior.own_domain``).
 
-        :type non_ad_domains: list
-        :param non_ad_domains: List of domains to select for non-ad links
+        :type blocked_domains: list
+        :param blocked_domains: Чёрный список доменов; хранится на время
+            сценария и используется всеми тремя сборщиками ссылок
         :rtype: tuple
         :returns: Tuple of [(ad, ad_link, ad_title), non_ad_links]
         """
+
+        # До любых сборщиков ссылок: списком владеет вызывающий код
+        # (ad_clicker передаёт utils.get_domains()), контроллер его хранит.
+        self._blocked_domains = list(blocked_domains or [])
 
         self._apply_cookies()
 
@@ -338,7 +402,7 @@ class SearchController:
                     shopping_ad_links = self._get_shopping_ad_links()
 
                 ad_links = self._get_ad_links()
-                non_ad_links = self._get_non_ad_links(ad_links, non_ad_domains)
+                non_ad_links = self._get_non_ad_links(ad_links, blocked_domains)
 
         except TimeoutException as exp:
             # Явный отказ, а не пустой возврат: раньше ветка закрывала
@@ -840,21 +904,15 @@ class SearchController:
                 ad_target_link = ad[3]
                 log.debug("click", "Ad title", fields={"title": ad_title, "link": ad_link})
 
-                if self._exclude_list:
-                    for exclude_item in self._exclude_list:
-                        if (
-                            exclude_item in ad_target_link
-                            or exclude_item.lower() in ad_title.lower()
-                        ):
-                            log.debug("click", "Excluding", fields={"title": ad_title, "link": ad_target_link})
-                            self._stats.num_excluded_shopping_ads += 1
-                            break
-                    else:
-                        log.info("click", "======= Found a Shopping Ad =======")
-                        shopping_ad_links.append((ad[0], ad_link, ad_title))
-                else:
-                    log.info("click", "======= Found a Shopping Ad =======")
-                    shopping_ad_links.append((ad[0], ad_link, ad_title))
+                # Чёрный список (домены + слова исключения) закрывает и
+                # shopping: клик по цели из списка запрещён так же, как в
+                # обычной рекламе и в органике.
+                if self._is_blocked_target(ad_link, ad_target_link, title=ad_title):
+                    self._stats.num_excluded_shopping_ads += 1
+                    continue
+
+                log.info("click", "======= Found a Shopping Ad =======")
+                shopping_ad_links.append((ad[0], ad_link, ad_title))
 
             return shopping_ad_links
 
@@ -948,38 +1006,41 @@ class SearchController:
             ad_title = ad.find_element(*self.AD_TITLE).text
             log.debug("click", "Ad title", fields={"title": ad_title, "link": ad_link})
 
-            if self._exclude_list:
-                for exclude_item in self._exclude_list:
-                    if (
-                        exclude_item in ad.get_attribute("data-pcu")
-                        or exclude_item.lower() in ad_title.lower()
-                    ):
-                        log.debug("click", "Excluding", fields={"title": ad_title, "link": ad_link})
-                        self._stats.num_excluded_ads += 1
-                        break
-                else:
-                    log.info("click", "======= Found an Ad =======")
-                    ad_links.append((ad, ad_link, ad_title))
-            else:
-                log.info("click", "======= Found an Ad =======")
-                ad_links.append((ad, ad_link, ad_title))
+            # data-pcu — реальная цель объявления, href — перенаправление
+            # Google: чёрный список проверяется по обоим (план §5, фаза 13).
+            if self._is_blocked_target(
+                ad_link, ad.get_attribute("data-pcu"), title=ad_title
+            ):
+                self._stats.num_excluded_ads += 1
+                continue
+
+            log.info("click", "======= Found an Ad =======")
+            ad_links.append((ad, ad_link, ad_title))
 
         return ad_links
 
     def _get_non_ad_links(
-        self, ad_links: AdList, non_ad_domains: Optional[list[str]] = None
+        self, ad_links: AdList, blocked_domains: Optional[list[str]] = None
     ) -> NonAdList:
         """Extract non-ad link elements
 
+        Ссылка из чёрного списка (домен из ``paths.filtered_domains`` /
+        ``behavior.own_domain`` либо слово из ``behavior.excludes``) не
+        попадает в результат: раньше список доменов, наоборот, работал как
+        белый, и кликер кликал ровно ссылки на наш домен.
+
         :type ad_links: AdList
         :param ad_links: List of ad links found to exclude
-        :type non_ad_domains: list
-        :param non_ad_domains: List of domains to select for non-ad links
+        :type blocked_domains: list
+        :param blocked_domains: Чёрный список доменов; ``None`` — взять
+            сохранённый в ``search_for_ads`` (``self._blocked_domains``)
         :rtype: NonAdList
         :returns: List of non-ad link elements
         """
 
         log.info("click", "Getting non-ad links...")
+
+        domains = self._blocked_domains if blocked_domains is None else blocked_domains
 
         # go to top of the page
         self._driver.find_element(By.TAG_NAME, "body").send_keys(Keys.HOME)
@@ -1018,22 +1079,24 @@ class SearchController:
                     and (link_url and link_url.startswith("http"))
                     and len(link.find_elements(By.TAG_NAME, "svg")) == 0
                 ):
-                    if non_ad_domains:
-                        log.debug("click", "Evaluating to add as non-ad link", fields={"url": link_url})
+                    if self._is_blocked_target(
+                        link_url, text=getattr(link, "text", "") or "", domains=domains
+                    ):
+                        log.debug(
+                            "click",
+                            "Excluding non-ad link",
+                            fields={"url": link_url},
+                        )
+                        continue
 
-                        for domain in non_ad_domains:
-                            if domain in link_url:
-                                log.debug("click", "Adding to non-ad links", fields={"url": link_url})
-                                non_ad_links.append(link)
-                                break
-                    else:
-                        log.debug("click", "Adding to non-ad links", fields={"url": link_url})
-                        non_ad_links.append(link)
+                    log.debug("click", "Adding to non-ad links", fields={"url": link_url})
+                    non_ad_links.append(link)
 
         log.info("click", "Found non-ad links", fields={"count": len(non_ad_links)})
 
-        # if there is no domain to filter, randomly select 3 links
-        if not non_ad_domains and len(non_ad_links) > 3:
+        # Несколько органических ссылок за раунд: как и раньше, потолок три —
+        # но теперь он не зависит от наличия списка доменов.
+        if len(non_ad_links) > 3:
             log.info("click", "Randomly selecting 3 from non-ad links...")
             non_ad_links = random.sample(non_ad_links, k=3)
 

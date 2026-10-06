@@ -54,6 +54,9 @@ class BehaviorParams:
     max_scroll_limit: Optional[int] = 0
     check_shopping_ads: Optional[bool] = True
     excludes: Optional[str] = ""
+    # Наш домен: добавляется в чёрный список клика автоматически
+    # (utils.get_domains), поэтому держать его в domains.txt руками не нужно.
+    own_domain: Optional[str] = ""
     random_mouse: Optional[bool] = False
     custom_cookies: Optional[bool] = False
     click_order: Optional[int] = 5
@@ -184,6 +187,9 @@ class ConfigReader:
             max_scroll_limit=config["behavior"]["max_scroll_limit"],
             check_shopping_ads=config["behavior"]["check_shopping_ads"],
             excludes=config["behavior"]["excludes"],
+            # .get, а не []: config.json прошлой версии без ключа обязан
+            # читаться (план §5, фаза 13), пустой строкой — «наш домен не задан».
+            own_domain=config["behavior"].get("own_domain", ""),
             random_mouse=config["behavior"]["random_mouse"],
             custom_cookies=config["behavior"]["custom_cookies"],
             click_order=config["behavior"]["click_order"],

@@ -98,21 +98,21 @@ def test_real_queries_file_is_parsed_line_by_line(set_paths, test_data_dir):
 
 
 @pytest.mark.skipif(not _data_ready("domains.txt"), reason=_missing_reason("domains.txt"))
-def test_real_domain_list_selects_only_its_own_links(
+def test_real_domain_list_blocks_its_own_links(
     set_paths, make_search_controller, test_data_dir
 ):
-    """Реальный список доменов отбирает non-ad ссылки через ``_get_non_ad_links``.
+    """Реальный список доменов запрещает non-ad ссылки через ``_get_non_ad_links``.
 
     Доказывает, что файл из ``paths.filtered_domains`` реально управляет отбором
     (``ad_clicker.py`` передаёт ``get_domains()`` в ``search_for_ads``): ссылка
-    с домена из файла проходит, чужая — нет, а сырые строки файла, не
-    оформленные как URL, не проходят проверку ``href`` обязан начинаться с
-    http. Синтетические случаи отбора покрыты в
+    с доменом из файла не кликается вовсе, чужая — проходит, а сырые строки
+    файла, не оформленные как URL, не проходят проверку ``href`` — она обязана
+    начинаться с http. Синтетические случаи отбора покрыты в
     ``test_search_controller.py``; здесь проверяется только реальный файл.
 
-    Семантика списка — селектор, а не чёрный список: README называет его
-    «domains to filter for clicking non-ad links», поэтому совпадение с файлом
-    пропускает ссылку, а отсутствие совпадения отбраковывает.
+    Семантика списка — чёрный список (план §5, фаза 13): совпадение с файлом
+    отбраковывает ссылку, отсутствие совпадения пропускает. Раньше было
+    ровно наоборот, и кликер кликал только ссылки на наш домен.
     """
 
     path = test_data_dir / "domains.txt"
@@ -125,10 +125,8 @@ def test_real_domain_list_selects_only_its_own_links(
     )
 
     candidates = [
-        make_link(
-            "https://www.edelind.de/goldkette-75-cm"
-        ),  # безусловно релевантный: страница домена
-        make_link("https://www.edelind.de"),  # полная строка файла — уже URL
+        make_link("https://www.edelind.de/goldkette-75-cm"),
+        make_link("https://www.edelind.de"),
         make_link("https://www.booking.com/hotels"),  # дефолт репозитория, в реальном файле его нет
         make_link("edelind.de"),  # сырая строка файла без схемы
         make_link("www.edelind.de"),  # то же, с www
@@ -137,22 +135,9 @@ def test_real_domain_list_selects_only_its_own_links(
 
     selected = [link.get_attribute("href") for link in controller._get_non_ad_links([], domains)]
 
-    assert "https://www.edelind.de/goldkette-75-cm" in selected, (
-        "безусловно релевантная ссылка домена из реального файла должна проходить отбор"
+    assert selected == ["https://www.booking.com/hotels"], (
+        f"наш домен обязан быть заблокирован, а чужой — пройти; выбрано: {selected}"
     )
-    # Строка файла, уже оформленная как URL, матчится подстрокой и проходит
-    # как есть: filtered_domains сравнивается с href через ``domain in link_url``.
-    assert "https://www.edelind.de" in selected, (
-        "полная URL-строка реального файла должна проходить отбор"
-    )
-    assert "https://www.booking.com/hotels" not in selected, (
-        "чужой домен (и дефолт репозитория) обязан отбраковываться — "
-        "это доказывает, что взят именно реальный файл"
-    )
-    assert "edelind.de" not in selected and "www.edelind.de" not in selected, (
-        "строки файла без схемы не являются href и не должны проходить отбор"
-    )
-    assert len(selected) == 2, f"отобрано лишних ссылок: {selected}"
 
 
 @pytest.mark.skipif(not _data_ready("proxies.txt"), reason=_missing_reason("proxies.txt"))

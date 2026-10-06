@@ -976,3 +976,51 @@ class TestImportHasNoSideEffects:
         assert result.returncode == 0, result.stderr
         assert not (tmp_path / "unexpected-logger-db.db").exists()
         assert not (tmp_path / "adclicker.db").exists()
+
+
+class TestOwnDomain:
+    """behavior.own_domain (план §5, фаза 13): наш домен в чёрном списке.
+
+    Нормализация строки до хоста — задача ``utils.get_domains`` (legacy
+    читает её же), здесь важно ровно то, что поле есть в схеме, читается,
+    пишется и не ломает конфиг прошлой версии без ключа.
+    """
+
+    def test_default_is_empty(self):
+        assert config_module.default_config()["behavior"]["own_domain"] == ""
+
+    @pytest.mark.parametrize("value", ["edelind.de", "https://www.edelind.de/goldkette", ""])
+    def test_accepts_any_string(self, value):
+        cfg = Config.from_dict(_raw(behavior__own_domain=value))
+
+        assert cfg.get("behavior.own_domain") == value
+
+    def test_config_without_the_key_loads_with_default(self):
+        raw = _raw()
+        del raw["behavior"]["own_domain"]
+
+        assert Config.from_dict(raw).get("behavior.own_domain") == ""
+
+    def test_rejects_non_string(self):
+        with pytest.raises(ConfigError) as excinfo:
+            Config.from_dict(_raw(behavior__own_domain=42))
+
+        assert [problem["field"] for problem in excinfo.value.problems] == [
+            "behavior.own_domain"
+        ]
+
+    def test_patch_changes_only_this_field(self):
+        cfg = Config.from_dict(_raw())
+
+        patched = cfg.patch({"behavior": {"own_domain": "edelind.de"}})
+
+        assert patched.get("behavior.own_domain") == "edelind.de"
+        assert cfg.get("behavior.own_domain") == ""
+        assert patched.get("behavior.excludes") == cfg.get("behavior.excludes")
+
+    def test_repository_config_json_has_the_key(self):
+        repo_config = json.loads(
+            (Path(__file__).resolve().parents[3] / "config.json").read_text(encoding="utf-8")
+        )
+
+        assert repo_config["behavior"]["own_domain"] == ""

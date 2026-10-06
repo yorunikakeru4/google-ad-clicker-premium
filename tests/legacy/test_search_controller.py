@@ -488,20 +488,89 @@ def test_get_non_ad_links_keeps_link_without_svg_children(make_search_controller
     assert controller._get_non_ad_links([]) == [link]
 
 
-def test_get_non_ad_links_filters_by_given_domains(make_search_controller):
-    wanted = make_link("http://www.booking.com/hotel")
+def test_get_non_ad_links_skips_blocked_domains(make_search_controller):
+    # Список — чёрный: ссылки на домен из списка не кликаются вовсе.
+    blocked = make_link("http://www.edelind.de/goldkette")
     other = make_link("http://shop.example/product")
-    controller = make_search_controller(driver=FakeDriver(links=[wanted, other]))
+    controller = make_search_controller(driver=FakeDriver(links=[blocked, other]))
 
-    assert controller._get_non_ad_links([], ["www.booking.com"]) == [wanted]
+    assert controller._get_non_ad_links([], ["edelind.de"]) == [other]
 
 
-def test_get_non_ad_links_returns_every_matching_link_when_domains_given(make_search_controller):
+def test_get_non_ad_links_keeps_links_when_only_other_domains_blocked(make_search_controller):
     first = make_link("http://www.booking.com/hotel/1")
     second = make_link("http://www.booking.com/hotel/2")
     controller = make_search_controller(driver=FakeDriver(links=[first, second]))
 
-    assert controller._get_non_ad_links([], ["booking"]) == [first, second]
+    assert controller._get_non_ad_links([], ["edelind.de"]) == [first, second]
+
+
+def test_get_non_ad_links_caps_result_to_three_links_with_blocked_domains(make_search_controller):
+    links = [make_link(f"http://shop{index}.example/product") for index in range(6)]
+    controller = make_search_controller(driver=FakeDriver(links=links))
+
+    result = controller._get_non_ad_links([], ["edelind.de"])
+
+    assert len(result) == 3
+    assert all(any(item is original for original in links) for item in result)
+
+
+def test_get_non_ad_links_skips_link_blocked_by_two_entries(make_search_controller):
+    link = make_link("http://www.booking.com/hotel")
+    controller = make_search_controller(driver=FakeDriver(links=[link]))
+
+    assert controller._get_non_ad_links([], ["booking.com", "www.booking.com"]) == []
+
+
+def test_get_non_ad_links_skips_exclude_word_in_href(
+    make_search_controller, monkeypatch, behavior
+):
+    monkeypatch.setattr(behavior, "excludes", "edelind")
+    blocked = make_link("http://www.edelind.de/goldkette")
+    other = make_link("http://shop.example/product")
+    controller = make_search_controller(driver=FakeDriver(links=[blocked, other]))
+    # Слово из behavior.excludes действует и без файлового списка доменов.
+    controller._blocked_domains = []
+
+    assert controller._get_non_ad_links([]) == [other]
+
+
+def test_get_non_ad_links_skips_exclude_word_in_link_text(
+    make_search_controller, monkeypatch, behavior
+):
+    monkeypatch.setattr(behavior, "excludes", "goldkette")
+    blocked = FakeElement(
+        attributes={
+            "href": "http://shop.example/a",
+            "role": "presentation",
+            "jsname": "UWckNb",
+            "data-ved": "2eVUEQ",
+        },
+        text="Edelind Goldkette",
+    )
+    other = FakeElement(
+        attributes={
+            "href": "http://shop.example/b",
+            "role": "presentation",
+            "jsname": "UWckNb",
+            "data-ved": "2eVUEQ",
+        },
+        text="Wireless Keyboard",
+    )
+    controller = make_search_controller(driver=FakeDriver(links=[blocked, other]))
+
+    assert controller._get_non_ad_links([]) == [other]
+
+
+def test_get_non_ad_links_uses_blocked_domains_stored_by_search_for_ads(
+    make_search_controller,
+):
+    blocked = make_link("http://www.edelind.de/goldkette")
+    other = make_link("http://shop.example/product")
+    controller = make_search_controller(driver=FakeDriver(links=[blocked, other]))
+    controller._blocked_domains = ["edelind.de"]
+
+    assert controller._get_non_ad_links([]) == [other]
 
 
 def test_get_non_ad_links_caps_result_to_three_links_without_domain_filter(
@@ -521,22 +590,6 @@ def test_get_non_ad_links_keeps_all_links_when_three_or_fewer(make_search_contro
     controller = make_search_controller(driver=FakeDriver(links=links))
 
     assert controller._get_non_ad_links([]) == links
-
-
-def test_get_non_ad_links_does_not_cap_matching_links_when_domain_filter_given(
-    make_search_controller,
-):
-    links = [make_link(f"http://www.booking.com/hotel/{index}") for index in range(6)]
-    controller = make_search_controller(driver=FakeDriver(links=links))
-
-    assert len(controller._get_non_ad_links([], ["www.booking.com"])) == 6
-
-
-def test_get_non_ad_links_does_not_duplicate_link_for_two_matching_domains(make_search_controller):
-    link = make_link("http://www.booking.com/hotel")
-    controller = make_search_controller(driver=FakeDriver(links=[link]))
-
-    assert controller._get_non_ad_links([], ["booking", "www.booking.com"]) == [link]
 
 
 # --- end_search -------------------------------------------------------------------
@@ -652,6 +705,126 @@ def test_ad_links_are_dropped_when_query_ends_with_empty_filter_word(make_search
 
     assert controller._get_ad_links() == []
     assert controller._stats.num_filtered_ads == 0
+
+
+# --- _get_ad_links: чёрный список доменов и слов ---------------------------------
+
+
+def test_ad_links_dropped_when_href_is_blocked_domain(make_search_controller):
+    driver = ScrolledAdsDriver(
+        make_ad("Wireless Keyboard Sale", link="https://www.edelind.de/goldkette")
+    )
+    controller = make_search_controller(query="wireless keyboard", driver=driver)
+    controller._blocked_domains = ["edelind.de"]
+
+    assert controller._get_ad_links() == []
+    assert controller._stats.num_excluded_ads == 1
+
+
+def test_ad_links_kept_when_href_is_other_domain(make_search_controller):
+    driver = ScrolledAdsDriver(make_ad("Wireless Keyboard Sale"))
+    controller = make_search_controller(query="wireless keyboard", driver=driver)
+    controller._blocked_domains = ["edelind.de"]
+
+    assert len(controller._get_ad_links()) == 1
+    assert controller._stats.num_excluded_ads == 0
+
+
+def test_ad_links_dropped_when_exclude_word_in_title(
+    make_search_controller, monkeypatch, behavior
+):
+    monkeypatch.setattr(behavior, "excludes", "edelind")
+    driver = ScrolledAdsDriver(make_ad("Edelind Goldkette Sale"))
+    controller = make_search_controller(query="wireless keyboard", driver=driver)
+
+    assert controller._get_ad_links() == []
+    assert controller._stats.num_excluded_ads == 1
+
+
+def test_ad_links_dropped_when_exclude_word_in_href(
+    make_search_controller, monkeypatch, behavior
+):
+    monkeypatch.setattr(behavior, "excludes", "goldkette")
+    driver = ScrolledAdsDriver(
+        make_ad("Wireless Keyboard Sale", link="https://shop.example/goldkette")
+    )
+    controller = make_search_controller(query="wireless keyboard", driver=driver)
+
+    assert controller._get_ad_links() == []
+    assert controller._stats.num_excluded_ads == 1
+
+
+# --- _get_shopping_ad_links: чёрный список ---------------------------------------
+
+
+class ShoppingUnit:
+    """Мобильный блок shopping-рекламы: контейнер со ссылкой и заголовком."""
+
+    def __init__(self, href, title):
+        self.text = title
+        self._anchor = FakeElement(attributes={"href": href}, text=title)
+
+    def find_element(self, by, value=None):
+        return self._anchor
+
+
+class ShoppingAdsDriver(FakeDriver):
+    """Драйвер, отдающий готовые shopping-блоки по любому селектору."""
+
+    def __init__(self, units):
+        super().__init__()
+        self.units = [ShoppingUnit(*unit) for unit in units]
+
+    def find_elements(self, by, value=None):
+        return list(self.units)
+
+
+def test_shopping_ads_dropped_when_target_is_blocked_domain(make_search_controller):
+    driver = ShoppingAdsDriver(
+        [
+            ("https://www.edelind.de/goldkette", "Goldkette 75cm"),
+            ("https://shop.example/keyboard", "Wireless Keyboard"),
+        ]
+    )
+    controller = make_search_controller(query="wireless keyboard", driver=driver)
+    controller._blocked_domains = ["edelind.de"]
+
+    result = controller._get_shopping_ad_links()
+
+    assert [entry[1] for entry in result] == ["https://shop.example/keyboard"]
+    assert controller._stats.num_excluded_shopping_ads == 1
+
+
+def test_shopping_ads_dropped_when_exclude_word_in_title(
+    make_search_controller, monkeypatch, behavior
+):
+    monkeypatch.setattr(behavior, "excludes", "goldkette")
+    driver = ShoppingAdsDriver(
+        [
+            ("https://shop.example/a", "Edelind Goldkette"),
+            ("https://shop.example/b", "Wireless Keyboard"),
+        ]
+    )
+    controller = make_search_controller(query="wireless keyboard", driver=driver)
+
+    result = controller._get_shopping_ad_links()
+
+    assert [entry[2] for entry in result] == ["Wireless Keyboard"]
+    assert controller._stats.num_excluded_shopping_ads == 1
+
+
+def test_search_for_ads_stores_blocked_domains(make_search_controller, monkeypatch):
+    controller = make_search_controller()
+
+    def stop(*args, **kwargs):
+        raise StopBeforeSearch()
+
+    monkeypatch.setattr(controller, "_apply_cookies", stop, raising=False)
+
+    with pytest.raises(StopBeforeSearch):
+        controller.search_for_ads(blocked_domains=["edelind.de"])
+
+    assert controller._blocked_domains == ["edelind.de"]
 
 
 # --- Известные баги: тесты зафиксированы как xfail ---------------------------------
@@ -886,7 +1059,7 @@ class TestProfileCookies:
         monkeypatch.setattr(controller, "_apply_cookies", stop, raising=False)
 
         with pytest.raises(StopBeforeSearch):
-            controller.search_for_ads(non_ad_domains=[])
+            controller.search_for_ads(blocked_domains=[])
 
         assert calls == ["cookies"], "cookies применяются до первой работы со страницей"
 
@@ -1177,7 +1350,7 @@ class TestSearchRoundFailures:
         controller = make_search_controller(driver=driver)
 
         with pytest.raises(SearchRoundError):
-            controller.search_for_ads(non_ad_domains=[])
+            controller.search_for_ads(blocked_domains=[])
 
     def test_search_box_never_ready_raises(self, make_search_controller, monkeypatch):
         monkeypatch.setattr(search_controller, "SEARCH_BOX_WAIT_TIMEOUT_S", 0.01)
@@ -1185,7 +1358,7 @@ class TestSearchRoundFailures:
         controller = make_search_controller(driver=driver)
 
         with pytest.raises(SearchRoundError):
-            controller.search_for_ads(non_ad_domains=[])
+            controller.search_for_ads(blocked_domains=[])
 
     def test_results_timeout_raises_instead_of_returning_empty(
         self, make_search_controller, monkeypatch
@@ -1195,4 +1368,4 @@ class TestSearchRoundFailures:
         controller = make_search_controller(driver=driver)
 
         with pytest.raises(SearchRoundError):
-            controller.search_for_ads(non_ad_domains=[])
+            controller.search_for_ads(blocked_domains=[])

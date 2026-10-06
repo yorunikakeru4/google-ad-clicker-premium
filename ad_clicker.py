@@ -165,7 +165,8 @@ def run_scenario(
         # Общий логгер процесса: все записи модулей ниже получают --id.
         log.bind(browser_id)
 
-    domains = get_domains()
+    # Чёрный список клика (план §5, фаза 13): domains.txt + behavior.own_domain.
+    blocked_domains = get_domains()
 
     # UA применяется только из профиля. Без профиля фолбэк None: Chrome
     # отдаёт честную строку — прежний подбор ставил в --user-agent устаревшие
@@ -282,7 +283,9 @@ def run_scenario(
         if device_id:
             search_controller.assign_android_device(device_id)
 
-        ads, non_ad_links, shopping_ads = search_controller.search_for_ads(non_ad_domains=domains)
+        ads, non_ad_links, shopping_ads = search_controller.search_for_ads(
+            blocked_domains=blocked_domains
+        )
 
         if config.behavior.hooks_enabled:
             hooks.after_search_hook(driver)

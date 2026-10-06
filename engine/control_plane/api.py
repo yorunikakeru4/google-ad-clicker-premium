@@ -60,6 +60,14 @@ from engine.proxy_pool import (
     ProxyNotFoundError,
     ProxyPool,
 )
+from engine.wordlist import (
+    WordlistError,
+    add_items,
+    clean_domain,
+    clean_query,
+    delete_items,
+    read_items,
+)
 
 # Имя переменной окружения с токеном.
 TOKEN_ENV_VAR = "ADCLICKER_CONTROL_TOKEN"
@@ -75,6 +83,11 @@ PROTOCOL_VERSION = 1
 
 # Единственный адрес, на котором демон себя слушает.
 LOOPBACK_HOST = "127.0.0.1"
+
+# Имена файлов списков по умолчанию — из той же логики, что и дефолты
+# ``_SCHEMA``: используются, когда путь в конфиге пуст (чистая установка).
+DEFAULT_QUERIES_FILE = "queries.txt"
+DEFAULT_DOMAINS_FILE = "domains.txt"
 
 # Потолок тела запроса. Конфиг небольшой, а лимит защищает демон от запроса,
 # который съел бы память целиком.
@@ -248,6 +261,10 @@ class ControlPlaneHandler(BaseHTTPRequestHandler):
             self._send_json(400, _error("invalid_json", str(exc)))
         except InvalidRequestError as exc:
             self._send_json(400, _error("invalid_request", str(exc)))
+        except WordlistError as exc:
+            # Причина из файловой системы (нет каталога, нет прав): сообщение
+            # уходит как есть, статус — из контракта самого исключения.
+            self._send_json(exc.status, _error(exc.code, str(exc)))
         except ConfigError as exc:
             # Отдельная ветка, а не вместе с SupervisorError: ConfigError —
             # это ValueError, и без неё невалидный конфиг уехал бы в 500.
@@ -410,10 +427,7 @@ class ControlPlaneHandler(BaseHTTPRequestHandler):
         path = self._proxy_file_setting()
         if not path:
             raise InvalidRequestError("paths.proxy_file не задан в конфиге")
-        source = Path(path)
-        if not source.is_absolute():
-            source = Path.cwd() / source
-        self._send_json(200, {"path": str(source), "exists": source.is_file()})
+        self._send_json(200, self._file_payload(path))
 
     def _proxy_file_setting(self) -> str:
         """``paths.proxy_file`` из конфига; пустая строка — значение не задано.
@@ -452,6 +466,188 @@ class ControlPlaneHandler(BaseHTTPRequestHandler):
         # CheckInProgressError отсюда уходит в 409 check_in_progress.
         self.proxy_checker.start()
         self._send_json(200, {"started": True})
+
+    # --- списки: запросы (Key Words) и домены -------------------------------
+
+    # Контракт обоих списков (план §5, фаза 13):
+    #
+    #   GET  /control/queries         — {queries, source, query_file, query}
+    #   POST /control/queries         — {lines: [...]}  → {added, skipped, ...}
+    #   POST /control/queries/delete  — {queries: [...]} | {all: true}
+    #   GET  /control/queries/file    — {path, exists}
+    #
+    #   GET  /control/domains         — {domains, filtered_domains, own_domain, excludes}
+    #   POST /control/domains         — {lines: [...]}
+    #   POST /control/domains/delete  — {domains: [...]} | {all: true}
+    #   GET  /control/domains/file    — {path, exists}
+    #
+    # Источник истины — файлы (``paths.query_file``, ``paths.filtered_domains``):
+    # движок читает их напрямую, поэтому список живёт в файле, а не в БД.
+    # Настройки вокруг списков (``behavior.own_domain``, ``behavior.excludes``)
+    # — поля config.json и идут общим POST /control/config.
+
+    def _queries_file_setting(self) -> str:
+        """``paths.query_file``; пустая строка — работает одиночный запрос."""
+        return str(self.config.get("paths.query_file") or "")
+
+    def _domains_file_setting(self) -> str:
+        """``paths.filtered_domains``; пустая строка — значение не задано."""
+        return str(self.config.get("paths.filtered_domains") or "")
+
+    @staticmethod
+    def _resolve_path(setting: str) -> Path:
+        """Путь файла из конфига относительно каталога демона.
+
+        Относительные пути в ``config.json`` читает legacy-код от текущего
+        каталога процесса — резолвить их нужно от того же каталога, иначе
+        демон писал бы список туда, откуда воркер его не прочитает.
+        """
+        source = Path(setting)
+        return source if source.is_absolute() else Path.cwd() / source
+
+    @classmethod
+    def _file_payload(cls, setting: str) -> dict[str, Any]:
+        """``{path, exists}`` для кнопки «открыть в системе».
+
+        Абсолютный путь отдаёт демон (см. ``_handle_proxies_file``), а
+        ``exists`` грузится намеренно: файла может ещё не быть, и UI
+        показывает «файл не найден» вместо ошибки opener'а.
+        """
+        source = cls._resolve_path(setting)
+        return {"path": str(source), "exists": source.is_file()}
+
+    def _requested_wordlist_targets(self, key: str) -> tuple[list[str], bool]:
+        """Тело удаления списка: значения по ключу либо ``{"all": true}``.
+
+        Пустой массив — ошибка: это не «удалить всё» (для этого есть
+        ``all``), а запрос без содержимого, и молчаливое превращение его в
+        no-op скрыло бы опечатку в UI.
+        """
+        body = self._read_optional_object()
+        if body.get("all") is True:
+            return [], True
+        targets = body.get(key)
+        if (
+            not isinstance(targets, list)
+            or not targets
+            or not all(isinstance(item, str) for item in targets)
+        ):
+            raise InvalidRequestError(
+                f'ожидается непустой массив строк "{key}" либо {{"all": true}}'
+            )
+        return targets, False
+
+    def _handle_queries_list(self) -> None:
+        path = self._queries_file_setting()
+        self._send_json(
+            200,
+            {
+                "queries": read_items(self._resolve_path(path), clean_query) if path else [],
+                "source": "file" if path else "single",
+                "query_file": path,
+                "query": str(self.config.get("behavior.query") or ""),
+            },
+        )
+
+    def _handle_queries_add(self) -> None:
+        """Добавить запросы; при пустом пути или одиночном запросе источник переключается на файл.
+
+        Одиночный запрос (``behavior.query``) не теряется: он первым строкой
+        переезжает в файл, который создаётся до патча конфига — воркер
+        перечитывает путь после замены ссылки и не должен наткнуться на
+        отсутствующий файл.
+        """
+        lines = self._requested_lines()
+        current_path = self._queries_file_setting()
+        single = str(self.config.get("behavior.query") or "")
+        path = current_path or DEFAULT_QUERIES_FILE
+
+        seed = [single] if single else []
+        result = add_items(self._resolve_path(path), [*seed, *lines], clean=clean_query)
+
+        switched = not current_path or bool(single)
+        if switched:
+            self.control.patch_config(
+                {"paths": {"query_file": path}, "behavior": {"query": ""}}
+            )
+
+        self._send_json(
+            200,
+            {
+                **result,
+                "source": "file",
+                "query_file": path,
+                "switched": switched,
+            },
+        )
+
+    def _handle_queries_delete(self) -> None:
+        path = self._queries_file_setting()
+        if not path:
+            raise InvalidRequestError("paths.query_file не задан — список запросов не ведётся")
+        targets, delete_all = self._requested_wordlist_targets("queries")
+        self._send_json(
+            200,
+            delete_items(
+                self._resolve_path(path), targets, clean=clean_query, delete_all=delete_all
+            ),
+        )
+
+    def _handle_queries_file(self) -> None:
+        path = self._queries_file_setting()
+        if not path:
+            raise InvalidRequestError("paths.query_file не задан в конфиге")
+        self._send_json(200, self._file_payload(path))
+
+    def _handle_domains_list(self) -> None:
+        path = self._domains_file_setting()
+        self._send_json(
+            200,
+            {
+                "domains": read_items(self._resolve_path(path), clean_domain) if path else [],
+                "filtered_domains": path,
+                # Настройки чёрного списка — поля config.json; отдаются здесь
+                # для карточки настроек на том же экране.
+                "own_domain": str(self.config.get("behavior.own_domain") or ""),
+                "excludes": str(self.config.get("behavior.excludes") or ""),
+            },
+        )
+
+    def _handle_domains_add(self) -> None:
+        lines = self._requested_lines()
+        current_path = self._domains_file_setting()
+        path = current_path or DEFAULT_DOMAINS_FILE
+
+        result = add_items(self._resolve_path(path), lines, clean=clean_domain)
+
+        switched = not current_path
+        if switched:
+            self.control.patch_config({"paths": {"filtered_domains": path}})
+
+        self._send_json(
+            200,
+            {**result, "filtered_domains": path, "switched": switched},
+        )
+
+    def _handle_domains_delete(self) -> None:
+        path = self._domains_file_setting()
+        if not path:
+            raise InvalidRequestError(
+                "paths.filtered_domains не задан — список доменов не ведётся"
+            )
+        targets, delete_all = self._requested_wordlist_targets("domains")
+        self._send_json(
+            200,
+            delete_items(
+                self._resolve_path(path), targets, clean=clean_domain, delete_all=delete_all
+            ),
+        )
+
+    def _handle_domains_file(self) -> None:
+        path = self._domains_file_setting()
+        if not path:
+            raise InvalidRequestError("paths.filtered_domains не задан в конфиге")
+        self._send_json(200, self._file_payload(path))
 
     # --- профили ---------------------------------------------------------
 
@@ -788,6 +984,14 @@ _ROUTES: dict[tuple[str, str], str] = {
     ("GET", "/control/proxies/file"): "_handle_proxies_file",
     ("POST", "/control/proxies/delete"): "_handle_proxies_delete",
     ("POST", "/control/proxies/check"): "_handle_proxies_check",
+    ("GET", "/control/queries"): "_handle_queries_list",
+    ("POST", "/control/queries"): "_handle_queries_add",
+    ("POST", "/control/queries/delete"): "_handle_queries_delete",
+    ("GET", "/control/queries/file"): "_handle_queries_file",
+    ("GET", "/control/domains"): "_handle_domains_list",
+    ("POST", "/control/domains"): "_handle_domains_add",
+    ("POST", "/control/domains/delete"): "_handle_domains_delete",
+    ("GET", "/control/domains/file"): "_handle_domains_file",
     ("GET", "/control/profiles"): "_handle_profiles_list",
     ("POST", "/control/profiles"): "_handle_profiles_add",
     ("POST", "/control/profiles/import"): "_handle_profiles_import",

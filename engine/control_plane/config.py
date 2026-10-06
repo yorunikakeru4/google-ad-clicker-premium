@@ -85,6 +85,9 @@ _SCHEMA: dict[str, dict[str, tuple[type | tuple[type, ...], Any]]] = {
         "max_scroll_limit": (int, 0),
         "check_shopping_ads": (bool, True),
         "excludes": (str, ""),
+        # Наш домен (план §5, фаза 13): в чёрный список клика он попадает
+        # сам, через utils.get_domains, держать его в domains.txt руками не нужно.
+        "own_domain": (str, ""),
         "random_mouse": (bool, False),
         "custom_cookies": (bool, False),
         "click_order": (int, 5),
