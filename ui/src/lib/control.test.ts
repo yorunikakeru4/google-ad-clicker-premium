@@ -6,10 +6,12 @@ import {
   controlRequest,
   diagnosticsRequest,
   disabledReason,
+  domainsRequest,
   errorMessage,
   offlineBannerText,
   profilesRequest,
   proxiesRequest,
+  queriesRequest,
   toStatusView,
   type StatusView,
 } from "./control";
@@ -484,5 +486,62 @@ describe("offlineBannerText", () => {
       "Нет связи с демоном: не найден config.json. Данные на экранах могут быть устаревшими.",
     );
     expect(text).not.toContain("..");
+  });
+});
+
+describe("wordlistRequest", () => {
+  it("каждое действие списка уходит на свой endpoint с телом контракта", () => {
+    // Один билдер на оба списка: различаются только базовый путь и ключ тела.
+    expect(queriesRequest({ kind: "list" })).toEqual({
+      method: "GET",
+      path: "/control/queries",
+    });
+    expect(queriesRequest({ kind: "add", lines: ["usb hub", "webcam"] })).toEqual({
+      method: "POST",
+      path: "/control/queries",
+      body: JSON.stringify({ lines: ["usb hub", "webcam"] }),
+    });
+    // Ключ тела — имя списка: демон ждёт {"queries": [...]} и {"domains": [...]}.
+    expect(queriesRequest({ kind: "delete", values: ["usb hub"] })).toEqual({
+      method: "POST",
+      path: "/control/queries/delete",
+      body: JSON.stringify({ queries: ["usb hub"] }),
+    });
+    expect(domainsRequest({ kind: "delete", values: ["edelind.de"] })).toEqual({
+      method: "POST",
+      path: "/control/domains/delete",
+      body: JSON.stringify({ domains: ["edelind.de"] }),
+    });
+    // «Всё» собирает демон: тело не растёт с размером списка.
+    expect(queriesRequest({ kind: "deleteAll" })).toEqual({
+      method: "POST",
+      path: "/control/queries/delete",
+      body: '{"all":true}',
+    });
+    expect(domainsRequest({ kind: "file" })).toEqual({
+      method: "GET",
+      path: "/control/domains/file",
+    });
+  });
+
+  it("пути состоят из строчных сегментов — проходят allowlist control.rs", () => {
+    for (const request of [
+      queriesRequest({ kind: "list" }),
+      queriesRequest({ kind: "add", lines: ["q"] }),
+      queriesRequest({ kind: "delete", values: ["q"] }),
+      queriesRequest({ kind: "deleteAll" }),
+      queriesRequest({ kind: "file" }),
+      domainsRequest({ kind: "list" }),
+      domainsRequest({ kind: "add", lines: ["d.de"] }),
+      domainsRequest({ kind: "delete", values: ["d.de"] }),
+      domainsRequest({ kind: "deleteAll" }),
+      domainsRequest({ kind: "file" }),
+    ]) {
+      const tail = request.path.replace(/^\/control\//, "");
+      expect(tail).not.toBe("");
+      for (const segment of tail.split("/")) {
+        expect(segment, request.path).toMatch(/^[a-z]+$/);
+      }
+    }
   });
 });

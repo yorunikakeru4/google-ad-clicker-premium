@@ -17,6 +17,8 @@ import MetricCard from "../components/data/MetricCard.vue";
 import SettingField from "../components/forms/SettingField.vue";
 import DashboardView from "./DashboardView.vue";
 import DiagnosticsView from "./DiagnosticsView.vue";
+import DomainsView from "./DomainsView.vue";
+import KeyWordsView from "./KeyWordsView.vue";
 import LogsView from "./LogsView.vue";
 import ProfilesView from "./ProfilesView.vue";
 import ProxiesView from "./ProxiesView.vue";
@@ -328,5 +330,59 @@ describe("экраны на шаблоне", () => {
     expect(html).toContain("Нижняя граница случайной паузы на странице с рекламой");
     expect(html).toContain("Время ежедневной очистки");
     expect(html).toContain("Периодичность очистки профилей");
+  });
+
+  it("Key Words: карточка источника, таблица и пустое состояние без данных", async () => {
+    const html = await render(KeyWordsView);
+
+    expect(html).toContain("Key Words");
+    for (const hook of [
+      "keywords-add",
+      "keywords-delete-all",
+      "keywords-open-file",
+      "keywords-empty",
+    ]) {
+      expect(html).toContain(`data-test="${hook}"`);
+    }
+
+    // до первого ответа демона: ни ошибок, ни итогов, ни источника
+    expect(html).not.toContain("keywords-action-error");
+    expect(html).not.toContain("keywords-add-result");
+    expect(html).not.toContain("keywords-delete-result");
+    expect(html).not.toContain("keywords-source-single");
+    expect(html).not.toContain("keywords-source-file");
+    expect(html).not.toContain("Списком здесь управлять нельзя");
+    // диалоги закрыты: v-dialog не рисует содержимое до открытия
+    expect(html).not.toContain("keywords-add-dialog");
+    expect(html).not.toContain("keywords-delete-dialog");
+    expect(html).not.toContain("keywords-bulk-delete-dialog");
+  });
+
+  it("Domains: таблица, карточка настроек и пустое состояние без данных", async () => {
+    const html = await render(DomainsView);
+
+    expect(html).toContain("Domains");
+    for (const hook of [
+      "domains-add",
+      "domains-delete-all",
+      "domains-open-file",
+      "domains-empty",
+      "domains-settings",
+      "domains-settings-save",
+    ]) {
+      expect(html).toContain(`data-test="${hook}"`);
+    }
+
+    // ни ошибок, ни итогов, ни открытых диалогов — экран только открылся
+    expect(html).not.toContain("domains-action-error");
+    expect(html).not.toContain("domains-add-result");
+    expect(html).not.toContain("domains-delete-result");
+    expect(html).not.toContain("domains-settings-error");
+    expect(html).not.toContain("domains-settings-success");
+    expect(html).not.toContain("domains-add-dialog");
+    expect(html).not.toContain("domains-delete-dialog");
+    expect(html).not.toContain("domains-bulk-delete-dialog");
+    // подсказка о семантике чёрного списка есть всегда
+    expect(html).toContain("Наш домен блокируется автоматически");
   });
 });

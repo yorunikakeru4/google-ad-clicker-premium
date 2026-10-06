@@ -16,7 +16,8 @@ export interface NavItem {
 const history = createWebHashHistory();
 
 // Единственный источник для роутера и бокового меню: семь экранов
-// дизайн-спецификации §3.1, порядок — как в ТЗ. Роуты ленивые.
+// дизайн-спецификации §3.1 (порядок — как в ТЗ) плюс Domains и Key Words
+// (план §5, фаза 13). Роуты ленивые.
 export const NAV_ITEMS: NavItem[] = [
   {
     path: "/",
@@ -35,6 +36,18 @@ export const NAV_ITEMS: NavItem[] = [
     title: "Proxies",
     icon: "mdi-earth",
     component: () => import("../views/ProxiesView.vue"),
+  },
+  {
+    path: "/domains",
+    title: "Domains",
+    icon: "mdi-domain",
+    component: () => import("../views/DomainsView.vue"),
+  },
+  {
+    path: "/keywords",
+    title: "Key Words",
+    icon: "mdi-key-variant",
+    component: () => import("../views/KeyWordsView.vue"),
   },
   {
     path: "/tasks",
