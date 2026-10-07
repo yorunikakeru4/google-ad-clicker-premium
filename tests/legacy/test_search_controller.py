@@ -1295,6 +1295,249 @@ class TestCloseCookieDialog:
         assert driver.clicks == [], "нет признака баннера — кнопки не ищутся"
 
 
+# --- _warm_up_session: анти-капча прогрев сессии перед первым поиском --------------
+
+WARM_CONSENT_URL = "https://consent.google.com/m?continue=https%3A%2F%2Fwww.google.de%2F"
+
+
+class WarmUpConsentButton:
+    """Кнопка consent-страницы: клик уводит браузер на главную Google."""
+
+    def __init__(self, label, driver):
+        self.text = label
+        self._driver = driver
+
+    def get_attribute(self, name):
+        return None
+
+    def click(self):
+        self._driver.consent_accepted(self.text)
+
+
+class WarmUpConsentDriver(FakeDriver):
+    """Драйвер прогрева: свежий браузер уводит на consent, клик возвращает домой.
+
+    Модель прод-сценария EU-локации: ``get(главная)`` для браузера без cookies
+    согласия заканчивается на ``consent.google.com`` (как настоящий редирект
+    Google). Как только в jar появляется ``SOCS``/``CONSENT``, загрузка главной
+    больше не редиректит. ``navigates_on_accept=False`` — согласие принято, но
+    со страницы Google не увёл: тогда контроллер обязан вернуться на главную сам.
+
+    ``policies_link`` — признак cookie-баннера на главной (тот же, что ищет
+    ``_close_cookie_dialog``); ``settle_consent=False`` — клик не даёт cookies
+    (CMP не подключила обработчики), как бывает на живом прогоне.
+    """
+
+    CONSENT_COOKIE_NAMES = ("SOCS", "CONSENT")
+
+    def __init__(
+        self,
+        *,
+        buttons=("Verwalten Sie Ihre Daten", "Alle akzeptieren"),
+        cookies=(),
+        redirect_to_consent=True,
+        navigates_on_accept=True,
+        policies_link=False,
+        settle_consent=True,
+    ):
+        super().__init__()
+        self.clicks = []
+        self.navigates_on_accept = navigates_on_accept
+        self.policies_link = policies_link
+        self.settle_consent = settle_consent
+        self.browser_cookies = [dict(cookie) for cookie in cookies]
+        self.redirect_to_consent = redirect_to_consent
+        self.home_url = None
+        self.current_url = WARM_CONSENT_URL
+        self._buttons = [WarmUpConsentButton(label, self) for label in buttons]
+
+    @property
+    def _consent_given(self):
+        """Cookies согласия уже лежат в jar: редирект на consent не нужен."""
+
+        return any(
+            cookie.get("name") in self.CONSENT_COOKIE_NAMES
+            for cookie in self.browser_cookies
+        )
+
+    def get(self, url):
+        super().get(url)
+        self.home_url = url
+        self.current_url = url if (self._consent_given or not self.redirect_to_consent) else WARM_CONSENT_URL
+
+    def find_elements(self, by, value=None):
+        if by == By.TAG_NAME and value == "button":
+            return list(self._buttons)
+        if by == By.TAG_NAME and value == "a":
+            if self.policies_link:
+                return [FakeElement(attributes={"href": "https://policies.google.com/privacy"})]
+            return []
+        return []
+
+    def get_cookies(self):
+        return [dict(cookie) for cookie in self.browser_cookies]
+
+    def consent_accepted(self, label):
+        """Клик «принять»: Google ставит SOCS и (обычно) уводит на главную."""
+
+        self.clicks.append(label)
+        if self.settle_consent:
+            self.browser_cookies.append({"name": "SOCS", "value": "consent-ok"})
+        if self.navigates_on_accept:
+            self.current_url = self.home_url
+
+
+class TestWarmUpSession:
+    """Прогрев: consent принят, cookies в профиле, повторный вызов — no-op."""
+
+    def test_consent_page_is_accepted_and_cookies_are_saved(
+        self, make_search_controller, assign_profile
+    ):
+        """Consent-страница → клик «Alle akzeptieren» и cookies в файл профиля."""
+
+        profile_id = assign_profile()
+        driver = WarmUpConsentDriver()
+        controller = make_search_controller(driver=driver)
+        visited_before = list(driver.visited)
+
+        controller._warm_up_session()
+
+        assert driver.clicks == ["Alle akzeptieren"], "кликается только кнопка согласия"
+        assert driver.current_url == driver.home_url, "после согласия браузер на главной"
+        assert driver.visited == visited_before, "главная не перезагружается вхолостую"
+        saved = load_profile_cookies(profile_id)
+        assert any(cookie.get("name") == "SOCS" for cookie in saved), (
+            "cookies согласия сохранены в профиль для следующих заходов"
+        )
+        assert any("scrollBy" in script for script in driver.scripts), (
+            "после согласия — один безобидный скролл"
+        )
+
+    def test_without_consent_page_nothing_happens(
+        self, make_search_controller, assign_profile
+    ):
+        """Ни consent-страницы, ни cookies согласия — прогрев не делает ничего."""
+
+        profile_id = assign_profile()
+        driver = WarmUpConsentDriver(buttons=(), redirect_to_consent=False)
+        controller = make_search_controller(driver=driver)
+        visited_before = list(driver.visited)
+
+        controller._warm_up_session()
+
+        assert driver.clicks == [], "кнопки не нажимаются"
+        assert driver.visited == visited_before, "навигации нет"
+        assert driver.scripts == [], "скролла нет"
+        assert not profile_cookies_path(profile_id).exists(), "cookies не пересохраняются"
+
+    def test_second_call_is_a_no_op(self, make_search_controller, assign_profile):
+        """Повторный вызов при уже принятых cookies — no-op, прогрев один раз."""
+
+        profile_id = assign_profile()
+        driver = WarmUpConsentDriver()
+        controller = make_search_controller(driver=driver)
+
+        controller._warm_up_session()
+        clicks_after_first = list(driver.clicks)
+        visited_after_first = list(driver.visited)
+        scripts_after_first = list(driver.scripts)
+        saved_after_first = profile_cookies_path(profile_id).read_text(encoding="utf-8")
+
+        controller._warm_up_session()
+
+        assert driver.clicks == clicks_after_first, "второй вызов не кликает"
+        assert driver.visited == visited_after_first, "второй вызов не ходит по страницам"
+        assert driver.scripts == scripts_after_first, "второй вызов не скроллит"
+        assert (
+            profile_cookies_path(profile_id).read_text(encoding="utf-8") == saved_after_first
+        ), "второй вызов не переписывает cookies-файл"
+
+    def test_existing_consent_cookies_skip_the_click(
+        self, make_search_controller, assign_profile
+    ):
+        """Cookies согласия уже применены → только возврат на главную, без кликов."""
+
+        profile_id = assign_profile()
+        driver = WarmUpConsentDriver()
+        controller = make_search_controller(driver=driver)
+        # Страница consent открылась в __init__, а _apply_cookies уже положил
+        # в jar профильные cookies согласия — кликать повторно незачем.
+        driver.browser_cookies = [{"name": "SOCS", "value": "consent-ok"}]
+
+        controller._warm_up_session()
+
+        assert driver.clicks == [], "согласие уже принято — повторного клика нет"
+        assert driver.visited[-1] == driver.home_url, "страница consent уходит возвратом на главную"
+        assert not profile_cookies_path(profile_id).exists(), "ничего не пересохраняется"
+
+    def test_home_is_loaded_when_accept_does_not_navigate(
+        self, make_search_controller, monkeypatch
+    ):
+        """Согласие принято, но навигации не случилось — главная открыта вручную."""
+
+        monkeypatch.setattr(search_controller, "SEARCH_BOX_WAIT_TIMEOUT_S", 0.01)
+        driver = WarmUpConsentDriver(navigates_on_accept=False)
+        controller = make_search_controller(driver=driver)
+
+        controller._warm_up_session()
+
+        assert driver.clicks == ["Alle akzeptieren"]
+        assert driver.visited[-1] == driver.home_url, "контроллер сам вернулся на главную"
+        assert driver.current_url == driver.home_url
+
+    def test_consent_banner_is_accepted_before_the_first_query(
+        self, make_search_controller, assign_profile
+    ):
+        """Cookie-баннер на главной принимается и cookies оселятся до поиска.
+
+        Живой DE-выход не уводит на consent.google.com, а показывает баннер
+        «Bevor Sie zu Google weitergehen» — без его принятия браузер подходит
+        к первому запросу без consent-истории.
+        """
+
+        profile_id = assign_profile()
+        driver = WarmUpConsentDriver(
+            redirect_to_consent=False, policies_link=True, buttons=("Alle akzeptieren",)
+        )
+        controller = make_search_controller(driver=driver)
+        visited_before = list(driver.visited)
+
+        controller._warm_up_session()
+
+        assert driver.clicks == ["Alle akzeptieren"], "баннер принят до первого запроса"
+        saved = load_profile_cookies(profile_id)
+        assert any(cookie.get("name") == "SOCS" for cookie in saved), (
+            "сохраняются только осевшие cookies согласия"
+        )
+        assert driver.visited == visited_before, "баннер не требует навигации"
+        assert any("scrollBy" in script for script in driver.scripts), "после согласия — скролл"
+
+    def test_banner_without_settled_consent_cookies_saves_nothing(
+        self, make_search_controller, assign_profile, monkeypatch
+    ):
+        """Клик не дал cookies согласия — прогрев не сохраняет и не скроллит."""
+
+        monkeypatch.setattr(search_controller, "CONSENT_COOKIES_WAIT_TIMEOUT_S", 0.01)
+        profile_id = assign_profile()
+        driver = WarmUpConsentDriver(
+            redirect_to_consent=False,
+            policies_link=True,
+            buttons=("Alle akzeptieren",),
+            settle_consent=False,
+        )
+        controller = make_search_controller(driver=driver)
+
+        controller._warm_up_session()
+
+        assert driver.clicks, "клик по согласию был сделан"
+        assert not profile_cookies_path(profile_id).exists(), (
+            "непринятое согласие в профиль не пишется"
+        )
+        assert not any("scrollBy" in script for script in driver.scripts), (
+            "idle-действия только после осевших cookies"
+        )
+
+
 # --- _type_humanlike: лестница вместо молчаливого глотания -------------------------
 
 

@@ -6,6 +6,7 @@ from argparse import ArgumentParser
 from datetime import datetime
 from itertools import chain, filterfalse, zip_longest
 from pathlib import Path
+from time import sleep
 
 import hooks
 from clicklogs_db import ClickLogsDB
@@ -228,6 +229,10 @@ def run_scenario(
                 else "proxy pre-check failed"
             )
             return False
+        # probe и первый запрос браузера не должны идти впритык: два
+        # неавторизованных запроса с одного IP без паузы — тот самый ритм
+        # «probe → поиск» впритык, который читается как автоматизация.
+        sleep(random.uniform(0.5, 2.0))
 
     try:
         driver, country_code = create_webdriver(proxy, user_agent, plugin_folder_name)
@@ -250,7 +255,6 @@ def run_scenario(
     diagnostics_checkpoint(driver, browser_id)
 
     if check_stealth:
-        from time import sleep
         from webdriver import execute_stealth_js_code
 
         execute_stealth_js_code(driver)

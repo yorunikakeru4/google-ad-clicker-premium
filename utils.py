@@ -8,8 +8,9 @@ from datetime import datetime
 from enum import Enum
 from itertools import cycle
 from pathlib import Path
-from time import sleep
+from time import monotonic, sleep
 from typing import Optional
+from urllib.parse import quote_plus
 
 try:
     import requests
@@ -849,12 +850,46 @@ def get_locale_language(country_code: Optional[str]) -> Optional[str]:
 
 # Честный UA для probe-запроса: python-requests сам по себе уже аномалия,
 # а нам нужно отличить «IP в бане» от «клиент странный» — шлём как Chrome.
-_PROBE_UA = (
+# Версия варьируется в узком реалистичном диапазоне: одна и та же строка с
+# одного IP раз в две минуты — тоже сигнатура (отчёт по CAPTCHA, §4.5).
+_PROBE_UA_TEMPLATE = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
-    "(KHTML, like Gecko) Chrome/153.0.0.0 Safari/537.36"
+    "(KHTML, like Gecko) Chrome/{version}.0.0.0 Safari/537.36"
+)
+_PROBE_UA_VERSIONS = (150, 151, 152, 153, 154)
+
+# Безобидный бытовой запрос вместо фиксированного «proxy+health+check»:
+# постоянная health-check-строка с одного IP перед каждым раундом читается
+# как автоматизация так же уверенно, как и сам ритм «probe → поиск → клик».
+_PROBE_QUERIES = (
+    "weather today",
+    "news",
+    "map",
+    "cafes near me",
+    "recipe of the day",
 )
 
-_PROBE_URL = "https://www.google.com/search?q=proxy+health+check"
+# TTL кэша probe, сек: раунд занимает ~2 минуты, поэтому на сеть уходит один
+# запрос примерно на два раунда, а не на каждый (двойная нагрузка на exit IP
+# плюс сигнатурный запрос сразу перед браузерным поиском).
+_PROBE_CACHE_TTL = 240.0
+
+# Кэш «прокси → (момент последнего сетевого probe, результат)». Ключ — полная
+# строка прокси вместе с кредами: сессия в логине выбирает exit IP, поэтому
+# две строки с разными сессиями проверяются независимо.
+_probe_cache: dict[str, tuple[float, Optional[bool]]] = {}
+
+
+def _probe_url() -> str:
+    """URL probe-запроса: случайный безобидный query из списка."""
+
+    return f"https://www.google.com/search?q={quote_plus(random.choice(_PROBE_QUERIES))}"
+
+
+def _probe_user_agent() -> str:
+    """Честный Chrome-UA probe с вариацией версии в реалистичном диапазоне."""
+
+    return _PROBE_UA_TEMPLATE.format(version=random.choice(_PROBE_UA_VERSIONS))
 
 
 def probe_proxy_captcha(proxy: str, timeout: float = 10.0) -> Optional[bool]:
@@ -882,15 +917,34 @@ def probe_proxy_captcha(proxy: str, timeout: float = 10.0) -> Optional[bool]:
     капчи главнее кода ответа: ``/sorry/`` на ответе 429 — это капча,
     а не ошибка транспорта. Креды в логи не попадают — вызывающий маскирует
     сам.
+
+    Результат кэшируется по строке прокси на ``_PROBE_CACHE_TTL`` секунд:
+    повторный probe того же прокси внутри TTL отдаёт сохранённый исход без
+    сетевого запроса, то есть на сессию уходит один health-check, а не один
+    на каждый раунд. Кэшируются только подтверждённые ``True``/``False`` —
+    ``None`` означает «проверить не удалось», и транзиентный обрыв не должен
+    блокировать раунды на весь TTL. Сам запрос не сигнатурен: случайный
+    бытовой query и Chrome-UA с вариацией версии вместо фиксированной пары
+    «health-check-строка + та же версия браузера».
     """
 
+    cached = _probe_cache.get(proxy)
+    if cached is not None and monotonic() - cached[0] < _PROBE_CACHE_TTL:
+        log.debug(
+            "proxy",
+            "proxy captcha probe served from cache",
+            fields={"proxy": proxy.split("@")[-1], "captcha": cached[1]},
+        )
+        return cached[1]
+
+    checked_at = monotonic()
     proxies = {"http": f"http://{proxy}", "https": f"http://{proxy}"}
     try:
         response = requests.get(
-            _PROBE_URL,
+            _probe_url(),
             proxies=proxies,
             timeout=timeout,
-            headers={"User-Agent": _PROBE_UA},
+            headers={"User-Agent": _probe_user_agent()},
         )
     except requests.RequestException as exp:
         log.debug(
@@ -911,6 +965,7 @@ def probe_proxy_captcha(proxy: str, timeout: float = 10.0) -> Optional[bool]:
                 "captcha": True,
             },
         )
+        _probe_cache[proxy] = (checked_at, True)
         return True
 
     # Ошибка транспорта, упакованная в HTTP-ответ: прокси отдал 407/502 на
@@ -937,6 +992,7 @@ def probe_proxy_captcha(proxy: str, timeout: float = 10.0) -> Optional[bool]:
             "captcha": False,
         },
     )
+    _probe_cache[proxy] = (checked_at, False)
     return False
 
 

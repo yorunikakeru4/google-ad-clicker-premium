@@ -108,6 +108,28 @@ _CONSENT_TEXT_HINTS = (
     "priimti",  # lt: "Priimti viską"
 )
 
+# --- анти-капча прогрев сессии ------------------------------------------------
+
+# Хост страницы согласия Google (EU/EEA-локации): свежий «чистый» браузер
+# Google уводит сюда вместо главной, а отсутствие cookies/consent-истории —
+# один из признаков, по которым первый же поиск заканчивается /sorry/.
+_CONSENT_HOST = "consent.google.com"
+
+# Cookies, которые Google ставит после принятия согласия. Их наличие в jar
+# (прошлый прогон их сохранил в профиль, _apply_cookies применил) означает,
+# что страница согласия уже закрывалась — повторный прогрев не кликает.
+_CONSENT_COOKIE_NAMES = ("CONSENT", "SOCS")
+
+# Попыток нажать кнопку согласия. CMP Google подключает обработчики не сразу:
+# клик сразу после загрузки молча не действует (живой прогон на DE-выходе:
+# «Alle akzeptieren» нажат, баннер остаётся, SOCS не появляется), поэтому
+# клик повторяется, пока cookies согласия не оселятся в jar.
+CONSENT_ACCEPT_ATTEMPTS = 2
+
+# Ожидание cookies согласия (SOCS/CONSENT) после клика, сек. Живой прогон:
+# SOCS появляется через 3–5 с после удачного клика.
+CONSENT_COOKIES_WAIT_TIMEOUT_S = 4
+
 # JS-фолбэк ввода запроса: значение + события input/change + сабмит формы.
 # Срабатывает, когда send_keys упал (неинтерактивное/перекрытое поле) —
 # иначе поиск не отправляется никогда, а раунд умирает без причины.
@@ -349,6 +371,11 @@ class SearchController:
 
         self._android_device_id = None
 
+        # Прогрев сессии (анти-капча) выполняется один раз — на первом
+        # поиске. Флаг на инстансе, а не в config: отдельной настройки
+        # поведения для прогрева нет, см. _warm_up_session.
+        self._session_warmed = False
+
         self._stats = SearchStats()
 
         if config.behavior.excludes:
@@ -497,6 +524,11 @@ class SearchController:
         self._blocked_domains = list(blocked_domains or [])
 
         self._apply_cookies()
+
+        # Прогрев идёт после cookies и до любой работы со страницей: если
+        # открылась consent-страница — принять её и сохранить cookies, пока
+        # поле поиска ещё не искалось.
+        self._warm_up_session()
 
         self._check_captcha()
         self._close_cookie_dialog()
@@ -1846,6 +1878,313 @@ class SearchController:
             return
 
         log.debug("browser", "No consent button seen; dialog left untouched")
+
+    # --- анти-капча прогрев сессии -------------------------------------------
+
+    def _warm_up_session(self) -> None:
+        """Анти-капча прогрев сессии перед первым поиском.
+
+        Гипотеза (baseline: 7 CAPTCHA из 10 поисков на ``google.com/sorry/``):
+        Google видит «свежий чистый браузер» — без cookies и без истории
+        согласия — и сразу отвечает капчей, из-за чего раунды умирают и жгут
+        2captcha. Прогрев снимает именно этот признак.
+
+        Главная Google открывается в :meth:`_load` (``__init__``), а cookies
+        применяются в :meth:`search_for_ads` через :meth:`_apply_cookies` —
+        то есть consent-состояние нередко открыто **до** того, как в jar
+        попадают профильные cookies согласия. Метод зовётся из
+        :meth:`search_for_ads` сразу после :meth:`_apply_cookies` и до
+        первого ввода запроса. Два consent-поверхности, живой прогон на
+        DE-выходе:
+
+        1. **полная consent-страница** ``consent.google.com`` → принять её
+           («Accept all» / «Alle akzeptieren», см. ``_CONSENT_TEXT_HINTS``),
+           сохранить cookies в профиль (:meth:`_save_profile_cookies`),
+           вернуться на главную;
+        2. **cookie-баннер на главной** («Bevor Sie zu Google weitergehen») —
+           именно так Google consenting устроенный на десктопных EU-выходах;
+           :meth:`_close_cookie_dialog` принимает его, но её клик идёт после
+           3–3.5 с ожидания и не проверяет результат. Прогрев кликает здесь
+           сам и **ждёт, пока cookies согласия реально оселятся в jar**,
+           прежде чем сохранять их и запускать idle-действия;
+        3. после согласия — пауза и мелкий скролл (1–2 безобидных действия,
+           без поисковых запросов).
+
+        Если cookies согласия уже применены (:meth:`_apply_cookies` положил
+        их из профиля) — прогрев дёшев: ни кликов, ни сохранений, максимум
+        возврат на главную. Без consent-признаков и без таких cookies метод
+        не делает ничего. Повторный вызов — no-op (``_session_warmed``):
+        флаг живёт на инстансе, отдельной настройки в config-схеме нет.
+        """
+
+        if self._session_warmed:
+            log.debug("browser", "Session warm-up already done, skipping")
+            return
+
+        self._session_warmed = True
+
+        if self._is_consent_page():
+            self._warm_up_on_consent_page()
+        elif self._consent_cookies_present():
+            log.debug("browser", "Warm-up: consent cookies already applied, nothing to repeat")
+        elif self._consent_banner_present():
+            self._warm_up_on_consent_banner()
+        else:
+            log.debug("browser", "Warm-up: no consent surface seen, page left untouched")
+
+    def _warm_up_on_consent_page(self) -> None:
+        """Прогрев на consent-странице: принять согласие и вернуться на главную.
+
+        Cookies согласия в файл профиля уходят **после** клика, а не в конце
+        прогона (как делает :meth:`end_search`): раунд может умереть на первой
+        же капче, и без этой записи следующий заход снова начнётся с чистого
+        браузера. Если клик не состоялся — дальше решает
+        :meth:`_close_cookie_dialog`, прогрев не наступает на её пальцы.
+        """
+
+        if self._consent_cookies_present():
+            # Согласие уже выдано прошлым прогоном: страница consent — лишь
+            # след навигации из __init_, случившейся до _apply_cookies.
+            # Клик не нужен, достаточно вернуться на главную.
+            log.debug("browser", "Warm-up: consent cookies already present, loading home")
+            self._load()
+        else:
+            if not self._accept_consent_page():
+                return
+
+            if self._wait_for_consent_cookies():
+                self._save_profile_cookies()
+            else:
+                log.debug(
+                    "browser",
+                    "Warm-up: consent cookies did not settle after accept, nothing saved",
+                )
+
+            if self._is_consent_page():
+                # Согласие принято, но Google не увёл с continue-URL:
+                # главная открывается вручную.
+                log.debug("browser", "Warm-up: no navigation after accept, loading home")
+                self._load()
+
+        self._warm_idle_actions()
+
+    def _warm_up_on_consent_banner(self) -> None:
+        """Прогрев на cookie-баннере главной: принять и дождаться cookies.
+
+        На живом DE-выходе Google не уводит на ``consent.google.com``, а
+        показывает баннер «Bevor Sie zu Google weitergehen …» прямо на главной.
+        Его принимает :meth:`_close_cookie_dialog`, но она идёт **позже** (после
+        :meth:`_check_captcha`) и не проверяет исход: CMP подключает обработчики
+        не сразу, клик рано после загрузки молча не действует, и к моменту
+        набора запроса браузер всё ещё «без consent-истории». Здесь клик
+        повторяется до ``CONSENT_ACCEPT_ATTEMPTS``, пока cookies согласия не
+        оселятся в jar; только после этого набор сохраняется в профиль и идут
+        idle-действия. Клик не состоялся — прогрев выходит молча: дальше решает
+        :meth:`_close_cookie_dialog`.
+        """
+
+        accepted = False
+
+        for _ in range(CONSENT_ACCEPT_ATTEMPTS):
+            if not self._click_consent_button():
+                break
+
+            accepted = True
+            if self._wait_for_consent_cookies():
+                break
+
+            sleep(get_random_sleep(1, 1.5) * config.behavior.wait_factor)
+
+        if not accepted:
+            return
+
+        if not self._consent_cookies_present():
+            log.debug("browser", "Warm-up: consent cookies did not settle, cookies not saved")
+            return
+
+        self._save_profile_cookies()
+        self._warm_idle_actions()
+
+    def _accept_consent_page(self) -> bool:
+        """Нажать «Accept all» на consent-странице и дождаться ухода с неё.
+
+        Клик совершает :meth:`_click_consent_button` (одна кнопка с текстом
+        согласия, «Reject all» не трогается); после клика ждём, пока страница
+        перестанет быть ``consent.google.com`` — согласие само ведёт на
+        continue-URL.
+
+        :rtype: bool
+        :returns: True — согласие принято (клик состоялся)
+        """
+
+        if not self._click_consent_button():
+            return False
+
+        try:
+            WebDriverWait(self._driver, timeout=SEARCH_BOX_WAIT_TIMEOUT_S).until(
+                lambda driver: _CONSENT_HOST not in str(getattr(driver, "current_url", "") or "")
+            )
+        except TimeoutException:
+            log.debug("browser", "Warm-up: still on the consent page after accept")
+
+        return True
+
+    def _click_consent_button(self) -> bool:
+        """Нажать ровно одну кнопку согласия («Accept all» / «Alle akzeptieren»).
+
+        Текст ищется по ``_CONSENT_TEXT_HINTS``, «Reject all», служебные ссылки
+        и кнопки с ``role="link"`` не трогаются; одна попытка на весь набор —
+        страница не должна меняться в непредсказуемом виде.
+
+        :rtype: bool
+        :returns: True — клик состоялся
+        """
+
+        buttons = list(self._driver.find_elements(By.TAG_NAME, "button"))
+        buttons += list(self._driver.find_elements(By.CSS_SELECTOR, "[role='button']"))
+
+        for button in buttons:
+            text = (button.text or "").strip().casefold()
+            if not text or not any(hint in text for hint in _CONSENT_TEXT_HINTS):
+                continue
+            if button.get_attribute("role") == "link":
+                continue
+
+            try:
+                log.debug(
+                    "browser",
+                    "Warm-up: accepting Google consent",
+                    fields={"button": text},
+                )
+                self._driver.execute_script("arguments[0].scrollIntoView(true);", button)
+                button.click()
+            except (
+                ElementNotInteractableException,
+                ElementClickInterceptedException,
+                StaleElementReferenceException,
+                WebDriverException,
+            ) as exp:
+                log.debug(
+                    "browser",
+                    "Warm-up: consent button is not clickable",
+                    fields={"button": text, "error": str(exp)},
+                )
+                continue
+
+            return True
+
+        log.debug("browser", "Warm-up: no accept button seen")
+        return False
+
+    def _consent_banner_present(self) -> bool:
+        """На главной стоит cookie-баннер согласия («Bevor Sie zu Google weitergehen»).
+
+        Признак тот же, что у :meth:`_close_cookie_dialog`: ссылка на
+        ``policies.google.com`` в подвале баннера. Без неё (баннера нет, страница
+        — капча или чистая выдача) прогрев не делает ничего.
+
+        :rtype: bool
+        :returns: True — баннер согласия на странице
+        """
+
+        try:
+            hrefs = [
+                element.get_attribute("href")
+                for element in self._driver.find_elements(By.TAG_NAME, "a")
+            ]
+        except Exception as exp:  # прогрев не должен ронять поиск
+            log.debug(
+                "browser",
+                "Warm-up: links are unavailable",
+                fields={"error": str(exp), "error_type": type(exp).__name__},
+            )
+            return False
+
+        return any(
+            isinstance(href, str) and "policies.google.com" in href for href in hrefs
+        )
+
+    def _wait_for_consent_cookies(self) -> bool:
+        """Дождаться cookies согласия (``CONSENT``/``SOCS``) в jar браузера.
+
+        CMP пишет их асинхронно после клика — сразу после ``button.click()``
+        в jar ещё пусто, и сохранение в профиль зафиксировало бы состояние
+        «согласие не принято».
+
+        :rtype: bool
+        :returns: True — cookies согласия появились за ``CONSENT_COOKIES_WAIT_TIMEOUT_S``
+        """
+
+        try:
+            WebDriverWait(self._driver, timeout=CONSENT_COOKIES_WAIT_TIMEOUT_S).until(
+                lambda driver: self._consent_cookies_present()
+            )
+        except TimeoutException:
+            return False
+
+        return True
+
+
+    def _warm_idle_actions(self) -> None:
+        """Безобидные действия на главной после согласия: пауза и мелкий скролл.
+
+        Ни запросов, ни навигации — только чтобы браузер, который только что
+        принял согласие, не выглядел «мёртвым» сразу перед первым поиском.
+        Возврат к началу страницы нужен, чтобы поле поиска осталось на месте.
+        """
+
+        log.debug("browser", "Warm-up: idle pause before the first search")
+        sleep(get_random_sleep(1, 2) * config.behavior.wait_factor)
+
+        try:
+            self._driver.execute_script("window.scrollBy(0, 300);")
+            sleep(get_random_sleep(0.5, 1) * config.behavior.wait_factor)
+            self._driver.execute_script("window.scrollTo(0, 0);")
+        except WebDriverException as exp:
+            log.debug("browser", "Warm-up: scroll skipped", fields={"error": str(exp)})
+
+    def _is_consent_page(self) -> bool:
+        """Текущая страница — согласие Google (``consent.google.com``).
+
+        Драйвер без ``current_url`` (тестовый двойник, мёртвый браузер)
+        считается страницей без согласия: прогрев в таком случае no-op.
+        """
+
+        try:
+            url = str(getattr(self._driver, "current_url", "") or "")
+        except Exception as exp:  # прогрев не должен ронять поиск
+            log.debug(
+                "browser",
+                "Warm-up: current url is unavailable",
+                fields={"error": str(exp), "error_type": type(exp).__name__},
+            )
+            return False
+
+        return _CONSENT_HOST in url
+
+    def _consent_cookies_present(self) -> bool:
+        """В браузере уже лежат cookies согласия Google (``CONSENT``/``SOCS``).
+
+        Наличие означает, что consent-страница принималась раньше и её cookies
+        доехали из профиля через :meth:`_apply_cookies` — повторный прогрев
+        не должен кликать и пересохранять набор. Драйвер без ``get_cookies``
+        — cookies нет.
+        """
+
+        try:
+            cookies = self._driver.get_cookies()
+        except Exception as exp:  # прогрев не должен ронять поиск
+            log.debug(
+                "browser",
+                "Warm-up: cookies are unavailable",
+                fields={"error": str(exp), "error_type": type(exp).__name__},
+            )
+            return False
+
+        return any(
+            isinstance(cookie, dict) and cookie.get("name") in _CONSENT_COOKIE_NAMES
+            for cookie in cookies or []
+        )
 
     def _is_scroll_at_the_end(self) -> bool:
         """Check if scroll is at the end

@@ -22,6 +22,19 @@ def parse(argv):
     return get_arg_parser().parse_args(argv)
 
 
+@pytest.fixture(autouse=True)
+def probe_pauses(monkeypatch):
+    """Пауза probe→драйвер не должна ждать реальное время в юнитах.
+
+    Возвращает список запрошенных пауз: тесты проверяют ритм по нему,
+    остальные просто не тратят секунды на ``sleep``.
+    """
+
+    pauses = []
+    monkeypatch.setattr(ad_clicker, "sleep", pauses.append)
+    return pauses
+
+
 def test_parser_supports_documented_options():
     options = {action.dest for action in get_arg_parser()._actions}
 
@@ -452,6 +465,23 @@ class TestProxyHealthCheck:
 
         assert probes == ["u:p@proxy.host:80"]
         assert len(started) == 1
+
+    def test_clean_probe_pauses_before_starting_the_browser(self, monkeypatch, probe_pauses):
+        """После probe перед create_webdriver идёт случайный довесок 0.5–2 с.
+
+        Probe — неавторизованный запрос с того же exit IP, что и первый
+        запрос браузера; впритык они читаются как автоматизация.
+        """
+        self._run(monkeypatch, False)
+
+        assert len(probe_pauses) == 1, "ровно одна пауза перед созданием драйвера"
+        assert 0.5 <= probe_pauses[0] <= 2.0, "довесок обязан быть в диапазоне 0.5–2 с"
+
+    def test_skipped_round_has_no_pause(self, monkeypatch, probe_pauses):
+        """Пропущенный раунд не тратит паузу: браузер всё равно не создаётся."""
+        self._run(monkeypatch, True)
+
+        assert probe_pauses == []
 
     def test_no_proxy_means_no_probe(self, monkeypatch):
         probes = []

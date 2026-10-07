@@ -8,6 +8,7 @@ import json
 import platform
 import random
 import time
+from urllib.parse import quote_plus
 
 import openpyxl
 import pytest
@@ -685,6 +686,52 @@ def test_is_mobile_user_agent_is_false_for_desktop_strings():
 # --- probe_proxy_captcha ----------------------------------------------------------
 
 
+@pytest.fixture(autouse=True)
+def _probe_cache_isolated():
+    """Кэш probe живёт в модуле между тестами — чистим до и после каждого.
+
+    Без этого тест, проверяющий «чистую» страницу, увидел бы капчу,
+    закэшированную предыдущим тестом тем же прокси.
+    """
+
+    utils._probe_cache.clear()
+    yield
+    utils._probe_cache.clear()
+
+
+class _ProbeClock:
+    """Управляемое время для TTL-кэша probe: подменяет time.monotonic в utils."""
+
+    def __init__(self, start: float = 1000.0):
+        self.now = start
+
+    def advance(self, seconds: float) -> None:
+        self.now += seconds
+
+
+@pytest.fixture
+def probe_clock(monkeypatch):
+    """Часы для TTL-кэша: тесты сдвигают время сами, без реальных ожиданий."""
+
+    clock = _ProbeClock()
+    monkeypatch.setattr(utils, "monotonic", lambda: clock.now)
+    return clock
+
+
+@pytest.fixture
+def probe_http(monkeypatch):
+    """Сетевые вызовы probe: каждый запрос записывается, ответ — чистый."""
+
+    calls = []
+
+    def _get(url, proxies=None, timeout=None, headers=None):
+        calls.append({"url": url, "proxies": proxies, "timeout": timeout, "headers": headers})
+        return _FakeResponse(url, "<html>results</html>")
+
+    monkeypatch.setattr(utils.requests, "get", _get)
+    return calls
+
+
 class _FakeResponse:
     """Ответ requests для probe: url + тело, без сети."""
 
@@ -789,6 +836,114 @@ def test_probe_passes_proxy_credentials_to_requests(monkeypatch):
         "http": "http://user:pass@proxy.host:8080",
         "https": "http://user:pass@proxy.host:8080",
     }
+
+
+# --- probe_proxy_captcha: кэш и рандомизация ---------------------------------------
+
+
+def test_second_probe_within_ttl_is_served_from_cache(probe_http, probe_clock):
+    """Повторный probe того же прокси внутри TTL не ходит в сеть.
+
+    Раунд идёт каждые ~2 минуты, поэтому подтверждённый результат живёт
+    дольше одного раунда: на сессию уходит один health-check, а не один
+    на каждый — иначе probe удваивает нагрузку на exit IP.
+    """
+    assert utils.probe_proxy_captcha("host:8080") is False
+
+    probe_clock.advance(utils._PROBE_CACHE_TTL - 1)
+
+    assert utils.probe_proxy_captcha("host:8080") is False
+    assert len(probe_http) == 1, "внутри TTL второй probe обязан взять кэш"
+
+
+def test_probe_goes_to_network_again_after_ttl_expires(probe_http, probe_clock):
+    """После истечения TTL probe снова спрашивает сеть, а не кэш вечно."""
+    assert utils.probe_proxy_captcha("host:8080") is False
+
+    probe_clock.advance(utils._PROBE_CACHE_TTL)
+
+    assert utils.probe_proxy_captcha("host:8080") is False
+    assert len(probe_http) == 2, "просроченный кэш не должен отдавать результат"
+
+
+def test_probe_cache_is_isolated_per_proxy(probe_http, probe_clock):
+    """Разные прокси кэшируются раздельно: кэш одного не закрывает другой."""
+    assert utils.probe_proxy_captcha("host-a:8080") is False
+    assert utils.probe_proxy_captcha("host-b:8080") is False
+    assert len(probe_http) == 2, "каждая строка прокси проверяется своей сетью"
+
+    assert utils.probe_proxy_captcha("host-a:8080") is False
+
+    assert len(probe_http) == 2, "кэш host-a не должен пострадать от probe host-b"
+
+
+def test_probe_caches_captcha_verdict(monkeypatch, probe_clock):
+    """Капча тоже кэшируется: повторный probe не спрашивает сеть о мёртвом IP."""
+    calls = []
+
+    def _get(url, **kwargs):
+        calls.append(url)
+        return _FakeResponse("https://www.google.com/sorry/index?continue=x", "")
+
+    monkeypatch.setattr(utils.requests, "get", _get)
+
+    assert utils.probe_proxy_captcha("host:8080") is True
+
+    probe_clock.advance(utils._PROBE_CACHE_TTL - 1)
+
+    assert utils.probe_proxy_captcha("host:8080") is True
+    assert len(calls) == 1
+
+
+def test_unknown_probe_result_is_not_cached(monkeypatch):
+    """None — «проверить не удалось»: транзиентный обрыв не кэшируется.
+
+    Иначе один сбой сети заблокировал бы раунды на весь TTL, хотя через
+    секунды прокси мог ожить.
+    """
+    attempts = []
+
+    def _get(url, **kwargs):
+        attempts.append(url)
+        if len(attempts) == 1:
+            raise utils.requests.RequestException("boom")
+        return _FakeResponse(url, "<html>results</html>")
+
+    monkeypatch.setattr(utils.requests, "get", _get)
+
+    assert utils.probe_proxy_captcha("host:8080") is None
+    assert utils.probe_proxy_captcha("host:8080") is False
+    assert len(attempts) == 2, "неудачный probe обязан повторить запрос"
+
+
+def test_probe_query_is_randomized():
+    """Probe берёт разные безобидные query, а не одну фиксированную строку.
+
+    Постоянный «proxy+health+check» с одного IP перед каждым раундом —
+    сигнатура бота; вариативность проверяется на большом числе выборок,
+    чтобы совпадение первого запроса не дало ложный провал.
+    """
+    urls = [utils._probe_url() for _ in range(30)]
+
+    assert len(set(urls)) > 1, "query обязан меняться от запроса к запросу"
+
+    queries = {url.split("q=", 1)[1] for url in urls}
+    expected = {quote_plus(item) for item in utils._PROBE_QUERIES}
+    assert queries <= expected, "probe не должен уходить за список безобидных query"
+
+
+def test_probe_request_uses_benign_query_and_chrome_ua(probe_http):
+    """Сетевой запрос probe: бытовой query и честный Chrome-UA из диапазона."""
+    utils.probe_proxy_captcha("host:8080")
+
+    request = probe_http[0]
+    query = request["url"].split("q=", 1)[1]
+    assert query in {quote_plus(item) for item in utils._PROBE_QUERIES}
+
+    user_agent = request["headers"]["User-Agent"]
+    assert user_agent.startswith("Mozilla/5.0 (Windows NT 10.0; Win64; x64)")
+    version = int(user_agent.split("Chrome/")[1].split(".")[0])
+    assert version in utils._PROBE_UA_VERSIONS, "версия UA должна варьироваться в диапазоне"
 
 
 # --- require_german_exit ----------------------------------------------------------
