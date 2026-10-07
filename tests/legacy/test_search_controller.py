@@ -439,18 +439,23 @@ def test_get_non_ad_links_skips_link_without_href(make_search_controller):
     assert controller._get_non_ad_links([]) == []
 
 
-def test_get_non_ad_links_skips_link_without_jsname(make_search_controller):
+def test_get_non_ad_links_keeps_link_without_jsname(make_search_controller):
+    # Новый контракт: jsname ставят внутренние виджеты Google, а не
+    # результаты выдачи. Раньше его требование отсекало реальную органику —
+    # из ~200 ссылок в клик уходила одна мусорная support.google.com.
     link = make_link("http://shop.example/product", jsname=None)
     controller = make_search_controller(driver=FakeDriver(links=[link]))
 
-    assert controller._get_non_ad_links([]) == []
+    assert controller._get_non_ad_links([]) == [link]
 
 
-def test_get_non_ad_links_skips_link_without_data_ved(make_search_controller):
+def test_get_non_ad_links_keeps_link_without_data_ved(make_search_controller):
+    # Новый контракт: data-ved есть не у всех результатов, и его требование
+    # было одной из причин «Ads Found 3, Non-ads Clicked 0».
     link = make_link("http://shop.example/product", **{"data-ved": None})
     controller = make_search_controller(driver=FakeDriver(links=[link]))
 
-    assert controller._get_non_ad_links([]) == []
+    assert controller._get_non_ad_links([]) == [link]
 
 
 def test_get_non_ad_links_skips_link_with_data_rw(make_search_controller):
@@ -475,6 +480,68 @@ def test_get_non_ad_links_skips_google_internal_links(make_search_controller, ur
     controller = make_search_controller(driver=FakeDriver(links=[link]))
 
     assert controller._get_non_ad_links([]) == []
+
+
+@pytest.mark.parametrize(
+    "url",
+    [
+        # прод-ссылка из лога: единственное, что проходило старый фильтр
+        "https://support.google.com/websearch/answer/181196",
+        "https://accounts.google.com/ServiceLogin",
+        "https://www.google.com/preferences?hl=de",
+        "https://policies.google.com/privacy",
+        "https://consent.google.com/m?continue=x",
+        "https://maps.google.com/?q=shop",
+        "https://www.googleadservices.com/pagead/aclk?sa=L&ai=xyz",
+        "https://pagead2.googlesyndication.com/pagead/js/ad.js",
+        "https://ssl.gstatic.com/ui/v1/icons/common/x.png",
+    ],
+)
+def test_get_non_ad_links_skips_google_service_hosts(make_search_controller, url):
+    # Служебные сервисы Google отбраковываются по хосту: подстрока
+    # «https://www.google» их не ловила (например, support.google.com),
+    # поэтому они и просачивались в клики.
+    link = make_link(url)
+    controller = make_search_controller(driver=FakeDriver(links=[link]))
+
+    assert controller._get_non_ad_links([]) == []
+
+
+def test_get_non_ad_links_keeps_google_url_redirect(make_search_controller):
+    # /url?... — как Google отдаёт настоящие результаты: раньше подстрока
+    # «https://www.google» отсекала такие ссылки вовсе, и органики не было.
+    link = make_link(
+        "https://www.google.com/url?sa=t&source=web&url=https%3A%2F%2Fshop.example%2Fkb"
+    )
+    controller = make_search_controller(driver=FakeDriver(links=[link]))
+
+    assert controller._get_non_ad_links([]) == [link]
+
+
+def test_get_non_ad_links_keeps_results_without_tracking_attributes(make_search_controller):
+    # Реальные результаты без jsname/data-ved: раньше такие ссылки не проходили
+    # ни при каких условиях, и в клик уходил только мусор.
+    links = [
+        make_link("https://shop.example/wireless-keyboard", jsname=None, **{"data-ved": None}),
+        make_link("https://en.wikipedia.org/wiki/Keyboard", jsname=None, **{"data-ved": None}),
+        make_link("https://www.booking.com/hotel/de/berlin.html", jsname=None),
+    ]
+    controller = make_search_controller(driver=FakeDriver(links=links))
+
+    assert controller._get_non_ad_links([]) == links
+
+
+def test_get_non_ad_links_keeps_lookalike_hosts(make_search_controller):
+    # Правило google.* не должно ловить чужие домены: и раньше, и сейчас
+    # кликабельны всё, что не является сервисом Google.
+    links = [
+        make_link("https://notgoogle.com/keyboard"),
+        make_link("https://google.com.evil.example/keyboard"),
+        make_link("https://shop.example/google-guides"),
+    ]
+    controller = make_search_controller(driver=FakeDriver(links=links))
+
+    assert controller._get_non_ad_links([]) == links
 
 
 def test_get_non_ad_links_skips_links_containing_svg_icon(make_search_controller):
@@ -1695,6 +1762,113 @@ def test_shopping_ads_filtered_when_collection_fails_halfway(make_search_control
     assert controller._stats.num_excluded_shopping_ads == 1
 
 
+class PageWideShoppingDriver(FakeDriver):
+    """Вёрстка без контейнера: блоки ``.pla-unit`` лежат прямо на странице.
+
+    Живой срез показал именно такую картину: ``cu-container`` на выдаче нет
+    (класс предка другой), а сами блоки и якоря с aclk — есть.
+    """
+
+    def __init__(self, units):
+        super().__init__()
+        self.units = units
+
+    def find_elements(self, by, value=None):
+        if value == ".pla-unit":
+            return list(self.units)
+        return []
+
+    def find_element(self, by, value=None):
+        if value == "cu-container":
+            raise NoSuchElementException("контейнер cu-container отсутствует")
+        return super().find_element(by, value)
+
+
+class UnitWithoutAnchor:
+    """Блок ``.pla-unit`` без якоря: такой блок не должен обрывать сбор."""
+
+    def __init__(self, text="https://shop.example/broken"):
+        self.text = text
+
+    def find_element(self, by, value=None):
+        raise NoSuchElementException("у блока нет якоря <a>")
+
+
+def test_shopping_ads_collected_without_a_container(make_search_controller):
+    # Контейнера cu-container нет, но блоки .pla-unit на странице есть:
+    # раньше NoSuchElementException обрывал сбор, и shopping не находился вовсе.
+    driver = PageWideShoppingDriver(
+        [
+            DesktopUnit(
+                href="https://www.google.com/aclk?sa=L&ai=one",
+                target="https://shop.example/keyboard",
+                title="Wireless Keyboard",
+            ),
+            DesktopUnit(
+                href="https://www.google.com/aclk?sa=L&ai=two",
+                target="https://shop.example/mouse",
+                title="Mouse",
+            ),
+        ]
+    )
+    controller = make_search_controller(query="wireless keyboard", driver=driver)
+
+    result = controller._get_shopping_ad_links()
+
+    assert [entry[1] for entry in result] == [
+        "https://www.google.com/aclk?sa=L&ai=one",
+        "https://www.google.com/aclk?sa=L&ai=two",
+    ]
+    assert [entry[2] for entry in result] == ["Wireless Keyboard", "Mouse"]
+    assert controller._stats.shopping_ads_found == 2
+
+
+def test_page_wide_shopping_collection_skips_units_without_anchor(make_search_controller):
+    # Битый блок пропускается с записью в лог, а не обрывает сбор остальных.
+    driver = PageWideShoppingDriver(
+        [
+            UnitWithoutAnchor(),
+            DesktopUnit(
+                href="https://shop.example/keyboard",
+                target="https://shop.example/keyboard",
+                title="Wireless Keyboard",
+            ),
+        ]
+    )
+    controller = make_search_controller(query="wireless keyboard", driver=driver)
+
+    result = controller._get_shopping_ad_links()
+
+    assert [entry[1] for entry in result] == ["https://shop.example/keyboard"]
+    assert controller._stats.shopping_ads_found == 1
+
+
+def test_page_wide_shopping_collection_applies_the_blacklist(make_search_controller):
+    # Третий путь подчиняется тому же контракту, что и мобильный/десктопный:
+    # чёрный список применяется к собранному, а не отключается вместе со сбором.
+    driver = PageWideShoppingDriver(
+        [
+            DesktopUnit(
+                href="https://www.edelind.de/goldkette",
+                target="https://www.edelind.de/goldkette",
+                title="Goldkette 75cm",
+            ),
+            DesktopUnit(
+                href="https://shop.example/keyboard",
+                target="https://shop.example/keyboard",
+                title="Wireless Keyboard",
+            ),
+        ]
+    )
+    controller = make_search_controller(query="wireless keyboard", driver=driver)
+    controller._blocked_domains = ["edelind.de"]
+
+    result = controller._get_shopping_ad_links()
+
+    assert [entry[1] for entry in result] == ["https://shop.example/keyboard"]
+    assert controller._stats.num_excluded_shopping_ads == 1
+
+
 class ClickDriver(FakeDriver):
     """Драйвер для клик-фазы: окно результатов и вызов stealth через CDP."""
 
@@ -1917,3 +2091,306 @@ def test_click_links_skips_ad_whose_text_mentions_blocked_domain(
 
     assert clicked == []
     assert controller._stats.num_excluded_ads == 1
+
+
+# --- Прод-дефект «Ads Found 3 → Ads Clicked 0»: открытие лендинга в новой вкладке ----
+
+
+class _SwitchTo:
+    """Мини-двойник ``driver.switch_to``: переключение между вкладками драйвера."""
+
+    def __init__(self, driver):
+        self._driver = driver
+
+    def window(self, handle):
+        self._driver.switch_window(handle)
+
+
+class TabDriver(FakeDriver):
+    """Драйвер с механикой вкладок для клик-фазы.
+
+    ``ctrl_click_opens`` — сценарий попыток ctrl/cmd+click (по одному bool на
+    попытку; пустой список — ни одна не открывает вкладку), ``window_opens`` —
+    открывает ли фолбэк ``window.open``, ``opened_tab_url`` — что окажется в
+    новой вкладке (по умолчанию тот же href, как после редиректа на лендинг;
+    ``about:blank`` моделирует навигацию, которая не состоялась).
+    """
+
+    def __init__(
+        self,
+        *,
+        ctrl_click_opens=(),
+        window_opens=True,
+        opened_tab_url=None,
+        landing_url="https://shop.example/landing",
+    ):
+        super().__init__()
+        self._handles = ["search-window"]
+        self._urls = {"search-window": "https://www.google.com/search?q=wireless+keyboard"}
+        self.current_window_handle = "search-window"
+        self.switch_to = _SwitchTo(self)
+        self._ctrl_click_opens = list(ctrl_click_opens)
+        self._window_opens = window_opens
+        self._opened_tab_url = opened_tab_url
+        self._landing_url = landing_url
+        self.ctrl_click_attempts = 0
+        self.window_open_calls = []
+        self.opened_tabs = []
+
+    @property
+    def window_handles(self):
+        return list(self._handles)
+
+    @property
+    def current_url(self):
+        return self._urls.get(self.current_window_handle, "about:blank")
+
+    def switch_window(self, handle):
+        if handle not in self._handles:
+            raise WebDriverException(f"no such window handle: {handle}")
+        self.current_window_handle = handle
+
+    def perform_ctrl_click(self):
+        """Попытка ctrl/cmd+click: по сценарию открывает (или не открывает) вкладку."""
+
+        self.ctrl_click_attempts += 1
+        opens = self._ctrl_click_opens.pop(0) if self._ctrl_click_opens else False
+
+        if opens:
+            self._add_tab(self._tab_url(self._landing_url))
+
+    def _tab_url(self, default):
+        return self._opened_tab_url if self._opened_tab_url is not None else default
+
+    def _add_tab(self, url):
+        handle = f"tab-{len(self._handles)}"
+        self._handles.append(handle)
+        self._urls[handle] = url
+        self.opened_tabs.append(url)
+        return handle
+
+    def close(self):
+        closed = self._handles.pop(self._handles.index(self.current_window_handle))
+        self._urls.pop(closed, None)
+
+        if self._handles:
+            self.current_window_handle = self._handles[0]
+
+    def execute_cdp_cmd(self, command, payload=None):
+        return None
+
+    def execute_script(self, script, *args):
+        self.scripts.append(script)
+
+        if "window.open" in script:
+            url = args[0] if args else None
+            self.window_open_calls.append(url)
+
+            if not self._window_opens or not url:
+                return "blocked"
+
+            self._add_tab(self._tab_url(url))
+            return "opened"
+
+        if "scrollHeight" in script:
+            return 1000
+
+        if "pageYOffset" in script:
+            return 1000
+
+        return None
+
+
+class CtrlClickActionChains:
+    """Заглушка ActionChains: попытка ctrl/cmd+click уходит в драйвер.
+
+    Настоящие цепочки работают только с реальным браузером, поэтому здесь
+    действия просто переносятся на ``TabDriver.perform_ctrl_click`` — счётчик
+    попыток и сценарий открытия вкладки остаются в драйвере.
+    """
+
+    def __init__(self, driver):
+        self._driver = driver
+
+    def move_to_element(self, element):
+        return self
+
+    def key_down(self, key):
+        return self
+
+    def click(self):
+        return self
+
+    def key_up(self, key):
+        return self
+
+    def perform(self):
+        self._driver.perform_ctrl_click()
+
+
+@pytest.fixture
+def ctrl_click(monkeypatch):
+    """Подменить ActionChains на заглушку: попытки клика моделирует драйвер."""
+
+    monkeypatch.setattr(search_controller, "ActionChains", CtrlClickActionChains)
+
+
+def ad_link(
+    href="https://www.google.com/aclk?sa=L&ai=xyz&adurl=https%3A%2F%2Fshop.example%2Fkb",
+):
+    """Элемент текстового объявления: href — aclk-редирект Google."""
+
+    return FakeElement(
+        attributes={"href": href, "data-pcu": "https://shop.example/kb"},
+        text="Wireless Keyboard",
+    )
+
+
+def test_handle_browser_click_counts_click_when_ctrl_click_opens_a_tab(
+    make_search_controller, ctrl_click
+):
+    # Первая попытка открыла вкладку: клик засчитан, фолбэк не задействуется.
+    driver = TabDriver(ctrl_click_opens=[True])
+    controller = make_search_controller(driver=driver)
+    link = ad_link()
+    href = link.get_attribute("href")
+
+    controller._handle_browser_click(link, href, True, "search-window", category="Ad")
+
+    assert driver.ctrl_click_attempts == 1
+    assert driver.window_open_calls == [], "при успехе window.open не должен вызываться"
+    assert controller.stats.ads_clicked == 1
+    assert driver.window_handles == ["search-window"], "вкладка лендинга должна закрыться"
+    assert driver.current_window_handle == "search-window", "фокус должен вернуться на выдачу"
+
+
+def test_handle_browser_click_retries_after_scrolling_into_view(
+    make_search_controller, ctrl_click
+):
+    # Элемент был вне вида: первая попытка пустая, после scrollIntoView клик проходит.
+    driver = TabDriver(ctrl_click_opens=[False, True])
+    controller = make_search_controller(driver=driver)
+    link = ad_link()
+
+    controller._handle_browser_click(
+        link, link.get_attribute("href"), True, "search-window", category="Ad"
+    )
+
+    assert driver.ctrl_click_attempts == 2
+    assert any("scrollIntoView" in script for script in driver.scripts), (
+        "вторая попытка должна идти после прокрутки элемента в вид"
+    )
+    assert driver.window_open_calls == []
+    assert controller.stats.ads_clicked == 1
+
+
+def test_handle_browser_click_falls_back_to_window_open(make_search_controller, ctrl_click):
+    # Прод-кейс: ctrl/cmd+click Chrome игнорирует, фолбэк открывает цель по href
+    # в новой вкладке — иначе «Ads Found 3, Ads Clicked 0».
+    href = "https://www.google.com/aclk?sa=L&ai=xyz&adurl=https%3A%2F%2Fshop.example%2Fkb"
+    driver = TabDriver()
+    controller = make_search_controller(driver=driver)
+
+    controller._handle_browser_click(ad_link(href), href, True, "search-window", category="Ad")
+
+    assert driver.ctrl_click_attempts == 2, "обе ctrl+click попытки должны были отработать"
+    assert driver.window_open_calls == [href], "фолбэк открывает ровно href ссылки"
+    assert controller.stats.ads_clicked == 1
+    assert driver.current_window_handle == "search-window"
+
+
+def test_handle_browser_click_does_not_count_click_without_a_new_tab(
+    make_search_controller, ctrl_click, record_log
+):
+    # Ни одна попытка не открыла вкладку: клик не засчитывается, а причина
+    # уходит в лог с url — раньше там была одна строка DEBUG без деталей.
+    href = "https://shop.example/product"
+    driver = TabDriver(window_opens=False)
+    controller = make_search_controller(driver=driver)
+
+    controller._handle_browser_click(
+        FakeElement(attributes={"href": href}, text="Result"), href, False, "search-window"
+    )
+
+    assert controller.stats.ads_clicked == 0
+    assert controller.stats.non_ads_clicked == 0
+    assert driver.window_handles == ["search-window"]
+    assert driver.current_window_handle == "search-window"
+
+    messages = [record[2] for record in record_log.records]
+    assert any("Ctrl+click did not open a new tab" in message for message in messages)
+    assert any("window.open did not open a new tab" in message for message in messages)
+
+    failure = next(
+        record
+        for record in record_log.records
+        if record[2] == "Could not open the link in a new tab; click is not counted"
+    )
+    assert failure[3]["url"] == href, "итоговая причина должна называть url клика"
+
+
+def test_handle_browser_click_does_not_count_a_blank_tab(make_search_controller, ctrl_click):
+    # Вкладка открылась, но лендинг в ней не загрузился (about:blank):
+    # фальстарт — счётчик растёт только при реальном открытии лендинга.
+    href = "https://www.google.com/aclk?sa=L&ai=xyz"
+    driver = TabDriver(ctrl_click_opens=[True], opened_tab_url="about:blank")
+    controller = make_search_controller(driver=driver)
+
+    controller._handle_browser_click(ad_link(href), href, True, "search-window", category="Ad")
+
+    assert controller.stats.ads_clicked == 0
+    assert driver.window_handles == ["search-window"], "пустая вкладка должна закрыться"
+    assert driver.current_window_handle == "search-window"
+
+
+def test_handle_browser_click_reports_a_blocked_popup(
+    make_search_controller, ctrl_click, record_log
+):
+    # Popup-блокиратор Chrome — диагностируемая причина, а не молчаливый return.
+    href = "https://shop.example/product"
+    driver = TabDriver(window_opens=False)
+    controller = make_search_controller(driver=driver)
+
+    controller._handle_browser_click(
+        FakeElement(attributes={"href": href}), href, False, "search-window"
+    )
+
+    blocked = next(
+        record for record in record_log.records if record[2] == "window.open did not open a new tab"
+    )
+    assert blocked[3] == {"url": href, "status": "blocked"}
+    assert driver.window_open_calls == [href], "фолбэк должен был попытаться открыть href"
+    assert driver.opened_tabs == [], "popup-блокиратор не пропустил вкладку"
+    assert controller.stats.ads_clicked == 0
+
+
+def test_click_links_counts_a_click_opened_by_the_fallback(make_search_controller, ctrl_click):
+    # Сквозной путь: ctrl+click не работает, но объявления всё равно кликаются.
+    href = "https://www.google.com/aclk?sa=L&ai=xyz&adurl=https%3A%2F%2Fshop.example%2Fkb"
+    driver = TabDriver()
+    controller = make_search_controller(driver=driver)
+
+    controller.click_links([(ad_link(href), href, "Wireless Keyboard")])
+
+    assert controller.stats.ads_clicked == 1
+
+    rows = ClickLogsDB().query_clicks(today())
+    assert len(rows) == 1, "в журнал должен попасть ровно один клик"
+    assert rows[0][0] == href
+    assert rows[0][2] == "Ad"
+
+
+def test_click_links_never_counts_when_no_landing_opens(make_search_controller, ctrl_click):
+    # «Ads Found 3 → Ads Clicked 0»: счётчик и журнал кликов должны остаться
+    # пустыми, даже если собраны три объявления и ни одно не открылось.
+    driver = TabDriver(window_opens=False)
+    controller = make_search_controller(driver=driver)
+    links = []
+    for index in range(3):
+        href = f"https://www.google.com/aclk?ai={index}"
+        links.append((ad_link(href), href, f"Ad {index}"))
+
+    controller.click_links(links)
+
+    assert controller.stats.ads_clicked == 0
+    assert not ClickLogsDB().query_clicks(today()), "журнал кликов не должен пополняться"

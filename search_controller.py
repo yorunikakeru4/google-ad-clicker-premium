@@ -17,12 +17,12 @@ from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
 from selenium.common.exceptions import (
-    JavascriptException,
     TimeoutException,
     NoSuchElementException,
     ElementNotInteractableException,
     ElementClickInterceptedException,
     StaleElementReferenceException,
+    WebDriverException,
 )
 
 import hooks
@@ -121,6 +121,90 @@ if (el.form) {
   if (el.form.requestSubmit) { el.form.requestSubmit(); } else { el.form.submit(); }
 }
 """
+
+# --- открытие ссылки в новой вкладке ---------------------------------------------
+
+# Фолбэк ctrl/cmd+click: открыть цель по href в новой вкладке. JS-клик
+# ``arguments[0].click()`` здесь намеренно НЕ используется — у goto/aclk-ссылок
+# он ведёт в ту же вкладку, убивает выдачу и клик не засчитывается, а
+# ``window.open`` сохраняет семантику «клик по ссылке»: браузер запрашивает
+# тот же href (aclk/redirect регистрирует переход на сервере Google) и ведёт
+# на лендинг. Статус нужен для диагностики в лог: ``blocked`` означает, что
+# popup-блокиратор Chrome не пропустил вызов, ``no-url`` — что у элемента не
+# нашлось href.
+_OPEN_IN_NEW_TAB_JS = """
+const url = arguments[0];
+if (!url) { return 'no-url'; }
+const opened = window.open(url, '_blank');
+if (!opened) { return 'blocked'; }
+try { opened.opener = null; } catch (error) { /* cross-origin: не страшно */ }
+return 'opened';
+"""
+
+# --- отбор органических (не рекламных) ссылок ------------------------------------
+
+# Хост вида ``google.<tld>`` или ``<поддомен>.google.<tld>``: www.google.de,
+# support.google.com, accounts.google.com, encrypted.google.com. Ссылки на
+# сервисы Google не являются результатами выдачи, поэтому отбраковываются по
+# хосту, а не подстрокой ``https://www.google``: та же подстрока отсекала и
+# ссылки-перенаправления ``/url?``, через которые Google отдаёт настоящие
+# органические результаты.
+_GOOGLE_HOST_RE = re.compile(r"^(?:[a-z0-9-]+\.)*google\.[a-z]{2,}(?:\.[a-z]{2,})?$")
+
+# Инфраструктурные домены Google: ссылки на них — не результат выдачи
+# (рекламные редиректы, пиксели, шрифты, кэш-страницы).
+_GOOGLE_SERVICE_HOSTS = (
+    "googleadservices.com",
+    "googlesyndication.com",
+    "googleapis.com",
+    "gstatic.com",
+    "googleusercontent.com",
+)
+
+
+def _is_google_service_url(url: str) -> bool:
+    """Служебная ссылка Google — не органический результат выдачи.
+
+    Прод-дефект: старый фильтр требовал ``jsname`` + ``data-ved`` и запрещал
+    подстроку ``https://www.google`` в href — из ~200 ссылок выдачи в
+    ``non_ad_links`` проходила одна (``support.google.com/...``, мусорная).
+    Здесь служебность определяется по хосту:
+
+    * ``/url?``-редиректы Google на внешние сайты — это и есть цель клика
+      органики, поэтому проходят (реальный хост внутри ``url=`` проверяет
+      чёрный список);
+    * хосты ``google.*`` (и его поддомены), плюс инфраструктурные домены из
+      ``_GOOGLE_SERVICE_HOSTS`` — служебные, не кликаются;
+    * не-http и URL без хоста (относительные пути, ``mailto:``, ``javascript:``)
+      — тоже не органика.
+
+    :type url: str
+    :param url: href ссылки
+    :rtype: bool
+    :returns: True — ссылка служебная и не является результатом выдачи
+    """
+
+    if not url.startswith("http"):
+        return True
+
+    try:
+        parsed = urlparse(url)
+    except ValueError:
+        return True
+
+    host = (parsed.hostname or "").lower()
+    if not host:
+        return True
+
+    if parsed.path == "/url" or parsed.path.startswith("/url/"):
+        return False
+
+    if _GOOGLE_HOST_RE.match(host):
+        return True
+
+    return any(
+        host == service or host.endswith(f".{service}") for service in _GOOGLE_SERVICE_HOSTS
+    )
 
 # --- явное падение раунда -----------------------------------------------------
 
@@ -802,69 +886,172 @@ class SearchController:
         :param category: Specifies link category as Ad, Non-ad, or Shopping
         """
 
-        self._open_link_in_new_tab(link_element)
+        new_window_handle = self._open_link_in_new_tab(link_element, link_url)
 
-        if len(self._driver.window_handles) != 2:
-            log.debug("click", "Couldn't click! Scrolling element into view...")
-            self._driver.execute_script("arguments[0].scrollIntoView(true);", link_element)
-            self._open_link_in_new_tab(link_element)
-
-        if len(self._driver.window_handles) != 2:
-            log.debug("click", "Failed to open in a new tab!", fields={"url": link_url})
+        if new_window_handle is None:
+            # Какая именно попытка и что именно не вышло — в логе выше;
+            # здесь итог: клик не засчитан, счётчик не растёт.
+            log.info(
+                "click",
+                "Could not open the link in a new tab; click is not counted",
+                fields={"url": link_url, "category": category},
+            )
             return
-        else:
-            log.debug("click", "Opened link in a new tab. Switching to tab...")
 
-        for window_handle in self._driver.window_handles:
-            if window_handle != original_window_handle:
-                self._driver.switch_to.window(window_handle)
-                click_time = datetime.now().strftime("%H:%M:%S")
+        log.debug(
+            "click",
+            "Opened link in a new tab. Switching to tab...",
+            fields={"url": link_url, "tab": new_window_handle},
+        )
 
-                sleep(get_random_sleep(3, 5) * config.behavior.wait_factor)
-                log.debug("click", "Current url on new tab", fields={"url": self._driver.current_url})
+        self._driver.switch_to.window(new_window_handle)
+        click_time = datetime.now().strftime("%H:%M:%S")
 
-                if self._hooks_enabled and category in ("Ad", "Shopping"):
-                    hooks.after_ad_click_hook(self._driver)
+        sleep(get_random_sleep(3, 5) * config.behavior.wait_factor)
 
-                self._start_random_action_threads()
+        landing_url = self._landing_url()
+        if landing_url is None:
+            # Вкладка открылась, но лендинг в ней не загрузился (about:blank —
+            # навигация не состоялась). Фальстарт: счётчик растёт только при
+            # реальном открытии лендинга, поэтому пустая вкладка закрывается.
+            log.info(
+                "click",
+                "New tab did not load the landing page; click is not counted",
+                fields={"url": link_url, "category": category},
+            )
+            self._driver.close()
+            self._driver.switch_to.window(original_window_handle)
+            sleep(get_random_sleep(1, 1.5) * config.behavior.wait_factor)
+            return
 
-                url = (
-                    "/".join(self._driver.current_url.split("/", maxsplit=3)[:3])
-                    if category == "Shopping"
-                    else (link_url if is_ad_element else self._driver.current_url)
-                )
+        log.debug("click", "Current url on new tab", fields={"url": landing_url})
 
-                self._update_click_stats(url, click_time, category)
+        if self._hooks_enabled and category in ("Ad", "Shopping"):
+            hooks.after_ad_click_hook(self._driver)
 
-                if config.behavior.request_boost:
-                    boost_requests(self._driver.current_url)
+        self._start_random_action_threads()
 
-                wait_time = self._get_wait_time(is_ad_element) * config.behavior.wait_factor
-                log.debug(
+        url = (
+            "/".join(landing_url.split("/", maxsplit=3)[:3])
+            if category == "Shopping"
+            else (link_url if is_ad_element else landing_url)
+        )
+
+        self._update_click_stats(url, click_time, category)
+
+        if config.behavior.request_boost:
+            boost_requests(landing_url)
+
+        wait_time = self._get_wait_time(is_ad_element) * config.behavior.wait_factor
+        log.debug(
             "click",
             "Waiting on page",
             fields={"seconds": wait_time, "page": category.lower()},
         )
-                sleep(wait_time)
+        sleep(wait_time)
 
-                self._driver.close()
-                break
+        self._driver.close()
 
         # go back to the original window
         self._driver.switch_to.window(original_window_handle)
         sleep(get_random_sleep(1, 1.5) * config.behavior.wait_factor)
 
     def _open_link_in_new_tab(
-        self, link_element: selenium.webdriver.remote.webelement.WebElement
-    ) -> None:
-        """Open the link in a new browser tab
+        self,
+        link_element: selenium.webdriver.remote.webelement.WebElement,
+        link_url: Optional[str] = None,
+    ) -> Optional[str]:
+        """Открыть ссылку в новой вкладке — цепочка попыток с диагностикой.
+
+        Прод-дефект «Ads Found 3 → Ads Clicked 0»: ctrl/cmd+click через
+        ActionChains в Chrome 153 вторую вкладку не открывает (событие
+        перехватывает вёрстка/обработчик Google), а старая проверка
+        ``len(window_handles) != 2`` обрывалась DEBUG-записью и ``return`` —
+        без фолбэка и без причины в логе. Цепочка:
+
+        1. ActionChains ctrl/cmd+click — то, что реально работало в прогонах;
+        2. ``scrollIntoView`` + тот же ctrl/cmd+click — элемент мог быть вне
+           вида или перекрыт другим слоем;
+        3. ``window.open(href)`` — открыть цель по href в новой вкладке. JS-клик
+           ``arguments[0].click()`` не используется намеренно: у goto/aclk-ссылок
+           он ведёт в ту же вкладку, убивает выдачу и клик не засчитывается, а
+           ``window.open`` сохраняет семантику «клик по ссылке» — href тот же,
+           переход регистрирует Google и ведёт на лендинг.
+
+        Каждая неудача логируется отдельно с url и причиной; ``None`` метод
+        возвращает только после того, как отказалась вся цепочка.
 
         :type link_element: selenium.webdriver.remote.webelement.WebElement
         :param link_element: Link element
+        :type link_url: str
+        :param link_url: href, прочитанный при сборе (запасной для протухшего элемента)
+        :rtype: str
+        :returns: Хендл новой вкладки или None, если открыть не удалось
         """
 
-        platform = sys.platform
-        control_command_key = Keys.COMMAND if platform.endswith("darwin") else Keys.CONTROL
+        handles_before = list(self._driver.window_handles)
+        url = self._link_href(link_element, link_url)
+
+        handle = self._ctrl_click_attempt(link_element, url, handles_before, attempt=1)
+        if handle is not None:
+            return handle
+
+        try:
+            self._driver.execute_script("arguments[0].scrollIntoView(true);", link_element)
+        except WebDriverException as exp:
+            log.debug(
+                "click",
+                "Could not scroll the element into view",
+                fields={"url": url, "error": str(exp).split("\n")[0]},
+            )
+
+        handle = self._ctrl_click_attempt(link_element, url, handles_before, attempt=2)
+        if handle is not None:
+            return handle
+
+        return self._open_url_in_new_tab(url, handles_before)
+
+    @staticmethod
+    def _link_href(
+        link_element: selenium.webdriver.remote.webelement.WebElement,
+        link_url: Optional[str],
+    ) -> Optional[str]:
+        """href для клика: живой атрибут элемента, иначе href, прочитанный при сборе.
+
+        Живой атрибут главнее: href мог измениться, пока страница скроллилась.
+        Протухший элемент не роняет цепочку — управление уходит на сохранённый
+        href, который ``window.open`` и так использует.
+        """
+
+        try:
+            href = link_element.get_attribute("href")
+        except WebDriverException:
+            href = None
+
+        return href or link_url
+
+    def _ctrl_click_attempt(
+        self,
+        link_element: selenium.webdriver.remote.webelement.WebElement,
+        link_url: Optional[str],
+        handles_before: list[str],
+        attempt: int,
+    ) -> Optional[str]:
+        """Одна попытка ctrl/cmd+click через ActionChains.
+
+        :type link_element: selenium.webdriver.remote.webelement.WebElement
+        :param link_element: Link element
+        :type link_url: str
+        :param link_url: href для записей в лог
+        :type handles_before: list
+        :param handles_before: Хендлы вкладок до попытки — по ним отличается новая вкладка
+        :type attempt: int
+        :param attempt: Номер попытки в цепочке (для читаемости лога)
+        :rtype: str
+        :returns: Хендл новой вкладки или None (причина — в логе)
+        """
+
+        control_command_key = Keys.COMMAND if sys.platform.endswith("darwin") else Keys.CONTROL
 
         try:
             actions = ActionChains(self._driver)
@@ -876,15 +1063,157 @@ class SearchController:
 
             sleep(get_random_sleep(0.5, 1) * config.behavior.wait_factor)
 
-        except JavascriptException as exp:
-            error_message = str(exp).split("\n")[0]
+        except WebDriverException as exp:
+            # Элемент вне вида, перекрыт или протух: клик не прошёл, но вкладка
+            # могла успеть открыться — проверка ниже общая для обоих исходов.
+            log.debug(
+                "click",
+                "Ctrl+click attempt raised an error",
+                fields={
+                    "url": link_url,
+                    "attempt": attempt,
+                    "error": str(exp).split("\n")[0],
+                    "error_type": type(exp).__name__,
+                },
+            )
 
-            if "has no size and location" in error_message:
-                log.error(
-                    "click",
-                    "Failed to click element, skipping...",
-                    fields={"element_html": link_element.get_attribute("outerHTML")},
-                )
+        handle = self._new_window_handle(handles_before)
+
+        if handle is None:
+            log.info(
+                "click",
+                "Ctrl+click did not open a new tab",
+                fields={"url": link_url, "attempt": attempt},
+            )
+
+        return handle
+
+    def _new_window_handle(self, handles_before: list[str]) -> Optional[str]:
+        """Хендл вкладки, которой не было до попытки; None — новой вкладки нет.
+
+        Сверка идёт по множеству хендлов, а не по ``len(...) != 2``: лишняя
+        вкладка, оставшаяся от прошлой попытки, не должна выглядеть как успех
+        и засчитывать чужой клик.
+        """
+
+        try:
+            handles = list(self._driver.window_handles)
+        except WebDriverException as exp:
+            log.debug(
+                "click",
+                "Window handles are unavailable",
+                fields={"error": str(exp).split("\n")[0], "error_type": type(exp).__name__},
+            )
+            return None
+
+        for handle in handles:
+            if handle not in handles_before:
+                return handle
+
+        return None
+
+    def _open_url_in_new_tab(
+        self, url: Optional[str], handles_before: list[str]
+    ) -> Optional[str]:
+        """Фолбэк: открыть href в новой вкладке через ``window.open``.
+
+        Срабатывает, когда обе ctrl/cmd+click-попытки не открыли вкладку.
+        Открытие идёт по сохранённому href, поэтому протухший элемент и
+        перехваченный Google'ом click-обработчик на результат не влияют.
+
+        :type url: str
+        :param url: href, который должен открыться в новой вкладке
+        :type handles_before: list
+        :param handles_before: Хендлы вкладок до попытки
+        :rtype: str
+        :returns: Хендл новой вкладки или None (причина — в логе)
+        """
+
+        if not url:
+            log.info("click", "Link has no href, there is nothing to open in a new tab")
+            return None
+
+        log.debug(
+            "click",
+            "Ctrl+click did not work, falling back to window.open",
+            fields={"url": url},
+        )
+
+        try:
+            status = self._driver.execute_script(_OPEN_IN_NEW_TAB_JS, url)
+        except WebDriverException as exp:
+            log.info(
+                "click",
+                "window.open fallback raised an error",
+                fields={
+                    "url": url,
+                    "error": str(exp).split("\n")[0],
+                    "error_type": type(exp).__name__,
+                },
+            )
+            return None
+
+        sleep(get_random_sleep(0.5, 1) * config.behavior.wait_factor)
+
+        handle = self._new_window_handle(handles_before)
+
+        if handle is None:
+            # ``blocked`` — popup-блокиратор Chrome: полезная причина для
+            # разбора на живом стенде, если вкладка не открывается никогда.
+            log.info(
+                "click",
+                "window.open did not open a new tab",
+                fields={"url": url, "status": status},
+            )
+            return None
+
+        log.debug(
+            "click",
+            "window.open fallback opened a new tab",
+            fields={"url": url, "status": status},
+        )
+        return handle
+
+    def _landing_url(self) -> Optional[str]:
+        """URL лендинга в текущей вкладке; None — вкладка пустая (``about:blank``).
+
+        Вызывается после переключения на открытую вкладку. Пустая вкладка
+        означает, что навигация не состоялась (popup-блокиратор, битый href) —
+        такой «клик» не должен расти счётчик. Первая проверка может застать
+        вкладку до коммита навигации, поэтому даётся одна короткая
+        перепроверка.
+        """
+
+        url = self._current_url_or_none()
+        if self._is_real_page(url):
+            return url
+
+        sleep(1 * config.behavior.wait_factor)
+
+        url = self._current_url_or_none()
+        return url if self._is_real_page(url) else None
+
+    def _current_url_or_none(self) -> Optional[str]:
+        """``driver.current_url`` без исключений: мёртвый драйвер не роняет клик."""
+
+        try:
+            return self._driver.current_url
+        except WebDriverException as exp:
+            log.debug(
+                "click",
+                "Current url is unavailable",
+                fields={"error": str(exp).split("\n")[0], "error_type": type(exp).__name__},
+            )
+            return None
+
+    @staticmethod
+    def _is_real_page(url: Optional[str]) -> bool:
+        """Страница загрузилась: не пусто и не заглушка браузера (``about:``, ``data:``)."""
+
+        if not url:
+            return False
+
+        return not url.startswith(("about:", "data:"))
 
     def _get_wait_time(self, is_ad_element: bool) -> int:
         """Get wait time based on whether the link is an ad or non-ad
@@ -1056,26 +1385,46 @@ class SearchController:
                     ads.append(ad_fields)
 
             else:
-                commercial_unit_container = self._driver.find_element(By.CLASS_NAME, "cu-container")
-                shopping_ads = commercial_unit_container.find_elements(By.CLASS_NAME, "pla-unit")
-
-                for shopping_ad in shopping_ads[:5]:
-                    ad = shopping_ad.find_element(By.TAG_NAME, "a")
-                    shopping_ad_link = ad.get_attribute("href")
-
-                    ad_data_element = shopping_ad.find_element(By.CSS_SELECTOR, "a:nth-child(2)")
-                    shopping_ad_title = ad_data_element.get_attribute("aria-label")
-                    shopping_ad_target_link = ad_data_element.get_attribute("href")
-
-                    ad_fields = (
-                        shopping_ad,
-                        shopping_ad_link,
-                        shopping_ad_title,
-                        shopping_ad_target_link,
+                # Десктоп. Контейнер ищется отдельно от сбора: на части выдач
+                # ``cu-container`` отсутствует (селектор предка другой), и раньше
+                # NoSuchElementException обрывал сбор целиком — «Shopping Ads
+                # Found 0» при живых блоках на странице.
+                try:
+                    commercial_unit_container = self._driver.find_element(
+                        By.CLASS_NAME, "cu-container"
                     )
-                    log.debug("click", "Shopping ad candidate", fields={"ad": ad_fields})
+                except NoSuchElementException:
+                    commercial_unit_container = None
 
-                    ads.append(ad_fields)
+                if commercial_unit_container is not None:
+                    shopping_ads = commercial_unit_container.find_elements(
+                        By.CLASS_NAME, "pla-unit"
+                    )
+
+                    for shopping_ad in shopping_ads[:5]:
+                        ad = shopping_ad.find_element(By.TAG_NAME, "a")
+                        shopping_ad_link = ad.get_attribute("href")
+
+                        ad_data_element = shopping_ad.find_element(
+                            By.CSS_SELECTOR, "a:nth-child(2)"
+                        )
+                        shopping_ad_title = ad_data_element.get_attribute("aria-label")
+                        shopping_ad_target_link = ad_data_element.get_attribute("href")
+
+                        ad_fields = (
+                            shopping_ad,
+                            shopping_ad_link,
+                            shopping_ad_title,
+                            shopping_ad_target_link,
+                        )
+                        log.debug("click", "Shopping ad candidate", fields={"ad": ad_fields})
+
+                        ads.append(ad_fields)
+
+                if not ads:
+                    # Третий путь (fallback): контейнера нет либо он пуст —
+                    # собираются все блоки ``.pla-unit`` на странице.
+                    ads.extend(self._collect_page_shopping_units())
 
         except NoSuchElementException:
             # Сбор прерван на середине (нет контейнера либо у очередного блока
@@ -1127,6 +1476,73 @@ class SearchController:
             shopping_ad_links.append((ad[0], ad_link, ad_title))
 
         return shopping_ad_links
+
+    def _collect_page_shopping_units(self) -> list[tuple]:
+        """Собрать shopping-блоки по фактической вёрстке — все ``.pla-unit`` на странице.
+
+        Контейнер-предок (``cu-container`` / ``pla-unit-container``) на части
+        выдач отсутствует или имеет другой класс, из-за чего сбор обрывался с
+        ``NoSuchElementException`` и раунд уходил в «No shopping ads» при
+        наличии самих блоков и якорей с aclk (проверено живым срезом). Поэтому
+        здесь сбор идёт по всем ``.pla-unit`` на странице, без требования к
+        классу предка, а битый блок без якоря пропускается с записью в лог и
+        не обрывает сбор остальных.
+
+        Применение фильтров и чёрного списка не зависит от этого метода: они
+        выполняются в :meth:`_get_shopping_ad_links` после сбора, как и раньше.
+
+        :rtype: list
+        :returns: Список кортежей (ad, ad_link, ad_title, ad_target_link)
+        """
+
+        units = self._driver.find_elements(By.CSS_SELECTOR, ".pla-unit")
+        log.debug("click", "Shopping units found on the page", fields={"count": len(units)})
+
+        collected = []
+
+        for shopping_ad in units:
+            if len(collected) >= 5:
+                break
+
+            try:
+                ad = shopping_ad.find_element(By.TAG_NAME, "a")
+                shopping_ad_link = ad.get_attribute("href")
+            except NoSuchElementException:
+                log.debug("click", "Shopping unit has no anchor, skipping")
+                continue
+
+            if not shopping_ad_link:
+                log.debug("click", "Shopping unit anchor has no href, skipping")
+                continue
+
+            # Якорь с aria-label есть не в каждом блоке: без него заголовок
+            # берётся из видимого текста, а цель клика — из первого якоря.
+            try:
+                ad_data_element = shopping_ad.find_element(By.CSS_SELECTOR, "a:nth-child(2)")
+            except NoSuchElementException:
+                ad_data_element = None
+
+            shopping_ad_title = ""
+            shopping_ad_target_link = shopping_ad_link
+
+            if ad_data_element is not None:
+                shopping_ad_title = ad_data_element.get_attribute("aria-label") or ""
+                shopping_ad_target_link = ad_data_element.get_attribute("href") or shopping_ad_link
+
+            if not shopping_ad_title:
+                shopping_ad_title = (getattr(shopping_ad, "text", "") or "").strip()
+
+            ad_fields = (
+                shopping_ad,
+                shopping_ad_link,
+                shopping_ad_title,
+                shopping_ad_target_link,
+            )
+            log.debug("click", "Shopping ad candidate", fields={"ad": ad_fields})
+
+            collected.append(ad_fields)
+
+        return collected
 
     def _get_ad_links(self) -> AdList:
         """Extract ad links to click
@@ -1246,6 +1662,19 @@ class SearchController:
         попадает в результат: раньше список доменов, наоборот, работал как
         белый, и кликер кликал ровно ссылки на наш домен.
 
+        Отбор результата (новый контракт, прод-дефект «из ~200 ссылок проходила
+        одна — ``support.google.com/...»):
+
+        * href обязан быть http-адресом;
+        * служебные ссылки Google отбраковываются по хосту
+          (:func:`_is_google_service_url`): ``support.google.com``,
+          ``accounts.google.com``, ``https://www.google.com/preferences...`` —
+          нет; ссылки-перенаправления ``/url?`` с настоящими результатами — да;
+        * атрибуты ``jsname``/``data-ved`` больше не требуются — их нет у
+          многих реальных результатов, и именно они отсекали органику;
+        * якоря-иконки (внутри ``svg``), ссылки со служебными ``role`` и
+          ``data-rw`` остаются исключёнными, как и раньше.
+
         :type ad_links: AdList
         :param ad_links: List of ad links found to exclude
         :type blocked_domains: list
@@ -1267,6 +1696,9 @@ class SearchController:
         log.debug("click", "len(all_links)", fields={"count": len(all_links)})
 
         non_ad_links = []
+        # Причины отбраковки одной сводной записью: по ней видно, почему из
+        # двухсот ссылок выдачи в клик ушло (или не ушло) ничего.
+        rejected = {"not_http": 0, "google_service": 0, "role": 0, "data_rw": 0, "icon": 0}
 
         for link in all_links:
             for ad in ad_links:
@@ -1275,39 +1707,46 @@ class SearchController:
                     break
             else:
                 link_url = link.get_attribute("href")
-                if (
-                    link_url
-                    and (
-                        link.get_attribute("role")
-                        not in (
-                            "link",
-                            "button",
-                            "menuitem",
-                            "menuitemradio",
-                        )
-                    )
-                    and link.get_attribute("jsname")
-                    and link.get_attribute("data-ved")
-                    and not link.get_attribute("data-rw")
-                    and "/maps" not in link_url
-                    and "/search?q" not in link_url
-                    and "googleadservices" not in link_url
-                    and "https://www.google" not in link_url
-                    and (link_url and link_url.startswith("http"))
-                    and len(link.find_elements(By.TAG_NAME, "svg")) == 0
-                ):
-                    if self._is_blocked_target(
-                        link_url, text=getattr(link, "text", "") or "", domains=domains
-                    ):
-                        log.debug(
-                            "click",
-                            "Excluding non-ad link",
-                            fields={"url": link_url},
-                        )
-                        continue
 
-                    log.debug("click", "Adding to non-ad links", fields={"url": link_url})
-                    non_ad_links.append(link)
+                if not link_url or not link_url.startswith("http"):
+                    rejected["not_http"] += 1
+                    continue
+
+                if _is_google_service_url(link_url):
+                    rejected["google_service"] += 1
+                    continue
+
+                if link.get_attribute("role") in (
+                    "link",
+                    "button",
+                    "menuitem",
+                    "menuitemradio",
+                ):
+                    rejected["role"] += 1
+                    continue
+
+                if link.get_attribute("data-rw"):
+                    rejected["data_rw"] += 1
+                    continue
+
+                if len(link.find_elements(By.TAG_NAME, "svg")) > 0:
+                    rejected["icon"] += 1
+                    continue
+
+                if self._is_blocked_target(
+                    link_url, text=getattr(link, "text", "") or "", domains=domains
+                ):
+                    log.debug(
+                        "click",
+                        "Excluding non-ad link",
+                        fields={"url": link_url},
+                    )
+                    continue
+
+                log.debug("click", "Adding to non-ad links", fields={"url": link_url})
+                non_ad_links.append(link)
+
+        log.debug("click", "Non-ad links rejected", fields=rejected)
 
         log.info("click", "Found non-ad links", fields={"count": len(non_ad_links)})
 
