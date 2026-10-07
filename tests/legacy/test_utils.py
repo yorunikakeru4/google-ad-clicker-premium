@@ -828,3 +828,20 @@ class TestRequireGermanExit:
         error = excinfo.value
         assert error.reason.startswith("exit-IP не Германия: CY")
         assert error.proxy_address == "proxy.host:8080"
+
+
+def test_get_domains_warns_when_blacklist_is_empty(set_paths, tmp_path, caplog):
+    # Прод-инцидент: пустой domains.txt и без behavior.own_domain — чёрный
+    # список выключен. Оператор должен увидеть это в логе, а не догадываться,
+    # почему запрещённый домен кликается.
+    domains_file = tmp_path / "empty_domains.txt"
+    domains_file.write_text("\n  \n", "utf-8")
+    set_paths(filtered_domains=domains_file)
+
+    assert utils.get_domains() == []
+
+    record = next(
+        entry for entry in caplog.records if entry.getMessage().startswith("Blacklist is empty")
+    )
+    assert record.category == "click"
+    assert record.levelname == "WARNING"

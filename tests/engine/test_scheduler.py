@@ -112,32 +112,53 @@ def test_interval_of_fifteen_minutes_is_accepted_but_does_not_cover_now():
 
 
 # --- распределение работы -------------------------------------------------
+#
+# Распределение больше не детерминировано: порядок раунда считается из пары
+# «соль запуска + номер раунда». Поэтому проверки свойств, которые обязаны
+# выполняться при ЛЮБОЙ соли, идут со значением по умолчанию, а проверки
+# «случайности» перебирают явные соли: результат в этом случае вычислен
+# заранее и не меняется от машины к машине — тест не может стать флаки.
 
 
-def test_worker_items_are_strided_over_the_pool():
-    queries = [f"q{i}" for i in range(1, 7)]
-
-    round_zero = [next_worker_item(queries, index, 3, 0) for index in (1, 2, 3)]
-    round_one = [next_worker_item(queries, index, 3, 1) for index in (1, 2, 3)]
-
-    assert round_zero == ["q1", "q2", "q3"]
-    assert round_one == ["q4", "q5", "q6"]
-
-
-def test_worker_items_wrap_around_the_list():
-    queries = ["a", "b"]
-
-    assert next_worker_item(queries, 3, 3, 0) == "a"
-    assert next_worker_item(queries, 3, 3, 1) == "b"
-
-
-def test_worker_items_are_distinct_within_a_round_when_pool_fits():
+def test_worker_items_are_distinct_within_a_round():
+    """Свойство stride сохранено: в одном раунде воркеры не пересекаются."""
     queries = [f"q{i}" for i in range(1, 9)]
 
     picked = [next_worker_item(queries, index, 4, 1) for index in range(1, 5)]
 
     assert len(set(picked)) == 4
-    assert picked == ["q5", "q6", "q7", "q8"]
+    assert set(picked) <= set(queries)
+
+
+def test_worker_item_is_stable_for_the_same_arguments():
+    """Выбор — чистая функция: так разные процессы сходятся без общения."""
+    queries = [f"q{i}" for i in range(1, 7)]
+
+    assert next_worker_item(queries, 2, 3, 5) == next_worker_item(queries, 2, 3, 5)
+
+
+def test_new_starts_do_not_repeat_the_same_first_round():
+    """Дефект старта: стрид всегда отдавал ``items[0..N-1]`` нового запуска.
+
+    Соли перечислены явно, а не берутся из ``_RUN_SEED``: ppid тестового
+    процесса на каждой машине свой, и свойство обязано быть доказано для
+    набора солей, а не для одной случайной.
+    """
+    queries = [f"q{i}" for i in range(1, 7)]
+    starts = [
+        tuple(next_worker_item(queries, index, 3, 0, seed=seed) for index in (1, 2, 3))
+        for seed in range(60)
+    ]
+
+    assert any(start != tuple(queries[:3]) for start in starts), (
+        "хотя бы один запуск обязан начинать не с одних и тех же первых запросов"
+    )
+    assert len({start[0] for start in starts}) > 1, (
+        "первый воркер не должен получать один и тот же запрос на всех запусках"
+    )
+    assert all(len(set(start)) == 3 for start in starts), (
+        "даже при другом порядке воркеры одного раунда не пересекаются"
+    )
 
 
 def test_more_workers_than_items_wraps_without_error():
@@ -145,7 +166,8 @@ def test_more_workers_than_items_wraps_without_error():
 
     picked = [next_worker_item(queries, index, 3, 0) for index in (1, 2, 3)]
 
-    assert picked == ["a", "b", "a"]
+    assert sorted(set(picked)) == ["a", "b"], "элементы списка должны исчерпаться"
+    assert picked[0] == picked[2], "лишний воркер получает честный повтор"
 
 
 def test_worker_items_reject_empty_source():
@@ -163,16 +185,24 @@ def test_worker_items_reject_invalid_worker_index():
         next_worker_item(["a"], 0, 1, 0)
 
 
-def test_round_item_is_the_same_for_every_worker():
-    """multiprocess_style == 2: один запрос на всех, очередь движется по раундам."""
+def test_round_item_is_stable_within_a_round():
+    """multiprocess_style == 2: один запрос на всех воркеров одного раунда."""
     queries = ["a", "b", "c"]
 
-    assert [next_round_item(queries, round_index) for round_index in range(4)] == [
-        "a",
-        "b",
-        "c",
-        "a",
-    ]
+    assert next_round_item(queries, 2, seed=7) == next_round_item(queries, 2, seed=7)
+
+
+def test_round_item_is_random_per_run_and_not_a_cycle():
+    """Стиль 2 больше не ходит по кругу ``a, b, c, a...`` ни на старте, ни дальше."""
+    queries = ["a", "b", "c"]
+
+    starts = {next_round_item(queries, 0, seed=seed) for seed in range(40)}
+    sequence = [next_round_item(queries, round_index, seed=7) for round_index in range(6)]
+
+    assert len(starts) > 1, "новый запуск не должен начинать с одного и того же запроса"
+    assert set(starts) == set(queries), "за 40 запусков должны встретиться все запросы"
+    assert sequence != ["a", "b", "c", "a", "b", "c"]
+    assert set(sequence) <= set(queries)
 
 
 def test_round_item_rejects_empty_source():

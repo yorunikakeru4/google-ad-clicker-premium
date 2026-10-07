@@ -7,6 +7,7 @@ from pathlib import Path
 from time import sleep
 from threading import Thread
 from typing import Any, Optional, Union
+from urllib.parse import parse_qs, urlparse
 
 import selenium
 from selenium.webdriver import ActionChains
@@ -44,6 +45,7 @@ from utils import (
     add_cookies,
     solve_recaptcha,
     domain_matches,
+    get_domains,
     get_random_sleep,
     resolve_redirect,
     boost_requests,
@@ -77,6 +79,14 @@ CAPTCHA_SOLVE_SESSION_LIMIT = 5
 # Каталог скриншотов CAPTCHA — относительно текущего каталога (как и весь
 # legacy-ввод/вывод: config.json, logs/, clicklogs.db), уже в .gitignore.
 CAPTCHA_SCREENSHOT_DIR = Path("engine/screenshots")
+
+# Причина ротации прокси, которую воркер кладёт в ``workers.last_error`` через
+# ``mark_degraded``: её читает супервизор и по статусу ``degraded`` подменяет
+# прокси на резервный (``supervisor._handle_degraded``). Прокси, показавший
+# капчу, считается испорченным (IP в бане), поэтому ждать с ним следующий
+# заход бессмысленно. В тексте — только факт детекта: кредов прокси, sitekey
+# и URL туда не попадают, строка видна в UI.
+CAPTCHA_PROXY_ROTATION_REASON = "captcha seen, rotating proxy"
 
 # --- cookie-баннер: только кнопка согласия -----------------------------------
 
@@ -134,6 +144,45 @@ LinkElement = selenium.webdriver.remote.webelement.WebElement
 AdList = list[tuple[LinkElement, str, str]]
 NonAdList = list[LinkElement]
 AllLinks = list[Union[AdList, NonAdList]]
+
+# Параметры query ссылок-перенаправлений Google, в которых лежит настоящая
+# цель клика: ``/url?...&url=...`` у органики, ``/aclk?...&adurl=...`` у
+# рекламы и shopping. Параметр ``q`` сюда намеренно не входит: у него две
+# разные роли (поисковый запрос и цель), и матчинг по нему блокировал бы
+# рекламу за одно совпадение с самим запросом.
+_DESTINATION_PARAMS = ("url", "adurl")
+
+
+def _destination_targets(urls: tuple) -> list[str]:
+    """Цели клика, спрятанные внутри ссылок-перенаправлений Google.
+
+    Хост самой ссылки — ``google.*``, поэтому по одному лишь хосту чёрный
+    список не срабатывает, хотя клик в итоге уходит на запрещённый домен
+    (прод-инцидент с ``edelind.de``). Цель извлекается из параметров
+    назначения и передаётся в тот же матчинг, что и сам href.
+
+    :type urls: tuple
+    :param urls: известные варианты цели клика (href, data-pcu, ...)
+    :rtype: list
+    :returns: декодированные цели без пустых значений
+    """
+
+    targets: list[str] = []
+
+    for url in urls:
+        if not url:
+            continue
+
+        try:
+            query = parse_qs(urlparse(url).query)
+        except ValueError:
+            # Некорректный URL — с ним нечего делать, это не цель клика.
+            continue
+
+        for name in _DESTINATION_PARAMS:
+            targets.extend(value for value in query.get(name, []) if value)
+
+    return targets
 
 
 class SearchController:
@@ -265,6 +314,9 @@ class SearchController:
         слово из ``behavior.excludes``. Проверяются **все** переданные URL:
         у рекламы ``href`` (перенаправление Google) и ``data-pcu`` (реальная
         цель) — это разные строки, и достаточно совпадения в любой из них.
+        Отдельно разбираются ссылки-перенаправления: цель, лежащая в
+        параметрах ``url=``/``adurl=``, проверяется так же, как сам href —
+        по хосту ``google.*`` такой клик выглядел бы разрешённым.
 
         Раньше excludes смотрели только на рекламу и только по заголовку с
         ``data-pcu``, а органика не проверялась вовсе — из-за этого кликер
@@ -280,18 +332,22 @@ class SearchController:
 
         blocked = self._blocked_domains if domains is None else domains
 
+        # Кандидаты на матчинг — сами ссылки плюс цели внутри перенаправлений
+        # Google: достаточно совпадения в любой из строк.
+        candidates = [*(url for url in urls if url), *_destination_targets(urls)]
+
         for domain in blocked:
-            for url in urls:
-                if url and domain_matches(url, domain):
+            for target in candidates:
+                if domain_matches(target, domain):
                     log.debug(
                         "click",
                         "Excluding: blocked domain",
-                        fields={"url": url, "domain": domain},
+                        fields={"url": target, "domain": domain},
                     )
                     return True
 
         haystack = "\n".join(
-            [*(url.lower() for url in urls if url), title.lower(), text.lower()]
+            [*(target.lower() for target in candidates), title.lower(), text.lower()]
         )
         for word in self._exclude_list or []:
             if word and word.lower() in haystack:
@@ -316,7 +372,8 @@ class SearchController:
         :param blocked_domains: Чёрный список доменов; хранится на время
             сценария и используется всеми тремя сборщиками ссылок
         :rtype: tuple
-        :returns: Tuple of [(ad, ad_link, ad_title), non_ad_links]
+        :returns: Tuple of [(ad, ad_link, ad_title), non_ad_links,
+            shopping_ad_links]
         """
 
         # До любых сборщиков ссылок: списком владеет вызывающий код
@@ -420,14 +477,27 @@ class SearchController:
         :param shopping_ads: List of (ad, ad_link, ad_title) tuples
         """
 
+        # Чёрный список перечитывается перед кликами: domains.txt мог
+        # обновиться, пока шли поиск и прокрутка.
+        self._refresh_blocked_domains()
+
         # store the ID of the original window
         original_window_handle = self._driver.current_window_handle
 
         for ad in shopping_ads:
+            # Заголовок до try: обработчик ниже пишет его в лог, а при обрыве
+            # на разборе кортежа переменная иначе осталась бы необъявленной.
+            ad_title = ""
             try:
                 ad_link_element = ad[0]
                 ad_link = ad[1]
                 ad_title = ad[2].replace("\n", " ")
+
+                # Повторная проверка непосредственно перед кликом: ссылка могла
+                # быть собрана до обновления чёрного списка.
+                if self._is_blocked_before_click(ad_link_element, ad_link, ad_title, "Shopping"):
+                    continue
+
                 log.info("click", "Clicking to", fields={"title": ad_title, "url": ad_link})
 
                 if self._hooks_enabled:
@@ -443,6 +513,82 @@ class SearchController:
             except Exception:
                 log.debug("click", "Failed to click ad element!", fields={"title": ad_title})
 
+    def _refresh_blocked_domains(self) -> None:
+        """Перечитать чёрный список доменов с диска непосредственно перед кликами.
+
+        ``utils.get_domains`` вызывается один раз в начале раунда, а
+        ``domains.txt`` может обновиться, пока шли поиск и прокрутка (список
+        правится из UI). Результат объединяется с уже сохранённым: за время
+        раунда список только расширяется, а убранная строка перестанет
+        блокировать со следующего раунда — направление «сначала блокируем»
+        важнее скорости реакции на удаление.
+
+        Отказ чтения (нет файла, ошибка ввода-вывода) клики не роняет: остаётся
+        список, полученный в начале раунда.
+        """
+
+        try:
+            fresh = get_domains()
+        except (SystemExit, Exception) as exp:
+            log.warning(
+                "click",
+                "Blocked domains were not re-read; keeping the round list",
+                fields={"error": str(exp), "error_type": type(exp).__name__},
+            )
+            return
+
+        self._blocked_domains = list(dict.fromkeys([*self._blocked_domains, *fresh]))
+
+    def _is_blocked_before_click(
+        self,
+        link_element: selenium.webdriver.remote.webelement.WebElement,
+        link_url: Optional[str],
+        title: str,
+        category: str,
+    ) -> bool:
+        """Запрещён ли цель клика прямо сейчас — последний рубеж перед кликом.
+
+        Сбор ссылок происходит в начале раунда, а чёрный список мог
+        обновиться, пока браузер скроллил и ждал: проверка повторяется по
+        свежему ``href``, а у рекламы ещё и по ``data-pcu`` (реальная цель
+        вместо перенаправления Google).
+
+        :type link_element: WebElement
+        :param link_element: элемент, который собираются кликнуть
+        :type link_url: str
+        :param link_url: href, прочитанный при сборе
+        :type title: str
+        :param title: заголовок ссылки
+        :type category: str
+        :param category: Ad, Shopping или Non-ad — кому идёт счётчик исключений
+        :rtype: bool
+        :returns: True — кликать нельзя, ссылка пропускается
+        """
+
+        if category == "Non-ad":
+            urls = (link_url,)
+            text = getattr(link_element, "text", "") or ""
+        else:
+            # data-pcu — реальная цель; у shopping-блока атрибута нет,
+            # get_attribute вернёт None и проверка сводится к href.
+            urls = (link_url, link_element.get_attribute("data-pcu"))
+            text = ""
+
+        if not self._is_blocked_target(*urls, title=title or "", text=text):
+            return False
+
+        if category == "Ad":
+            self._stats.num_excluded_ads += 1
+        elif category == "Shopping":
+            self._stats.num_excluded_shopping_ads += 1
+
+        log.info(
+            "click",
+            "Skipping target from the blacklist",
+            fields={"url": link_url, "category": category},
+        )
+        return True
+
     def click_links(self, links: AllLinks) -> None:
         """Click links
 
@@ -452,14 +598,31 @@ class SearchController:
 
         execute_stealth_js_code(self._driver)
 
+        # Чёрный список перечитывается до кликов: domains.txt мог обновиться,
+        # пока шли поиск и прокрутка.
+        self._refresh_blocked_domains()
+
         # store the ID of the original window
         original_window_handle = self._driver.current_window_handle
 
         for link in links:
             is_ad_element = isinstance(link, tuple)
+            category = "Ad" if is_ad_element else "Non-ad"
+            # До try — обработчики ниже пишут их в лог; при обрыве на самом
+            # разборе ссылки переменные иначе оказались бы необъявленными, и
+            # UnboundLocalError обрывал весь цикл вместе с оставшимися кликами.
+            link_element = None
+            link_url = None
+            ad_title = None
 
             try:
                 link_element, link_url, ad_title = self._extract_link_info(link, is_ad_element)
+
+                # Последний рубеж перед кликом: цель проверяется по свежему
+                # списку и свежему href — ссылка могла быть собрана до
+                # обновления domains.txt.
+                if self._is_blocked_before_click(link_element, link_url, ad_title or "", category):
+                    continue
 
                 if self._hooks_enabled and is_ad_element:
                     hooks.before_ad_click_hook(self._driver)
@@ -469,8 +632,6 @@ class SearchController:
                     "Clicking to",
                     fields={"title": ad_title, "url": link_url, "is_ad": is_ad_element},
                 )
-
-                category = "Ad" if is_ad_element else "Non-ad"
 
                 if config.behavior.send_to_android and self._android_device_id:
                     self._handle_android_click(link_element, link_url, is_ad_element, category)
@@ -486,14 +647,14 @@ class SearchController:
                 log.debug(
                     "click",
                     "Ad element has changed. Skipping scroll into view...",
-                    fields={"element": ad_title if is_ad_element else link_url},
+                    fields={"element": ad_title or link_url},
                 )
 
             except Exception:
                 log.error(
                     "click",
                     "Failed to click on",
-                    fields={"element": ad_title if is_ad_element else link_url},
+                    fields={"element": ad_title or link_url},
                 )
 
     def _extract_link_info(self, link: Any, is_ad_element: bool) -> tuple:
@@ -874,52 +1035,56 @@ class SearchController:
 
                     ads.append(ad_fields)
 
-            self._stats.shopping_ads_found = len(ads)
-
-            if not ads:
-                return []
-
-            # if there are filter words given, filter results accordingly
-            filtered_ads = []
-
-            if self._filter_words:
-                for ad in ads:
-                    ad_title = ad[2].replace("\n", " ")
-                    ad_link = ad[3]
-
-                    for word in self._filter_words:
-                        if word in ad_link or word in ad_title.lower():
-                            if ad not in filtered_ads:
-                                log.debug("click", "Filtering", fields={"title": ad_title, "link": ad_link})
-                                self._stats.num_filtered_shopping_ads += 1
-                                filtered_ads.append(ad)
-            else:
-                filtered_ads = ads
-
-            shopping_ad_links = []
-
-            for ad in filtered_ads:
-                ad_link = ad[1]
-                ad_title = ad[2].replace("\n", " ")
-                ad_target_link = ad[3]
-                log.debug("click", "Ad title", fields={"title": ad_title, "link": ad_link})
-
-                # Чёрный список (домены + слова исключения) закрывает и
-                # shopping: клик по цели из списка запрещён так же, как в
-                # обычной рекламе и в органике.
-                if self._is_blocked_target(ad_link, ad_target_link, title=ad_title):
-                    self._stats.num_excluded_shopping_ads += 1
-                    continue
-
-                log.info("click", "======= Found a Shopping Ad =======")
-                shopping_ad_links.append((ad[0], ad_link, ad_title))
-
-            return shopping_ad_links
-
         except NoSuchElementException:
-            log.info("click", "No shopping ads are shown!")
+            # Сбор прерван на середине (нет контейнера либо у очередного блока
+            # нет якоря): собранное не выбрасывается, но и без фильтров/чёрного
+            # списка не возвращается. Раньше ветка отдавала ``ads`` как есть —
+            # минуя и filter_words, и чёрный список, — и кликер уходил на цель
+            # из списка запрещённых доменов.
+            log.debug("click", "Shopping ads block is incomplete")
 
-        return ads
+        if not ads:
+            log.info("click", "No shopping ads are shown!")
+            return []
+
+        self._stats.shopping_ads_found = len(ads)
+
+        # if there are filter words given, filter results accordingly
+        filtered_ads = []
+
+        if self._filter_words:
+            for ad in ads:
+                ad_title = ad[2].replace("\n", " ")
+                ad_link = ad[3]
+
+                for word in self._filter_words:
+                    if word in ad_link or word in ad_title.lower():
+                        if ad not in filtered_ads:
+                            log.debug("click", "Filtering", fields={"title": ad_title, "link": ad_link})
+                            self._stats.num_filtered_shopping_ads += 1
+                            filtered_ads.append(ad)
+        else:
+            filtered_ads = ads
+
+        shopping_ad_links = []
+
+        for ad in filtered_ads:
+            ad_link = ad[1]
+            ad_title = ad[2].replace("\n", " ")
+            ad_target_link = ad[3]
+            log.debug("click", "Ad title", fields={"title": ad_title, "link": ad_link})
+
+            # Чёрный список (домены + слова исключения) закрывает и
+            # shopping: клик по цели из списка запрещён так же, как в
+            # обычной рекламе и в органике.
+            if self._is_blocked_target(ad_link, ad_target_link, title=ad_title):
+                self._stats.num_excluded_shopping_ads += 1
+                continue
+
+            log.info("click", "======= Found a Shopping Ad =======")
+            shopping_ad_links.append((ad[0], ad_link, ad_title))
+
+        return shopping_ad_links
 
     def _get_ad_links(self) -> AdList:
         """Extract ad links to click
@@ -936,7 +1101,13 @@ class SearchController:
 
         log.debug("click", "Max scroll limit", fields={"limit": self._max_scroll_limit})
 
-        while not self._is_scroll_at_the_end():
+        # Сбор стоит ПЕРЕД проверкой конца страницы, а не после: верхняя
+        # реклама (``#tads``) видна без прокрутки и должна собираться даже на
+        # странице, которую скроллить некуда, а нижняя (``#tadsb``) дорисовывается
+        # Google уже после последнего PAGE_DOWN — раньше финальная позиция не
+        # обследовалась вовсе, и раунд уходил в «No ads found» с закрытым
+        # браузером.
+        while True:
             try:
                 top_ads_containers = self._driver.find_elements(*self.TOP_ADS_CONTAINER)
                 for ad_container in top_ads_containers:
@@ -952,6 +1123,10 @@ class SearchController:
 
             except NoSuchElementException:
                 log.debug("click", "Could not found bottom ads!")
+
+            if self._is_scroll_at_the_end():
+                log.debug("click", "Reached the end of the page! Ending scroll...")
+                break
 
             if self._max_scroll_limit > 0:
                 if scroll_count == self._max_scroll_limit:
@@ -1432,6 +1607,31 @@ class SearchController:
           stop-ветку с ``solved=false``.
         * **both** — решает; любая неудача или исчерпание лимита — stop-ветка.
 
+        **Ротация прокси.** Любая ветка детекта, уводящая прогон в stop
+        (политика ``stop``, нет ключа, лимит сессии, нет URL, неудача
+        решения — все они создают событие и заканчивают прогон), после
+        записи события шлёт сигнал ротации ``log.mark_degraded(...)`` из
+        :meth:`_stop_for_captcha`. Это тот же сигнал, что шлют ``ad_clicker``
+        при отбраковке прокси пробой и ``webdriver`` при ошибке прокси:
+        супервизор видит ``degraded`` и подменяет прокси на резервный, так
+        что следующий заход идёт уже с другого IP. Раньше сигнал не шёлся —
+        событие писалось в ``captcha_events``, а воркер работал дальше с тем
+        же адресом, на котором поймал капчу. Порядок обязателен: строка
+        события в ``captcha_events`` раньше сигнала, иначе супервизор мог бы
+        погасить процесс до того, как событие доедет до БД.
+
+        **Решённая капча — единственное исключение.** В ветке ``solve``/
+        ``both`` с ``solved=true`` прогон продолжается, а ротация — это
+        рестарт процесса супервизором (SIGTERM, выдержка ``shutdown_grace``,
+        SIGKILL): сигнал убил бы только что решённый прогон на середине и
+        обесценил бы саму политику solve, поэтому там сигнала нет. Отложить
+        его до конца прогона можно только из точки завершения сценария
+        (``engine.worker`` / ``ad_clicker.end_search``) — она вне зоны
+        captcha-ветки. При дефолтной политике ``stop`` исключения нет:
+        любая капча заканчивает прогон, а значит требование «после каждой
+        CAPTCHA менять proxy» выполняется для каждой капчи, которую видит
+        оператор.
+
         **Изменение семантики (осознанное, по плану):** legacy при наличии
         ключа решал капчу сам и продолжал прогон, без ключа — останавливал.
         Новый дефолт ``captcha_policy=stop`` останавливает прогон и при
@@ -1550,6 +1750,10 @@ class SearchController:
         elapsed_ms = int((time.monotonic() - started_at) * 1000)
 
         if response_code:
+            # Ротации здесь намеренно нет: прогон продолжается, а сигнал
+            # mark_degraded заставил бы супервизора убить процесс на середине
+            # только что решённого прогона. Сигнал шлёт ровно stop-ветка
+            # (:meth:`_stop_for_captcha`) — см. докстринг метода.
             log.info("captcha", "Captcha was solved.", fields={"elapsed_ms": elapsed_ms})
             self._stats.captcha_solved = True
             event.update(solved=True, solver="2captcha", elapsed_ms=elapsed_ms)
@@ -1861,14 +2065,27 @@ class SearchController:
         return result.get("code"), result.get("error")
 
     def _stop_for_captcha(self, reason: str) -> None:
-        """Stop-ветка: прервать сценарий и ждать оператора.
+        """Stop-ветка: прервать сценарий и запросить ротацию прокси.
 
-        Семантика — legacy-ветка «нет ключа»: ``SystemExit`` выходит из
-        ``search_for_ads`` в ``run_scenario``, whose ``finally`` закрывает
+        Семантика остановки — legacy-ветка «нет ключа»: ``SystemExit`` выходит
+        из ``search_for_ads`` в ``run_scenario``, whose ``finally`` закрывает
         браузер, а ``engine.worker`` ловит ``SystemExit``, помечает прогон
         упавшим и ждёт следующего раунда по расписанию. Скриншот, событие и
         уведомление к этому моменту уже сделаны — оператор получает полную
-        картину и решает, что дальше.
+        картину.
+
+        Ротация прокси живёт здесь, а не в каждой ветке
+        :meth:`_check_captcha`: все stop-ветки сходятся в эту функцию уже с
+        записанным событием, поэтому одного сигнала хватает, чтобы ни одна
+        причина остановки не осталась без ротации, а сигнал не мог уехать
+        раньше строки в ``captcha_events``. ``mark_degraded`` — готовый
+        механизм (тот же, что у ``ad_clicker`` при отбраковке прокси пробой):
+        супервизор видит ``workers.status='degraded'`` и подменяет прокси на
+        резервный. В причине — только факт детекта, без кредов: она попадает
+        в ``workers.last_error`` и видна в UI.
+
+        Решённая капча сюда не попадает — сигнал там сломал бы продолжаемый
+        прогон; см. докстринг :meth:`_check_captcha`.
         """
         log.info(
             "captcha",
@@ -1876,6 +2093,7 @@ class SearchController:
             fields={"reason": reason},
         )
         log.info("click", str(self.stats))
+        log.mark_degraded(CAPTCHA_PROXY_ROTATION_REASON)
         raise SystemExit()
 
     def _close_choose_location_popup(self) -> None:

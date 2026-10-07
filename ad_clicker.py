@@ -290,7 +290,10 @@ def run_scenario(
         if config.behavior.hooks_enabled:
             hooks.after_search_hook(driver)
 
-        if not (ads or shopping_ads):
+        # Пуст только тогда, когда нечего кликать вовсе: одна пустая реклама
+        # при живой органике раньше означала «No ads found» и закрытие
+        # браузера без единого клика — раунд просто ходил по Google.
+        if not (ads or shopping_ads or non_ad_links):
             log.info("click", "No ads found in the search results!")
 
             if config.behavior.telegram_enabled:
@@ -309,8 +312,14 @@ def run_scenario(
                 all_links = ads + non_ad_links
 
             elif config.behavior.click_order == 3:
-                if non_ad_links:
+                # Чередование «органика/реклама» требует обеих половин: при
+                # пустом ads (найдена только shopping-реклама) старый код
+                # падал по IndexError на ads[0] и раунд завершался нулём кликов.
+                if non_ad_links and ads:
                     all_links = [non_ad_links[0]] + [ads[0]] + non_ad_links[1:] + ads[1:]
+                elif non_ad_links:
+                    log.debug("click", "Couldn't found ads! Continue with non-ads only.")
+                    all_links = non_ad_links
                 else:
                     log.debug("click", "Couldn't found non-ads! Continue with ads only.")
                     all_links = ads

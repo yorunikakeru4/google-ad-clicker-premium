@@ -7,9 +7,10 @@
 - **статусы** — замкнутый набор ``free|assigned|active|error|blocked`` и
   явная машина переходов: недопустимый переход это ``ValueError``, а не
   молчаливая запись чего угодно;
-- **выдача** — ``take_for_worker`` отдаёт профиль по одному на воркера, в
-  детерминированном порядке, с приоритетом прошлого назначения, и никогда
-  не выдаёт профиль, который держит живой воркер;
+- **выдача** — ``take_for_worker`` отдаёт профиль по одному на воркера,
+  случайный среди свободных (не «первый по id» — иначе каждый запуск
+  отдавал бы воркерам одни и те же User-Agent), с приоритетом прошлого
+  назначения, и никогда не выдаёт профиль, который держит живой воркер;
 - **импорт** — одна строка = ``key_ref`` (необязательно ``key_ref | name``)
   либо User-Agent (``Mozilla/...`` → колонка ``user_agent`` и имя ``UA-N``),
   300+ строк одной операцией, дубликаты и кривые строки уходят в
@@ -17,6 +18,8 @@
 """
 
 from __future__ import annotations
+
+import random
 
 import pytest
 
@@ -866,15 +869,44 @@ class TestTakeForWorker:
 
         assert pool.take_for_worker("br-1") is None
 
-    def test_takes_the_first_free_profile_in_id_order(self, pool, db_path):
+    def test_takes_a_random_free_profile(self, pool, db_path):
+        """Среди свободных — случайный выбор, а не всегда первый по id.
+
+        Детерминизм нужен тесту, а не пулу: ``random.seed`` фиксирует
+        последовательность ``random.choice``, и проверка перестаёт зависеть
+        от вероятности (состояние генератора возвращается в ``finally``).
+        Раньше выдача брала всегда ``ids[0]``, и каждый запуск программы
+        отдавал воркерам одни и те же User-Agent по порядку.
+        """
+        ids = add_free_profiles(pool, 2)
+        state = random.getstate()
+        random.seed(20261007)
+        taken = []
+        try:
+            for number in range(1, 41):
+                browser_id = f"br-{number}"
+                make_worker(db_path, browser_id)
+                claimed = pool.take_for_worker(browser_id)
+                assert claimed is not None, "свободный профиль должен выдаться"
+                taken.append(claimed["id"])
+                pool.release(claimed["id"])
+        finally:
+            random.setstate(state)
+
+        assert set(taken) == set(ids), (
+            "за 40 выдач оба профиля обязаны встретиться — выбор не по порядку id"
+        )
+
+    def test_take_marks_the_profile_assigned_and_binds_the_worker(self, pool, db_path):
+        """Конкретный профиль теперь не предсказываем, а связку проверяем."""
         ids = add_free_profiles(pool, 2)
         make_worker(db_path, "br-1")
 
         taken = pool.take_for_worker("br-1")
 
-        assert taken["id"] == ids[0]
-        assert table_rows(db_path, "profiles")[0]["status"] == "assigned"
-        assert worker_row(db_path, "br-1")["profile_id"] == ids[0]
+        assert taken["id"] in ids
+        assert table_rows(db_path, "profiles")[ids.index(taken["id"])]["status"] == "assigned"
+        assert worker_row(db_path, "br-1")["profile_id"] == taken["id"]
 
     def test_one_profile_per_worker(self, pool, db_path):
         add_free_profiles(pool, 1)
@@ -1016,9 +1048,13 @@ class TestUnassignAll:
         ids = add_free_profiles(pool, 4)
         make_worker(db_path, "br-1")
         make_worker(db_path, "br-2")
-        pool.take_for_worker("br-1")
-        pool.take_for_worker("br-2")
-        pool.set_status(ids[3], "blocked")
+        taken = {
+            pool.take_for_worker("br-1")["id"],
+            pool.take_for_worker("br-2")["id"],
+        }
+        # Блокируется именно свободный: какой профиль достался воркерам,
+        # больше не предсказуемо, и ids[3] мог уйти в выдачу.
+        pool.set_status(next(i for i in ids if i not in taken), "blocked")
 
         released = pool.unassign_all()
 
@@ -1078,7 +1114,9 @@ class TestAssignRange:
         assert result == {"assigned": 0, "available": 1}, (
             "свободных воркеров нет — выдавать некому, профили остаются как были"
         )
-        assert statuses(pool) == ["assigned", "free"]
+        assert sorted(statuses(pool)) == ["assigned", "free"], (
+            "какой именно профиль взял br-1, больше не предсказуемо"
+        )
 
     def test_non_free_profiles_in_the_range_are_not_handed_out(self, pool, db_path):
         ids = add_free_profiles(pool, 2)

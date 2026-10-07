@@ -16,7 +16,11 @@ telegram и политика ``behavior.captcha_policy``.
 - политики различимы: ``stop`` (дефолт) прерывает сценарий ``SystemExit`` и
   ждёт оператора, ``solve`` решает через 2captcha и продолжает, ``both``
   решает и при неудаче уходит в stop-ветку; лимит попыток на воркер и
-  отсутствие ключа не взрывают сценарий иначе чем stop-веткой.
+  отсутствие ключа не взрывают сценарий иначе чем stop-веткой;
+- ротация прокси: любая ветка, уводящая прогон в stop, после события шлёт
+  сигнал ``log.mark_degraded`` (причина без кредов) — супервизор подменяет
+  прокси, и следующий заход идёт с другого IP. Решённая капча сигнал не
+  шлёт: ротация — рестарт процесса и убила бы продолжаемый прогон.
 
 Драйвер здесь фальшивый (без Chrome и сети), ``solve_recaptcha`` подменяется:
 проверяется логика пайплайна, а не реальный 2captcha.
@@ -46,6 +50,7 @@ from engine.control_plane.state import StateStore
 from engine.db import migrations
 from engine.log import resolve_db_path
 from search_controller import (
+    CAPTCHA_PROXY_ROTATION_REASON,
     CAPTCHA_SOLVE_RETRIES,
     CAPTCHA_SOLVE_SESSION_LIMIT,
     SearchController,
@@ -216,6 +221,64 @@ def _solve_spy(monkeypatch, result: Optional[str] = "RESP-CODE"):
 
     monkeypatch.setattr(search_controller, "solve_recaptcha", fake_solve)
     return calls
+
+
+def _worker(db, browser_id):
+    """Строка ``workers`` воркера: статус и причина, которые читает супервизор."""
+
+    with sqlite3.connect(db) as conn:
+        conn.row_factory = sqlite3.Row
+        return conn.execute(
+            "SELECT status, last_error FROM workers WHERE browser_id = ?",
+            (browser_id,),
+        ).fetchone()
+
+
+class RotationSpy:
+    """Логгер-шпион сигнала ротации поверх настоящего ``search_controller.log``.
+
+    Все вызовы прокидываются в реальный логгер — событие, счётчики и статус
+    ``workers`` в тестах остаются настоящими, — а порядок пары
+    ``record_captcha_event`` / ``mark_degraded`` запоминается: сигнал обязан
+    идти после строки в ``captcha_events``, иначе супервизор мог бы погасить
+    процесс раньше, чем событие доедет до БД.
+    """
+
+    def __init__(self, real):
+        self._real = real
+        self.timeline: list[tuple[str, object]] = []
+
+    @property
+    def degraded(self) -> list[object]:
+        """Причины, с которыми ушёл сигнал ротации."""
+
+        return [payload for kind, payload in self.timeline if kind == "degraded"]
+
+    @property
+    def captcha_events(self) -> list[object]:
+        """``solved`` каждого события, прошедшего через логгер."""
+
+        return [payload for kind, payload in self.timeline if kind == "event"]
+
+    def record_captcha_event(self, *args, **kwargs):
+        self.timeline.append(("event", kwargs.get("solved")))
+        return self._real.record_captcha_event(*args, **kwargs)
+
+    def mark_degraded(self, reason, browser_id=None):
+        self.timeline.append(("degraded", reason))
+        return self._real.mark_degraded(reason, browser_id=browser_id)
+
+    def __getattr__(self, name):
+        return getattr(self._real, name)
+
+
+@pytest.fixture
+def rotation(captcha_env, monkeypatch):
+    """Шпион сигнала ротации поверх логгера процесса (зависимость от ``captcha_env``)."""
+
+    spy = RotationSpy(search_controller.log)
+    monkeypatch.setattr(search_controller, "log", spy)
+    return spy
 
 
 # --- единая точка: каждая ветка детекта даёт одно событие -----------------------
@@ -640,3 +703,211 @@ class TestBothPolicy:
         row = _events(both_env.db, both_env.browser_id)[0]
         assert row["solved"] == 0
         assert row["solver"] is None
+
+
+# --- ротация прокси: сигнал на каждую остановку из-за капчи -----------------------
+
+
+class TestProxyRotationSignal:
+    """Сигнал ротации прокси на каждой ветке, уводящей прогон в stop.
+
+    Прод-дефект: событие писалось в ``captcha_events``, а сигнала на смену
+    прокси не было — воркер работал с тем же IP, и следующий заход снова
+    ловил капчу. Сигнал — готовый механизм ``log.mark_degraded`` (им же
+    пользуются ``ad_clicker`` при отбраковке пробой и ``webdriver`` при
+    ошибке прокси): статус ``degraded`` читает супервизор и подменяет прокси
+    на резервный.
+    """
+
+    def test_stop_policy_signals_rotation_after_the_event(self, captcha_env, rotation):
+        """Политика stop: событие в БД, затем сигнал — и только потом выход."""
+
+        driver = CaptchaDriver()
+        controller = make_controller(captcha_env, driver)
+
+        with pytest.raises(SystemExit):
+            controller._check_captcha()
+
+        assert rotation.captcha_events == [False]
+        assert rotation.degraded == [CAPTCHA_PROXY_ROTATION_REASON], (
+            "stop-ветка обязана просить сменить прокси, иначе следующий заход "
+            "уйдёт с того же IP"
+        )
+        assert rotation.timeline == [
+            ("event", False),
+            ("degraded", CAPTCHA_PROXY_ROTATION_REASON),
+        ], "событие обязано попасть в БД раньше сигнала: супервизор гасит процесс"
+        assert len(_events(captcha_env.db, captcha_env.browser_id)) == 1
+
+    def test_signal_reaches_the_store_as_degraded_status(self, captcha_env, rotation):
+        """Сигнал — не только зов логгера: строка воркера реально меняется."""
+
+        driver = CaptchaDriver()
+        controller = make_controller(captcha_env, driver)
+
+        with pytest.raises(SystemExit):
+            controller._check_captcha()
+
+        worker = _worker(captcha_env.db, captcha_env.browser_id)
+        assert worker["status"] == "degraded", "супервизор читает именно этот статус"
+        assert worker["last_error"] == CAPTCHA_PROXY_ROTATION_REASON
+
+    def test_no_captcha_sends_no_signal(self, captcha_env, rotation):
+        """Капчи нет — прокси здоров, ротировать нечего."""
+
+        driver = CaptchaDriver(captcha_after=10_000)
+        controller = make_controller(captcha_env, driver)
+
+        controller._check_captcha()
+
+        assert rotation.timeline == []
+        assert _events(captcha_env.db, captcha_env.browser_id) == []
+
+    def test_rotation_reason_carries_no_credentials(self):
+        """Причина уходит в ``workers.last_error`` и видна в UI — без кредов."""
+
+        reason = CAPTCHA_PROXY_ROTATION_REASON
+        assert reason == search_controller.CAPTCHA_PROXY_ROTATION_REASON
+        assert "captcha" in reason
+        assert "@" not in reason, "user:pass@host в UI и логах быть не должно"
+        assert "://" not in reason
+
+    def test_missing_api_key_signals_rotation(self, captcha_env, behavior, rotation, monkeypatch):
+        """solve без ключа: событие + stop-ветка → сигнал ротации."""
+
+        monkeypatch.setattr(behavior, "captcha_policy", "solve")
+        monkeypatch.setattr(behavior, "twocaptcha_apikey", "")
+        solve_calls = _solve_spy(monkeypatch)
+        driver = CaptchaDriver()
+        controller = make_controller(captcha_env, driver)
+
+        with pytest.raises(SystemExit):
+            controller._check_captcha()
+
+        assert solve_calls == []
+        assert rotation.degraded == [CAPTCHA_PROXY_ROTATION_REASON]
+        assert rotation.timeline == [
+            ("event", False),
+            ("degraded", CAPTCHA_PROXY_ROTATION_REASON),
+        ]
+
+    def test_exhausted_session_limit_signals_rotation(
+        self, captcha_env, behavior, rotation, monkeypatch
+    ):
+        """Лимит 2captcha за сессию исчерпан до решения: stop → сигнал."""
+
+        monkeypatch.setattr(behavior, "captcha_policy", "solve")
+        monkeypatch.setattr(behavior, "twocaptcha_apikey", "key-42")
+        monkeypatch.setattr(
+            SearchController, "_solve_attempts_used", CAPTCHA_SOLVE_SESSION_LIMIT
+        )
+        _solve_spy(monkeypatch)
+        driver = CaptchaDriver()
+        controller = make_controller(captcha_env, driver)
+
+        with pytest.raises(SystemExit):
+            controller._check_captcha()
+
+        assert rotation.degraded == [CAPTCHA_PROXY_ROTATION_REASON]
+
+    def test_limit_hit_inside_the_retry_loop_signals_rotation(
+        self, captcha_env, behavior, rotation, monkeypatch
+    ):
+        """«Не решилось» внутри ретраев: лимит кончился на второй попытке."""
+
+        monkeypatch.setattr(behavior, "captcha_policy", "solve")
+        monkeypatch.setattr(behavior, "twocaptcha_apikey", "key-42")
+        monkeypatch.setattr(
+            SearchController,
+            "_solve_attempts_used",
+            CAPTCHA_SOLVE_SESSION_LIMIT - 1,
+        )
+        solve_calls = _solve_spy(monkeypatch, result=None)
+        driver = CaptchaDriver()
+        controller = make_controller(captcha_env, driver)
+
+        with pytest.raises(SystemExit):
+            controller._check_captcha()
+
+        assert len(solve_calls) == 1, "первая попытка тратит лимит, вторая — стоп"
+        row = _events(captcha_env.db, captcha_env.browser_id)[0]
+        assert row["solved"] == 0
+        assert rotation.degraded == [CAPTCHA_PROXY_ROTATION_REASON]
+
+    def test_missing_page_url_signals_rotation(
+        self, captcha_env, behavior, rotation, monkeypatch
+    ):
+        """Нет URL страницы — решать неоткуда: stop → сигнал."""
+
+        monkeypatch.setattr(behavior, "captcha_policy", "solve")
+        monkeypatch.setattr(behavior, "twocaptcha_apikey", "key-42")
+        solve_calls = _solve_spy(monkeypatch)
+        driver = CaptchaDriver(page_url=None)
+        controller = make_controller(captcha_env, driver)
+
+        with pytest.raises(SystemExit):
+            controller._check_captcha()
+
+        assert solve_calls == []
+        assert rotation.degraded == [CAPTCHA_PROXY_ROTATION_REASON]
+
+    def test_failed_solve_signals_rotation(self, captcha_env, behavior, rotation, monkeypatch):
+        """solve: сервис не решил → stop-ветка → сигнал ротации."""
+
+        monkeypatch.setattr(behavior, "captcha_policy", "solve")
+        monkeypatch.setattr(behavior, "twocaptcha_apikey", "key-42")
+        _solve_spy(monkeypatch, result=None)
+        driver = CaptchaDriver()
+        controller = make_controller(captcha_env, driver)
+
+        with pytest.raises(SystemExit):
+            controller._check_captcha()
+
+        assert rotation.captcha_events == [False]
+        assert rotation.degraded == [CAPTCHA_PROXY_ROTATION_REASON]
+        assert rotation.timeline == [
+            ("event", False),
+            ("degraded", CAPTCHA_PROXY_ROTATION_REASON),
+        ]
+
+    def test_failed_solve_under_both_policy_signals_rotation(
+        self, captcha_env, behavior, rotation, monkeypatch
+    ):
+        """both: неудача решения уходит в stop-ветку, сигнал не теряется."""
+
+        monkeypatch.setattr(behavior, "captcha_policy", "both")
+        monkeypatch.setattr(behavior, "twocaptcha_apikey", "key-42")
+        _solve_spy(monkeypatch, result=None)
+        driver = CaptchaDriver()
+        controller = make_controller(captcha_env, driver)
+
+        with pytest.raises(SystemExit):
+            controller._check_captcha()
+
+        assert rotation.degraded == [CAPTCHA_PROXY_ROTATION_REASON]
+
+    @pytest.mark.parametrize("policy", ["solve", "both"])
+    def test_successful_solve_does_not_signal_rotation(
+        self, captcha_env, behavior, rotation, monkeypatch, policy
+    ):
+        """Решённая капча: сигнал НЕ шлётся — иначе погиб бы сам прогон.
+
+        Ротация = рестарт процесса супервизором (SIGTERM → выдержка →
+        SIGKILL): сигнал посреди продолжаемого прогона убил бы его на
+        середине и обесценил бы политику solve. Смена прокси после
+        решённой капчи откладывается до конца прогона — точка завершения
+        (``engine.worker`` / ``ad_clicker.end_search``) вне зоны этой ветки.
+        """
+
+        monkeypatch.setattr(behavior, "captcha_policy", policy)
+        monkeypatch.setattr(behavior, "twocaptcha_apikey", "key-42")
+        _solve_spy(monkeypatch, result="RESP-CODE")
+        driver = CaptchaDriver()
+        controller = make_controller(captcha_env, driver)
+
+        controller._check_captcha()
+
+        assert rotation.degraded == [], "решённая капча не должна ронять прогон"
+        assert rotation.captcha_events == [True]
+        assert _events(captcha_env.db, captcha_env.browser_id)[0]["solved"] == 1
+        assert _worker(captcha_env.db, captcha_env.browser_id)["status"] != "degraded"

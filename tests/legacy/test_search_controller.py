@@ -13,6 +13,7 @@ import pytest
 from selenium.common.exceptions import (
     ElementNotInteractableException,
     NoSuchElementException,
+    StaleElementReferenceException,
     WebDriverException,
 )
 from selenium.webdriver.common.by import By
@@ -22,7 +23,11 @@ import search_controller
 from clicklogs_db import ClickLogsDB
 from conftest import FakeDriver, FakeElement
 from engine.profile_apply import load_profile_cookies, profile_cookies_path
-from search_controller import SearchController, SearchRoundError
+from search_controller import (
+    CAPTCHA_PROXY_ROTATION_REASON,
+    SearchController,
+    SearchRoundError,
+)
 from stats import SearchStats
 
 
@@ -1369,3 +1374,438 @@ class TestSearchRoundFailures:
 
         with pytest.raises(SearchRoundError):
             controller.search_for_ads(blocked_domains=[])
+
+
+# --- CAPTCHA: сигнал ротации прокси ---------------------------------------------
+
+
+class CaptchaVisibleDriver(FakeDriver):
+    """Драйвер с видимой reCAPTCHA: любая ветка детекта уходит в stop."""
+
+    def find_element(self, by, value=None):
+        if by == By.ID and value == "recaptcha":
+            return FakeElement({"data-sitekey": "sitekey-1", "data-s": "data-s-1"})
+        return super().find_element(by, value)
+
+
+class NoCaptchaDriver(FakeDriver):
+    """Драйвер без капчи: ``#recaptcha`` не находится никогда."""
+
+    def find_element(self, by, value=None):
+        if by == By.ID and value == "recaptcha":
+            raise NoSuchElementException("капчи нет")
+        return super().find_element(by, value)
+
+
+class CaptchaLogRecorder(LogRecorder):
+    """Логгер captcha-ветки: пишет событие и сигнал ротации, в БД ничего не уходит."""
+
+    # ``_event_browser_id`` читает его у логгера: без биндинга контекст события
+    # (прокси/run в БД) пропускается, а тестам важен только сигнал.
+    browser_id = None
+
+    def __init__(self):
+        super().__init__()
+        self.captcha_events = []
+        self.degraded = []
+        self.timeline = []
+
+    def record_captcha_event(self, *args, **kwargs):
+        self.captcha_events.append(kwargs)
+        self.timeline.append("event")
+
+    def mark_degraded(self, reason, browser_id=None):
+        self.degraded.append((reason, browser_id))
+        self.timeline.append("degraded")
+
+
+@pytest.fixture
+def captcha_log(monkeypatch):
+    """Логгер-заглушка captcha-ветки: без БД, с фиксацией сигнала ротации."""
+
+    recorder = CaptchaLogRecorder()
+    monkeypatch.setattr(search_controller, "log", recorder)
+    return recorder
+
+
+class TestCaptchaProxyRotation:
+    """Сигнал ротации прокси из captcha-ветки (без БД и настоящего браузера).
+
+    Дефект: капча детектилась, событие писалось, а прокси не менялся —
+    следующий заход шёл с того же IP. Сигнал — ``log.mark_degraded``, его
+    читает супервизор (``_handle_degraded``) и подменяет прокси.
+    """
+
+    def test_no_captcha_leaves_the_proxy_alone(self, make_search_controller, captcha_log):
+        """Капчи нет — ни события, ни сигнала: ротировать нечего."""
+
+        controller = make_search_controller(driver=NoCaptchaDriver())
+
+        controller._check_captcha()
+
+        assert captcha_log.timeline == []
+        assert captcha_log.captcha_events == []
+        assert captcha_log.degraded == []
+
+    def test_detected_captcha_signals_rotation_after_the_event(
+        self, make_search_controller, captcha_log
+    ):
+        """Детект при дефолтной политике stop: событие, затем сигнал, затем выход."""
+
+        controller = make_search_controller(driver=CaptchaVisibleDriver())
+
+        with pytest.raises(SystemExit):
+            controller._check_captcha()
+
+        assert captcha_log.degraded == [(CAPTCHA_PROXY_ROTATION_REASON, None)]
+        assert captcha_log.timeline == [
+            "event",
+            "degraded",
+        ], "событие обязано быть записано раньше сигнала: супервизор гасит процесс"
+
+    def test_stop_for_captcha_is_the_funnel_for_the_signal(
+        self, make_search_controller, captcha_log
+    ):
+        """Stop-ветка шлёт ровно один сигнал и только потом роняет процесс."""
+
+        controller = make_search_controller(driver=FakeDriver())
+
+        with pytest.raises(SystemExit):
+            controller._stop_for_captcha("captcha_policy=stop")
+
+        assert captcha_log.degraded == [(CAPTCHA_PROXY_ROTATION_REASON, None)]
+        assert captcha_log.timeline == ["degraded"]
+
+
+
+# --- Прод-дефект 1: реклама не собирается → раунд закрывается без кликов -----------
+
+
+class NonScrollableAdsDriver(FakeDriver):
+    """Драйвер с рекламой, у которого страница уже «в конце»: скроллить некуда.
+
+    Так выглядит короткая выдача: ``_is_scroll_at_the_end`` истинна с самого
+    первого вызова, и цикл прокрутки ``_get_ad_links`` не выполняется ни разу.
+    """
+
+    def __init__(self, ad):
+        super().__init__()
+        self.ad = ad
+
+    def find_elements(self, by, value=None):
+        return [AdContainer([self.ad])]
+
+    def execute_script(self, script, *args):
+        # И scrollHeight, и pageYOffset+innerHeight равны → «в конце».
+        return 1000
+
+
+def test_ad_links_collected_when_page_is_not_scrollable(make_search_controller):
+    # Верхняя реклама (``#tads``) видна без прокрутки, но старый цикл собирал
+    # её только внутри while-условия: на не-прокручиваемой странице он не
+    # запускался вовсе, ads оставался пустым и раунд закрывал браузер.
+    driver = NonScrollableAdsDriver(make_ad("Wireless Keyboard Sale"))
+    controller = make_search_controller(query="wireless keyboard", driver=driver)
+
+    assert controller._get_ad_links() == [
+        (driver.ad, "https://ads.example.com/kb", "Wireless Keyboard Sale")
+    ]
+
+
+class _ScrollBody(FakeElement):
+    """Тело страницы: PAGE_DOWN помечает драйвер прокрученным."""
+
+    def __init__(self, driver):
+        super().__init__()
+        self._driver = driver
+
+    def send_keys(self, keys):
+        super().send_keys(keys)
+        if keys == Keys.PAGE_DOWN:
+            self._driver.scrolled = True
+
+
+class LazyBottomAdsDriver(FakeDriver):
+    """Нижняя реклама появляется в DOM только после прокрутки вниз.
+
+    Позиция после последнего PAGE_DOWN — ровно та, на которой Google дорисовывает
+    ``#tadsb``: старый цикл проверял конец страницы ДО сбора и никогда не
+    обследовал финальную позицию.
+    """
+
+    def __init__(self, top_ad, bottom_ad):
+        super().__init__()
+        self.top_ad = top_ad
+        self.bottom_ad = bottom_ad
+        self.scrolled = False
+        self.body = _ScrollBody(self)
+
+    def find_element(self, by, value=None):
+        if value == "body":
+            return self.body
+        return super().find_element(by, value)
+
+    def find_elements(self, by, value=None):
+        ads = [self.top_ad] + ([self.bottom_ad] if self.scrolled else [])
+        return [AdContainer(ads)]
+
+    def execute_script(self, script, *args):
+        if "scrollHeight" in script:
+            return 1000
+        return 1000 if self.scrolled else 0
+
+
+def test_ad_links_collected_after_the_final_scroll(make_search_controller):
+    top = make_ad("Top Ad", link="https://ads.example.com/top")
+    bottom = make_ad("Bottom Ad", link="https://ads.example.com/bottom")
+    driver = LazyBottomAdsDriver(top, bottom)
+    controller = make_search_controller(query="wireless keyboard", driver=driver)
+
+    assert controller._get_ad_links() == [
+        (top, "https://ads.example.com/top", "Top Ad"),
+        (bottom, "https://ads.example.com/bottom", "Bottom Ad"),
+    ]
+
+
+# --- Прод-дефект 2: цель из чёрного списка попадает в клик -------------------------
+
+
+def test_is_blocked_target_matches_destination_inside_redirect(make_search_controller):
+    # href клика — перенаправление Google: по хосту ссылки чёрный список не
+    # срабатывает, а клик всё равно ведёт на запрещённый домен.
+    controller = make_search_controller()
+    controller._blocked_domains = ["edelind.de"]
+    redirect = (
+        "https://www.google.com/aclk?sa=L&ai=xyz"
+        "&adurl=https%3A%2F%2Fwww.edelind.de%2Fgoldkette"
+    )
+
+    assert controller._is_blocked_target(redirect) is True
+    assert (
+        controller._is_blocked_target(
+            "https://www.google.com/aclk?adurl=https%3A%2F%2Fshop.example%2Fx"
+        )
+        is False
+    )
+
+
+def test_get_non_ad_links_skips_google_redirect_to_blocked_domain(make_search_controller):
+    # Нестандартная схема/хост Google: фильтр «https://www.google» такие ссылки
+    # пропускает, поэтому запрет обязан читать цель из параметра ``url=``.
+    link = make_link(
+        "http://google.de/url?sa=t&source=web"
+        "&url=https%3A%2F%2Fwww.edelind.de%2Fgoldkette"
+    )
+    controller = make_search_controller(driver=FakeDriver(links=[link]))
+
+    assert controller._get_non_ad_links([], ["edelind.de"]) == []
+
+
+def test_refresh_blocked_domains_adds_entries_written_during_the_round(
+    make_search_controller, monkeypatch
+):
+    # domains.txt мог обновиться (через UI), пока шёл поиск: перед кликами
+    # файл читается заново, а список за раунд только расширяется.
+    controller = make_search_controller()
+    controller._blocked_domains = ["edelind.de"]
+    monkeypatch.setattr(search_controller, "get_domains", lambda: ["shop.example"])
+
+    controller._refresh_blocked_domains()
+
+    assert controller._blocked_domains == ["edelind.de", "shop.example"]
+
+
+def test_refresh_blocked_domains_keeps_round_list_when_read_fails(
+    make_search_controller, monkeypatch
+):
+    controller = make_search_controller()
+    controller._blocked_domains = ["edelind.de"]
+
+    def no_file():
+        raise SystemExit("Couldn't find domains file: domains.txt")
+
+    monkeypatch.setattr(search_controller, "get_domains", no_file)
+
+    controller._refresh_blocked_domains()
+
+    assert controller._blocked_domains == ["edelind.de"], (
+        "сбой чтения не должен разблокировать уже известный список"
+    )
+
+
+class DesktopUnit:
+    """Десктопный ``pla-unit``: якорь с href и якорь с aria-label."""
+
+    def __init__(self, href, target, title, broken=False):
+        self._anchor = FakeElement(attributes={"href": href})
+        self._data = FakeElement(attributes={"href": target, "aria-label": title})
+        self.broken = broken
+
+    def find_element(self, by, value=None):
+        if value == "a:nth-child(2)":
+            if self.broken:
+                raise NoSuchElementException("якорь с aria-label отсутствует")
+            return self._data
+        return self._anchor
+
+
+class DesktopShoppingDriver(FakeDriver):
+    """Вёрстка без мобильного контейнера: путь ``cu-container``/``pla-unit``."""
+
+    def __init__(self, units):
+        super().__init__()
+        self.units = units
+
+    def find_elements(self, by, value=None):
+        if value == "pla-unit-container":
+            return []
+        if value == "pla-unit":
+            return list(self.units)
+        return []
+
+    def find_element(self, by, value=None):
+        if value == "cu-container":
+            return AdContainer(self.units)
+        return super().find_element(by, value)
+
+
+def test_shopping_ads_filtered_when_collection_fails_halfway(make_search_controller):
+    # Сбор прерван NoSuchElement на втором блоке: раньше ветка отдавала ads
+    # как есть — минуя и фильтры, и чёрный список, — и кликер уходил на цель
+    # из списка запрещённых доменов.
+    driver = DesktopShoppingDriver(
+        [
+            DesktopUnit(
+                href="https://www.edelind.de/goldkette",
+                target="https://www.edelind.de/goldkette",
+                title="Goldkette 75cm",
+            ),
+            DesktopUnit(
+                href="https://shop.example/keyboard",
+                target="https://shop.example/keyboard",
+                title="Wireless Keyboard",
+                broken=True,
+            ),
+        ]
+    )
+    controller = make_search_controller(query="wireless keyboard", driver=driver)
+    controller._blocked_domains = ["edelind.de"]
+
+    assert controller._get_shopping_ad_links() == []
+    assert controller._stats.num_excluded_shopping_ads == 1
+
+
+class ClickDriver(FakeDriver):
+    """Драйвер для клик-фазы: окно результатов и вызов stealth через CDP."""
+
+    current_window_handle = "search-window"
+
+    def execute_cdp_cmd(self, command, payload=None):
+        return None
+
+
+@pytest.fixture
+def record_clicks(monkeypatch):
+    """Перехват клика на точке входа ``_handle_browser_click``."""
+
+    def _install(controller):
+        clicked = []
+        monkeypatch.setattr(
+            controller,
+            "_handle_browser_click",
+            lambda element, url, is_ad, handle, category="Ad": clicked.append(
+                (url, category, is_ad)
+            ),
+            raising=False,
+        )
+        return clicked
+
+    return _install
+
+
+def test_click_links_rechecks_blacklist_right_before_click(
+    make_search_controller, monkeypatch, record_clicks
+):
+    # Ссылка собрана до того, как в domains.txt появился запрещённый домен:
+    # список перечитывается и проверяется непосредственно перед кликом.
+    link = make_link("http://www.edelind.de/goldkette")
+    controller = make_search_controller(driver=ClickDriver())
+    controller._blocked_domains = []
+    monkeypatch.setattr(search_controller, "get_domains", lambda: ["edelind.de"])
+    clicked = record_clicks(controller)
+
+    controller.click_links([link])
+
+    assert clicked == [], "клика по домену из чёрного списка быть не должно"
+
+
+def test_click_links_clicks_target_that_is_not_blocked(
+    make_search_controller, record_clicks
+):
+    link = make_link("http://shop.example/product")
+    controller = make_search_controller(driver=ClickDriver())
+    controller._blocked_domains = ["edelind.de"]
+    clicked = record_clicks(controller)
+
+    controller.click_links([link])
+
+    assert [(url, category) for url, category, _ in clicked] == [
+        ("http://shop.example/product", "Non-ad")
+    ]
+
+
+def test_click_links_skips_ad_whose_real_target_is_blocked(
+    make_search_controller, monkeypatch, record_clicks
+):
+    href = "https://www.google.com/aclk?adurl=https%3A%2F%2Fwww.edelind.de%2Fx"
+    ad = FakeElement(
+        attributes={"href": href, "data-pcu": "https://www.edelind.de/x"},
+        text="Ad title",
+    )
+    controller = make_search_controller(driver=ClickDriver())
+    monkeypatch.setattr(search_controller, "get_domains", lambda: ["edelind.de"])
+    clicked = record_clicks(controller)
+
+    controller.click_links([(ad, href, "Ad title")])
+
+    assert clicked == []
+    assert controller._stats.num_excluded_ads == 1
+
+
+def test_click_links_survives_a_stale_element(make_search_controller, record_clicks):
+    # Протухший элемент раньше ронял сам click_links (UnboundLocalError в
+    # обработчике) — прогон обрывался, и оставшиеся ссылки не кликались.
+    class StaleLink(FakeElement):
+        def get_attribute(self, name):
+            if name == "href":
+                raise StaleElementReferenceException("element is stale")
+            return super().get_attribute(name)
+
+    stale = StaleLink(attributes={"href": "http://gone.example"})
+    good = make_link("http://shop.example/product")
+    controller = make_search_controller(driver=ClickDriver())
+    clicked = record_clicks(controller)
+
+    controller.click_links([stale, good])
+
+    assert [url for url, _, _ in clicked] == ["http://shop.example/product"], (
+        "протухший элемент не должен обрывать оставшиеся клики"
+    )
+
+
+def test_click_shopping_ads_rechecks_blacklist_right_before_click(
+    make_search_controller, monkeypatch, record_clicks
+):
+    target = "http://www.edelind.de/goldkette"
+    ad = FakeElement(attributes={"href": target})
+    controller = make_search_controller(driver=ClickDriver())
+    controller._blocked_domains = []
+    monkeypatch.setattr(search_controller, "get_domains", lambda: ["edelind.de"])
+    clicked = record_clicks(controller)
+
+    controller.click_shopping_ads([(ad, target, "Goldkette 75cm")])
+
+    assert clicked == []
+    assert controller._stats.num_excluded_shopping_ads == 1, (
+        "пропуск на этапе клика должен попадать в счётчик shopping-исключений"
+    )

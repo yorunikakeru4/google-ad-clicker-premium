@@ -2418,10 +2418,14 @@ class TestProfileAssignment:
 
         supervisor.start(2)
 
-        assert [store.get_worker(b)["profile_id"] for b in ("br-1", "br-2")] == ids
+        # Какой профиль достался какому воркеру, больше не предсказуемо
+        # (пул выдаёт свободный профиль случайно), поэтому проверяется
+        # распределение: без дублей, каждый со своим профилем в env.
+        taken = [store.get_worker(b)["profile_id"] for b in ("br-1", "br-2")]
+        assert sorted(taken) == sorted(ids), "каждый воркер получил свой профиль"
         assert [env_of(registry, call)["ADCLICKER_PROFILE_ID"] for call in (0, 1)] == [
-            str(ids[0]),
-            str(ids[1]),
+            str(taken[0]),
+            str(taken[1]),
         ]
 
     def test_profile_proxy_wins_over_the_pool(
@@ -2520,15 +2524,18 @@ class TestProfileAssignment:
         ids = add_profiles(db_path, "a", "b")
         supervisor = make_supervisor(store, registry, clock, settings)
         supervisor.start(1)
-        assert store.get_worker("br-1")["profile_id"] == ids[0]
+        # Пул выдаёт профиль случайно, поэтому опорой становится то, что
+        # воркер реально получил, а не порядок id в БД.
+        first = store.get_worker("br-1")["profile_id"]
+        assert first in ids
 
         registry.created[0].exit(1)
         supervisor.tick()
 
-        assert profile_status(db_path, ids[0]) == "free", (
+        assert profile_status(db_path, first) == "free", (
             "реапер освобождает профиль мёртвого воркера — иначе пул потерял бы строку"
         )
-        assert store.get_worker("br-1")["profile_id"] == ids[0], (
+        assert store.get_worker("br-1")["profile_id"] == first, (
             "ссылка переживает реапер: именно она возвращает профиль респавну"
         )
 
@@ -2536,9 +2543,9 @@ class TestProfileAssignment:
         supervisor.tick()
 
         worker = store.get_worker("br-1")
-        assert worker["profile_id"] == ids[0]
-        assert profile_status(db_path, ids[0]) == "assigned"
-        assert env_of(registry, -1)["ADCLICKER_PROFILE_ID"] == str(ids[0])
+        assert worker["profile_id"] == first
+        assert profile_status(db_path, first) == "assigned"
+        assert env_of(registry, -1)["ADCLICKER_PROFILE_ID"] == str(first)
 
     def test_rotation_passes_the_profile_to_the_new_process(
         self, store, registry, clock, settings, db_path
@@ -2691,9 +2698,13 @@ class TestProfileReaper:
         supervisor = make_supervisor(store, registry, clock, settings)
         supervisor.start(2)
         worker_beats(store, clock, "br-1", "br-2")
+        # Какой профиль у какого воркера, решает случайный выбор в пуле.
+        dead = store.get_worker("br-1")["profile_id"]
+        alive = store.get_worker("br-2")["profile_id"]
+        assert {dead, alive} == set(ids)
 
         registry.created[0].exit(1)
         supervisor.tick()
 
-        assert profile_status(db_path, ids[0]) == "free"
-        assert profile_status(db_path, ids[1]) == "assigned"
+        assert profile_status(db_path, dead) == "free"
+        assert profile_status(db_path, alive) == "assigned"

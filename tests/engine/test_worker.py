@@ -590,18 +590,47 @@ class TestProfileStatuses:
 # --- распределение работы -------------------------------------------------
 
 
-def test_query_and_proxy_are_strided_over_the_pool(store, logger, stop_event, db_path):
+def test_query_and_proxy_come_from_the_pools(store, logger, stop_event, db_path):
+    """Воркер берёт запрос и прокси из списков, а не из какого-то порядка."""
     source = FakeSource()
-    source.queries_value = ["q1", "q2", "q3", "q4", "q5", "q6"]
-    source.proxies_value = ["p1", "p2", "p3", "p4", "p5", "p6"]
+    source.queries_value = [f"q{i}" for i in range(1, 7)]
+    source.proxies_value = [f"p{i}" for i in range(1, 7)]
     source.on_scenario = lambda request: stop_event.set()
 
     make_runner(source, store, logger, stop_event, browser_id="br-2", pool_size=3).run()
 
     request = source.requests[0]
     assert (request.worker_index, request.pool_size, request.round_index) == (2, 3, 0)
-    assert request.query == "q2"
-    assert request.proxy == "p2"
+    assert request.query in source.queries_value
+    assert request.proxy in source.proxies_value
+
+
+def test_query_and_proxy_change_from_start_to_start(store, logger, db_path, monkeypatch):
+    """Новый запуск не повторяет запрос и прокси предыдущего — тот самый дефект.
+
+    Соль перебирается явно (0..7), а не полагается на ``_RUN_SEED``: ppid
+    тестового процесса на каждой машине свой, а детерминированный набор солей
+    делает результат проверки одинаковым везде.
+    """
+    queries = [f"q{i}" for i in range(1, 7)]
+    proxies = [f"p{i}" for i in range(1, 7)]
+    picked: set[tuple[str, str]] = set()
+
+    for seed in range(8):
+        monkeypatch.setattr("engine.scheduler._RUN_SEED", seed)
+        source = FakeSource()
+        source.queries_value = queries
+        source.proxies_value = proxies
+        stop = threading.Event()
+        source.on_scenario = lambda request: stop.set()
+
+        make_runner(source, store, logger, stop, browser_id="br-1", pool_size=3).run()
+
+        request = source.requests[0]
+        picked.add((request.query, request.proxy))
+
+    assert len({query for query, _ in picked}) > 1, "запрос на старте обязан меняться"
+    assert len({proxy for _, proxy in picked}) > 1, "прокси на старте обязан меняться"
 
 
 def test_pool_size_falls_back_to_config_browser_count(store, logger, stop_event, db_path):
@@ -611,21 +640,28 @@ def test_pool_size_falls_back_to_config_browser_count(store, logger, stop_event,
     make_runner(source, store, logger, stop_event, browser_id="br-3").run()
 
     assert source.requests[0].pool_size == 4
-    assert source.requests[0].query == "q3"
+    assert source.requests[0].query in source.queries_value
 
 
 def test_multiprocess_style_two_gives_the_same_query_to_every_worker(
     store, logger, stop_event, db_path
 ):
-    source = FakeSource(default_settings(multiprocess_style=2))
-    source.queries_value = ["q1", "q2"]
-    source.on_scenario = lambda request: stop_event.set()
+    """multiprocess_style == 2: в раунде все воркеры ищут один и тот же запрос."""
+    requests = []
+    for browser_id in ("br-1", "br-2"):
+        source = FakeSource(default_settings(multiprocess_style=2))
+        source.queries_value = ["q1", "q2"]
+        stop = threading.Event()
+        source.on_scenario = lambda request: stop.set()
 
-    make_runner(
-        source, store, logger, stop_event, browser_id="br-2", pool_size=3
-    ).run()
+        make_runner(
+            source, store, logger, stop, browser_id=browser_id, pool_size=3
+        ).run()
 
-    assert source.requests[0].query == "q1"
+        requests.append(source.requests[0])
+
+    assert requests[0].query == requests[1].query
+    assert requests[0].query in ("q1", "q2")
 
 
 def test_missing_proxy_file_is_not_fatal(store, logger, stop_event, db_path):

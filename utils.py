@@ -478,7 +478,20 @@ def get_domains() -> list[str]:
         if domain and domain not in domains:
             domains.append(domain)
 
-    log.debug("click", "Blocked domains", fields={"domains": domains})
+    log.debug(
+        "click",
+        "Blocked domains",
+        fields={"domains": domains, "path": str(filepath)},
+    )
+
+    if not domains:
+        # Прод-инцидент: пустой файл и без own_domain — чёрный списка нет в
+        # принципе, и единственный сигнал об этом для оператора это лог.
+        log.warning(
+            "click",
+            "Blacklist is empty: no domains in the file and no own_domain",
+            fields={"path": str(filepath), "entries": len(entries)},
+        )
 
     return domains
 

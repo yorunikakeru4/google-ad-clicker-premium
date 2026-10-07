@@ -43,6 +43,7 @@
 from __future__ import annotations
 
 import json
+import random
 import re
 import sqlite3
 import threading
@@ -733,9 +734,12 @@ class ProfilePool:
            поднятый заново продолжает работать с тем же профилем — приоритет
            есть даже у профиля, освобождённого реапером (ссылка на воркера
            при этом сохранена намеренно);
-        2. первый свободный по возрастанию id — порядок детерминирован, а
-           держатель входит в проверку: профиль, на который ссылается живой
-           воркер, не выдаётся никому, даже если статус сброшен оператором.
+        2. случайный свободный — ``random.choice`` среди профилей в статусе
+           ``free``, на которые не ссылается живой воркер (ровно та же
+           проверка держателя, что и раньше). Берётся не первый по
+           возрастанию id, иначе каждый запуск отдавал бы воркерам одни и те
+           же профили по порядку — те самые User-Agent, по которым капча
+           узнавала программу.
 
         Выданный профиль несёт свой ``proxy_id`` — супервизор делает его
         прокси воркера, приоритетнее пула (см. ``Supervisor._start_worker``).
@@ -765,12 +769,12 @@ class ProfilePool:
                           SELECT 1 FROM workers w
                           WHERE w.profile_id = p.id AND w.status IN ({_status_list()})
                       )
-                    ORDER BY p.id LIMIT 1
+                    ORDER BY p.id
                     """
-                ).fetchone()
-                if free is None:
+                ).fetchall()
+                if not free:
                     return None
-                claimed = self._claim(conn, free, browser_id)
+                claimed = self._claim(conn, random.choice(free), browser_id)
                 conn.commit()
                 return claimed
             except BaseException:

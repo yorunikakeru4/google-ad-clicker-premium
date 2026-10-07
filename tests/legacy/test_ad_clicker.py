@@ -567,3 +567,94 @@ class TestScenarioCheckpoints:
         assert checkpoints == [(fake_driver, None), (fake_driver, None)], (
             "снимок должен быть и при открытии браузера, и перед его закрытием"
         )
+
+
+# --- Клик-фаза run_scenario: прод-дефект «бот ходит, но не нажимает» ----------------
+
+
+@pytest.fixture
+def fake_scenario(monkeypatch):
+    """Run_scenario без браузера: задаёт результат поиска, пишет клик-фазу.
+
+    Двойник SearchController отдаёт то, что тест положил в словарь ``state``,
+    и запоминает переданные ему ссылки — так проверяется, что именно кликает
+    сценарий, а не то, как кликает контроллер (это тесты search_controller).
+    """
+
+    from stats import SearchStats
+
+    state = {
+        "ads": [],
+        "non_ad": [],
+        "shopping": [],
+        "clicked": [],
+        "shopping_clicked": [],
+    }
+
+    class FakeSearchController:
+        def __init__(self, driver, query, country_code=None):
+            self.stats = SearchStats()
+
+        def search_for_ads(self, blocked_domains=None):
+            return state["ads"], state["non_ad"], state["shopping"]
+
+        def click_links(self, links):
+            state["clicked"].append(links)
+
+        def click_shopping_ads(self, links):
+            state["shopping_clicked"].append(links)
+
+        def end_search(self):
+            pass
+
+    monkeypatch.setattr(ad_clicker, "SearchController", FakeSearchController)
+    monkeypatch.setattr(
+        ad_clicker, "create_webdriver", lambda *args, **kwargs: (object(), None)
+    )
+    return state
+
+
+class TestScenarioClicks:
+    """Что кликает раунд: пустая реклама не должна убивать прогон.
+
+    Прод-дефект: при пустом ``ads`` сценарий печатал «No ads found» и шёл в
+    ``end_search`` — после нескольких скроллов браузер закрывался, хотя
+    органика в ``non_ad_links`` была и не кликалась никогда.
+    """
+
+    def test_organic_links_are_clicked_when_no_ads_found(self, fake_scenario):
+        non_ad = [object()]
+        fake_scenario["non_ad"] = non_ad
+
+        assert ad_clicker.run_scenario(query="usb hub") is True
+        assert fake_scenario["clicked"] == [non_ad], (
+            "раунд без рекламы обязан кликать органику, а не закрывать браузер"
+        )
+
+    def test_shopping_ads_are_clicked_when_no_text_ads(self, fake_scenario):
+        shopping = [(object(), "http://s.example", "Title")]
+        fake_scenario["shopping"] = shopping
+
+        assert ad_clicker.run_scenario(query="usb hub") is True
+        assert fake_scenario["shopping_clicked"] == [shopping]
+
+    def test_nothing_is_clicked_when_search_returned_nothing(self, fake_scenario):
+        assert ad_clicker.run_scenario(query="usb hub") is True
+        assert fake_scenario["clicked"] == [], "пустой раунд — без попыток клика"
+        assert fake_scenario["shopping_clicked"] == [], (
+            "нечего кликать — клик-фаза не должна вызываться вовсе"
+        )
+
+    def test_click_order_three_survives_results_without_ads(
+        self, fake_scenario, behavior, monkeypatch
+    ):
+        # Чередование «органика/реклама» брало ads[0] без проверки: при
+        # найденной только shopping-рекламе раунд падал по IndexError и
+        # завершался нулём кликов.
+        monkeypatch.setattr(behavior, "click_order", 3)
+        non_ad = [object()]
+        fake_scenario["non_ad"] = non_ad
+        fake_scenario["shopping"] = [(object(), "http://s.example", "Title")]
+
+        assert ad_clicker.run_scenario(query="usb hub") is True
+        assert fake_scenario["clicked"] == [non_ad]
