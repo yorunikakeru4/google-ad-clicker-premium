@@ -1,6 +1,7 @@
 import sys
 import json
 import random
+import re
 import time
 from datetime import datetime
 from pathlib import Path
@@ -185,6 +186,31 @@ def _destination_targets(urls: tuple) -> list[str]:
     return targets
 
 
+# Доменоподобные токены в тексте объявления: «edelind.de», «www.edelind.de»,
+# «shop.example.com». Хвост — обязательно буквы (2+): числа («1.039»,
+# «154.0.8037.92») и порты доменами не считаются.
+_DOMAIN_TOKEN = re.compile(r"[a-z0-9][a-z0-9-]*(?:\.[a-z0-9][a-z0-9-]*)*\.[a-z]{2,}")
+
+
+def _domain_tokens(text: str) -> list[str]:
+    """Домены, упомянутые в видимом тексте ссылки или заголовке объявления.
+
+    Прод-дыра: у shopping и рекламы href — редирект Google (``aclk``/``goto``)
+    с непрозрачной целью, ``data-pcu`` у shopping отсутствует, а домен
+    рекламодателя виден только в aria-label/заголовке («... edelind.de
+    Rabattcode...»). По одному href чёрный список такое не ловил, и клик
+    уходил на запрещённый домен. Токены проверяются тем же
+    :func:`domain_matches`, что и хосты URL — границы домена сохраняются.
+
+    :type text: str
+    :param text: заголовок объявления или видимый текст ссылки
+    :rtype: list
+    :returns: токены в нижнем регистре без дублей
+    """
+
+    return list(dict.fromkeys(_DOMAIN_TOKEN.findall(text.lower())))
+
+
 class SearchController:
     """Search controller for Premium Bot
 
@@ -343,6 +369,20 @@ class SearchController:
                         "click",
                         "Excluding: blocked domain",
                         fields={"url": target, "domain": domain},
+                    )
+                    return True
+
+        # Домены из заголовка/текста: у редиректов Google (aclk/goto) цель
+        # непрозрачна, и единственный след домена рекламодателя — видимый
+        # текст («... edelind.de Rabattcode...»). Без этого покупка кликалась
+        # по чёрному списку (прод-инцидент 07.10).
+        for domain in blocked:
+            for token in (*_domain_tokens(title), *_domain_tokens(text)):
+                if domain_matches(token, domain):
+                    log.debug(
+                        "click",
+                        "Excluding: domain mentioned in text",
+                        fields={"token": token, "domain": domain, "title": title},
                     )
                     return True
 
@@ -570,9 +610,11 @@ class SearchController:
             text = getattr(link_element, "text", "") or ""
         else:
             # data-pcu — реальная цель; у shopping-блока атрибута нет,
-            # get_attribute вернёт None и проверка сводится к href.
+            # get_attribute вернёт None и проверка сводится к href. Текст
+            # элемента обязателен: у goto/aclk-редиректов домен виден только
+            # в видимом тексте объявления (см. ``_domain_tokens``).
             urls = (link_url, link_element.get_attribute("data-pcu"))
-            text = ""
+            text = getattr(link_element, "text", "") or ""
 
         if not self._is_blocked_target(*urls, title=title or "", text=text):
             return False

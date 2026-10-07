@@ -1809,3 +1809,111 @@ def test_click_shopping_ads_rechecks_blacklist_right_before_click(
     assert controller._stats.num_excluded_shopping_ads == 1, (
         "пропуск на этапе клика должен попадать в счётчик shopping-исключений"
     )
+
+
+# --- Прод-дыра: цель скрыта в редиректе Google, домен виден только в тексте ----
+
+
+def test_is_blocked_target_matches_domain_only_in_title(make_search_controller):
+    # Прод-кейс: href = google.com/aclk без расшифруемой цели, а в aria-label
+    # объявления написано «... edelind.de Rabattcode...». Хост href — google,
+    # destination-параметров нет, но клик уходит на домен из чёрного списка.
+    controller = make_search_controller()
+    controller._blocked_domains = ["edelind.de"]
+    aclk = "https://www.google.com/aclk?sa=L&ai=DChsSEwi1xJfvrqe&co=1"
+
+    assert controller._is_blocked_target(
+        aclk,
+        title="Kette Gold 750 Damen 50 cm | EDELIND edelind.de Rabattcode Kostenlos",
+    )
+    assert not controller._is_blocked_target(
+        aclk, title="Wireless Keyboard Sale shop.example"
+    )
+
+
+def test_is_blocked_target_matches_domain_in_text(make_search_controller):
+    controller = make_search_controller()
+    controller._blocked_domains = ["edelind.de"]
+    goto = "https://www.google.com/goto?url=CAESbwHrOzAVVU3fis6DpR9W"
+
+    assert controller._is_blocked_target(
+        goto, text="Edle Goldketten - Gold 750 edelind.de"
+    )
+
+
+def test_is_blocked_target_ignores_lookalikes_and_numbers_in_title(
+    make_search_controller,
+):
+    # «notedelind.de» — чужой хост с той же подстрокой: граница домена
+    # обязана сохраниться, а числа вида «1.039» и версии «154.0.8037.92»
+    # доменами не являются и блокировать не должны.
+    controller = make_search_controller()
+    controller._blocked_domains = ["edelind.de"]
+    aclk = "https://www.google.com/aclk?sa=L&ai=xyz"
+
+    assert not controller._is_blocked_target(
+        aclk, title="Notedelind.de Wettbewerber Kette 1.039 € Chrome/154.0.8037.92"
+    )
+
+
+def test_shopping_ads_dropped_when_domain_only_in_title(make_search_controller):
+    # Прод-кейс: href shopping-якоря — aclk-редирект Google (цель
+    # непрозрачна), data-pcu у shopping отсутствует; спасает только
+    # упоминание домена в aria-label.
+    driver = ShoppingAdsDriver(
+        [
+            (
+                "https://www.google.com/aclk?sa=L&ai=DChsSEwi1xJfvrqe&co=1",
+                "Kette Gold 750 | EDELIND edelind.de Rabattcode",
+            ),
+            ("https://www.google.com/aclk?sa=L&ai=other&co=1", "Wireless Keyboard"),
+        ]
+    )
+    controller = make_search_controller(query="wireless keyboard", driver=driver)
+    controller._blocked_domains = ["edelind.de"]
+
+    result = controller._get_shopping_ad_links()
+
+    assert [entry[2] for entry in result] == ["Wireless Keyboard"]
+    assert controller._stats.num_excluded_shopping_ads == 1
+
+
+def test_click_shopping_ads_skips_when_domain_only_in_title(
+    make_search_controller, monkeypatch, record_clicks
+):
+    # Последний рубеж: ссылка собрана до обновления списка, домен виден
+    # только в заголовке — клика не должно быть.
+    ad = FakeElement(
+        attributes={"href": "https://www.google.com/aclk?sa=L&ai=xyz"},
+        text="Kette Gold 750",
+    )
+    controller = make_search_controller(driver=ClickDriver())
+    controller._blocked_domains = []
+    monkeypatch.setattr(search_controller, "get_domains", lambda: ["edelind.de"])
+    clicked = record_clicks(controller)
+
+    controller.click_shopping_ads(
+        [(ad, "https://www.google.com/aclk?sa=L&ai=xyz", "edelind.de Rabattcode")]
+    )
+
+    assert clicked == []
+    assert controller._stats.num_excluded_shopping_ads == 1
+
+
+def test_click_links_skips_ad_whose_text_mentions_blocked_domain(
+    make_search_controller, monkeypatch, record_clicks
+):
+    # goto-ссылка: href непрозрачен, заголовок пуст, а видимый текст
+    # объявления содержит домен — клика не должно быть.
+    href = "https://www.google.com/goto?url=CAESbwHrOzAVVU3f"
+    ad = FakeElement(
+        attributes={"href": href}, text="Edle Goldketten edelind.de Rabattcode"
+    )
+    controller = make_search_controller(driver=ClickDriver())
+    controller._blocked_domains = ["edelind.de"]
+    clicked = record_clicks(controller)
+
+    controller.click_links([(ad, href, "")])
+
+    assert clicked == []
+    assert controller._stats.num_excluded_ads == 1
