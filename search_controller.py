@@ -124,22 +124,14 @@ if (el.form) {
 
 # --- открытие ссылки в новой вкладке ---------------------------------------------
 
-# Фолбэк ctrl/cmd+click: открыть цель по href в новой вкладке. JS-клик
-# ``arguments[0].click()`` здесь намеренно НЕ используется — у goto/aclk-ссылок
-# он ведёт в ту же вкладку, убивает выдачу и клик не засчитывается, а
-# ``window.open`` сохраняет семантику «клик по ссылке»: браузер запрашивает
-# тот же href (aclk/redirect регистрирует переход на сервере Google) и ведёт
-# на лендинг. Статус нужен для диагностики в лог: ``blocked`` означает, что
-# popup-блокиратор Chrome не пропустил вызов, ``no-url`` — что у элемента не
-# нашлось href.
-_OPEN_IN_NEW_TAB_JS = """
-const url = arguments[0];
-if (!url) { return 'no-url'; }
-const opened = window.open(url, '_blank');
-if (!opened) { return 'blocked'; }
-try { opened.opener = null; } catch (error) { /* cross-origin: не страшно */ }
-return 'opened';
-"""
+# Фолбэк ctrl/cmd+click открывает вкладку штатным WebDriver API
+# (``switch_to.new_window("tab")`` + ``get(href)``), без исполняемого на
+# странице JS. ``window.open`` через ``execute_script`` на страницах Google
+# зависал до script timeout (воспроизведено изолированно: на google.com —
+# всегда, на example.com — мгновенно), создавая пустую вкладку-сироту
+# ``about:blank``: клик не засчитывался, а на экране оставалась незагруженная
+# «undefined» страница. Прямой ``arguments[0].click()`` тоже не используется —
+# у goto/aclk-ссылок он ведёт в ту же вкладку и убивает выдачу.
 
 # --- отбор органических (не рекламных) ссылок ------------------------------------
 
@@ -972,11 +964,14 @@ class SearchController:
         1. ActionChains ctrl/cmd+click — то, что реально работало в прогонах;
         2. ``scrollIntoView`` + тот же ctrl/cmd+click — элемент мог быть вне
            вида или перекрыт другим слоем;
-        3. ``window.open(href)`` — открыть цель по href в новой вкладке. JS-клик
-           ``arguments[0].click()`` не используется намеренно: у goto/aclk-ссылок
-           он ведёт в ту же вкладку, убивает выдачу и клик не засчитывается, а
-           ``window.open`` сохраняет семантику «клик по ссылке» — href тот же,
-           переход регистрирует Google и ведёт на лендинг.
+        3. штатный WebDriver: ``new_window("tab")`` + навигация новой вкладки
+           по href — ``window.open`` через ``execute_script`` на страницах
+           Google висел до script timeout (см. секцию открытия вкладки),
+           команды драйвера не зависают. Навигация по тому же href регистрирует
+           переход так же, как клик: aclk/goto уходит тем же GET-запросом и
+           ведёт на лендинг. JS-клик ``arguments[0].click()`` не используется
+           намеренно — у goto/aclk-ссылок он ведёт в ту же вкладку и убивает
+           выдачу.
 
         Каждая неудача логируется отдельно с url и причиной; ``None`` метод
         возвращает только после того, как отказалась вся цепочка.
@@ -1020,7 +1015,7 @@ class SearchController:
 
         Живой атрибут главнее: href мог измениться, пока страница скроллилась.
         Протухший элемент не роняет цепочку — управление уходит на сохранённый
-        href, который ``window.open`` и так использует.
+        href, которым открывает вкладку фолбэк.
         """
 
         try:
@@ -1115,11 +1110,15 @@ class SearchController:
     def _open_url_in_new_tab(
         self, url: Optional[str], handles_before: list[str]
     ) -> Optional[str]:
-        """Фолбэк: открыть href в новой вкладке через ``window.open``.
+        """Фолбэк: открыть href в новой вкладке штатным WebDriver API.
 
         Срабатывает, когда обе ctrl/cmd+click-попытки не открыли вкладку.
-        Открытие идёт по сохранённому href, поэтому протухший элемент и
-        перехваченный Google'ом click-обработчик на результат не влияют.
+        Вместо ``window.open`` (висит до script timeout на страницах Google,
+        см. комментарий у секции открытия вкладки) — ``new_window("tab")``
+        плюс навигация новой вкладки по href: это команды драйвера, они не
+        исполняются на стороне страницы и не зависают. Навигация по тому же
+        href регистрирует переход так же, как клик: aclk/goto уходит тем же
+        GET-запросом и ведёт на лендинг.
 
         :type url: str
         :param url: href, который должен открыться в новой вкладке
@@ -1135,16 +1134,16 @@ class SearchController:
 
         log.debug(
             "click",
-            "Ctrl+click did not work, falling back to window.open",
+            "Ctrl+click did not work, falling back to a driver-opened tab",
             fields={"url": url},
         )
 
         try:
-            status = self._driver.execute_script(_OPEN_IN_NEW_TAB_JS, url)
+            self._driver.switch_to.new_window("tab")
         except WebDriverException as exp:
             log.info(
                 "click",
-                "window.open fallback raised an error",
+                "Driver could not open a new tab",
                 fields={
                     "url": url,
                     "error": str(exp).split("\n")[0],
@@ -1153,26 +1152,55 @@ class SearchController:
             )
             return None
 
-        sleep(get_random_sleep(0.5, 1) * config.behavior.wait_factor)
-
         handle = self._new_window_handle(handles_before)
 
         if handle is None:
-            # ``blocked`` — popup-блокиратор Chrome: полезная причина для
-            # разбора на живом стенде, если вкладка не открывается никогда.
+            # Новая вкладка не отличается от старых — аномалия драйвера:
+            # закрываем то, что открыли, чтобы не оставлять сироту.
+            log.info("click", "New tab handle did not appear", fields={"url": url})
+            self._close_current_tab(handles_before)
+            return None
+
+        try:
+            self._driver.switch_to.window(handle)
+            self._driver.get(url)
+        except WebDriverException as exp:
             log.info(
                 "click",
-                "window.open did not open a new tab",
-                fields={"url": url, "status": status},
+                "Driver could not navigate the new tab; click is not counted",
+                fields={
+                    "url": url,
+                    "error": str(exp).split("\n")[0],
+                    "error_type": type(exp).__name__,
+                },
             )
+            self._close_current_tab(handles_before)
             return None
 
         log.debug(
             "click",
-            "window.open fallback opened a new tab",
-            fields={"url": url, "status": status},
+            "Driver-opened tab navigated to the href",
+            fields={"url": url, "tab": handle},
         )
         return handle
+
+    def _close_current_tab(self, handles_before: list[str]) -> None:
+        """Закрыть текущую вкладку и вернуться на исходную. Ошибки гасятся:
+
+        попытка уборки не должна ронять сценарий, а исходная вкладка из
+        ``handles_before`` остаётся рабочей поверхностью.
+        """
+
+        try:
+            self._driver.close()
+        except WebDriverException:
+            pass
+
+        if handles_before:
+            try:
+                self._driver.switch_to.window(handles_before[0])
+            except WebDriverException:
+                pass
 
     def _landing_url(self) -> Optional[str]:
         """URL лендинга в текущей вкладке; None — вкладка пустая (``about:blank``).

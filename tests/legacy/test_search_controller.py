@@ -2097,7 +2097,7 @@ def test_click_links_skips_ad_whose_text_mentions_blocked_domain(
 
 
 class _SwitchTo:
-    """Мини-двойник ``driver.switch_to``: переключение между вкладками драйвера."""
+    """Мини-двойник ``driver.switch_to``: переключение и открытие вкладок."""
 
     def __init__(self, driver):
         self._driver = driver
@@ -2105,15 +2105,21 @@ class _SwitchTo:
     def window(self, handle):
         self._driver.switch_window(handle)
 
+    def new_window(self, kind="tab"):
+        self._driver.perform_new_window(kind)
+
 
 class TabDriver(FakeDriver):
     """Драйвер с механикой вкладок для клик-фазы.
 
     ``ctrl_click_opens`` — сценарий попыток ctrl/cmd+click (по одному bool на
     попытку; пустой список — ни одна не открывает вкладку), ``window_opens`` —
-    открывает ли фолбэк ``window.open``, ``opened_tab_url`` — что окажется в
-    новой вкладке (по умолчанию тот же href, как после редиректа на лендинг;
-    ``about:blank`` моделирует навигацию, которая не состоялась).
+    открывает ли фолбэк ``switch_to.new_window`` новую вкладку (False — драйвер
+    бросает WebDriverException), ``opened_tab_url`` — что окажется в новой
+    вкладке, открытой ctrl-кликом (по умолчанию тот же href, как после
+    редиректа на лендинг; ``about:blank`` моделирует навигацию, которая не
+    состоялась). Фолбэк-вкладка создаётся пустой и получает URL через ``get`` —
+    ровно как в проде: ``new_window`` + навигация по href.
     """
 
     def __init__(
@@ -2134,7 +2140,8 @@ class TabDriver(FakeDriver):
         self._opened_tab_url = opened_tab_url
         self._landing_url = landing_url
         self.ctrl_click_attempts = 0
-        self.window_open_calls = []
+        self.new_window_calls = []
+        self.fallback_get_calls = []
         self.opened_tabs = []
 
     @property
@@ -2149,6 +2156,31 @@ class TabDriver(FakeDriver):
         if handle not in self._handles:
             raise WebDriverException(f"no such window handle: {handle}")
         self.current_window_handle = handle
+
+    def perform_new_window(self, kind="tab"):
+        """``switch_to.new_window``: открывает пустую вкладку по сценарию.
+
+        ``window_opens=False`` моделирует отказ драйвера (WebDriverException);
+        успешное открытие создаёт ``about:blank``-вкладку и переключает на неё
+        — как настоящий WebDriver, — URL приходит позже через ``get``.
+        """
+
+        self.new_window_calls.append(kind)
+
+        if not self._window_opens:
+            raise WebDriverException("unable to open new window (modelled failure)")
+
+        handle = self._add_tab("about:blank")
+        self.current_window_handle = handle
+
+    def get(self, url):
+        """Навигация текущей вкладки: и штатная, и фолбэк-переход по href."""
+
+        self.visited.append(url)
+        self._urls[self.current_window_handle] = url
+
+        if self.current_window_handle != "search-window":
+            self.fallback_get_calls.append(url)
 
     def perform_ctrl_click(self):
         """Попытка ctrl/cmd+click: по сценарию открывает (или не открывает) вкладку."""
@@ -2181,16 +2213,6 @@ class TabDriver(FakeDriver):
 
     def execute_script(self, script, *args):
         self.scripts.append(script)
-
-        if "window.open" in script:
-            url = args[0] if args else None
-            self.window_open_calls.append(url)
-
-            if not self._window_opens or not url:
-                return "blocked"
-
-            self._add_tab(self._tab_url(url))
-            return "opened"
 
         if "scrollHeight" in script:
             return 1000
@@ -2258,7 +2280,7 @@ def test_handle_browser_click_counts_click_when_ctrl_click_opens_a_tab(
     controller._handle_browser_click(link, href, True, "search-window", category="Ad")
 
     assert driver.ctrl_click_attempts == 1
-    assert driver.window_open_calls == [], "при успехе window.open не должен вызываться"
+    assert driver.new_window_calls == [], "при успехе фолбэк не должен вызываться"
     assert controller.stats.ads_clicked == 1
     assert driver.window_handles == ["search-window"], "вкладка лендинга должна закрыться"
     assert driver.current_window_handle == "search-window", "фокус должен вернуться на выдачу"
@@ -2280,13 +2302,18 @@ def test_handle_browser_click_retries_after_scrolling_into_view(
     assert any("scrollIntoView" in script for script in driver.scripts), (
         "вторая попытка должна идти после прокрутки элемента в вид"
     )
-    assert driver.window_open_calls == []
+    assert driver.new_window_calls == []
     assert controller.stats.ads_clicked == 1
 
 
-def test_handle_browser_click_falls_back_to_window_open(make_search_controller, ctrl_click):
-    # Прод-кейс: ctrl/cmd+click Chrome игнорирует, фолбэк открывает цель по href
-    # в новой вкладке — иначе «Ads Found 3, Ads Clicked 0».
+def test_handle_browser_click_falls_back_to_driver_new_window(
+    make_search_controller, ctrl_click
+):
+    # Прод-дефект: ctrl/cmd+click Chrome игнорирует, а старый фолбэк
+    # ``window.open`` на страницах Google висел до script timeout и оставлял
+    # пустую вкладку-сироту — «Ads Found 3, Ads Clicked 0». Новый фолбэк —
+    # штатный ``new_window`` + навигация по href: вкладка открывается и
+    # получает URL без исполняемого на странице JS.
     href = "https://www.google.com/aclk?sa=L&ai=xyz&adurl=https%3A%2F%2Fshop.example%2Fkb"
     driver = TabDriver()
     controller = make_search_controller(driver=driver)
@@ -2294,7 +2321,8 @@ def test_handle_browser_click_falls_back_to_window_open(make_search_controller, 
     controller._handle_browser_click(ad_link(href), href, True, "search-window", category="Ad")
 
     assert driver.ctrl_click_attempts == 2, "обе ctrl+click попытки должны были отработать"
-    assert driver.window_open_calls == [href], "фолбэк открывает ровно href ссылки"
+    assert driver.new_window_calls == ["tab"], "фолбэк открывает вкладку через new_window"
+    assert driver.fallback_get_calls == [href], "новая вкладка уходит по href ссылки"
     assert controller.stats.ads_clicked == 1
     assert driver.current_window_handle == "search-window"
 
@@ -2319,7 +2347,7 @@ def test_handle_browser_click_does_not_count_click_without_a_new_tab(
 
     messages = [record[2] for record in record_log.records]
     assert any("Ctrl+click did not open a new tab" in message for message in messages)
-    assert any("window.open did not open a new tab" in message for message in messages)
+    assert any("Driver could not open a new tab" in message for message in messages)
 
     failure = next(
         record
@@ -2343,10 +2371,11 @@ def test_handle_browser_click_does_not_count_a_blank_tab(make_search_controller,
     assert driver.current_window_handle == "search-window"
 
 
-def test_handle_browser_click_reports_a_blocked_popup(
+def test_handle_browser_click_reports_driver_new_window_failure(
     make_search_controller, ctrl_click, record_log
 ):
-    # Popup-блокиратор Chrome — диагностируемая причина, а не молчаливый return.
+    # Отказ драйвера от new_window — диагностируемая причина, а не
+    # молчаливый return; вкладка при этом не остаётся-сиротой.
     href = "https://shop.example/product"
     driver = TabDriver(window_opens=False)
     controller = make_search_controller(driver=driver)
@@ -2355,12 +2384,14 @@ def test_handle_browser_click_reports_a_blocked_popup(
         FakeElement(attributes={"href": href}), href, False, "search-window"
     )
 
-    blocked = next(
-        record for record in record_log.records if record[2] == "window.open did not open a new tab"
+    failure = next(
+        record for record in record_log.records if record[2] == "Driver could not open a new tab"
     )
-    assert blocked[3] == {"url": href, "status": "blocked"}
-    assert driver.window_open_calls == [href], "фолбэк должен был попытаться открыть href"
-    assert driver.opened_tabs == [], "popup-блокиратор не пропустил вкладку"
+    assert failure[3]["url"] == href
+    assert "error_type" in failure[3], "причина отказа должна называть тип ошибки драйвера"
+    assert driver.new_window_calls == ["tab"], "фолбэк обязан был попытаться открыть вкладку"
+    assert driver.fallback_get_calls == [], "навигации не было — вкладки не открылись"
+    assert driver.opened_tabs == [], "драйвер отказал до создания вкладки"
     assert controller.stats.ads_clicked == 0
 
 
