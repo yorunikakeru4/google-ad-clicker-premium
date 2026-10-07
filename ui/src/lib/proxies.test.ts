@@ -170,6 +170,43 @@ describe("createProxiesApi: добавление и импорт", () => {
 
     await expect(api.add(["a:1"])).rejects.toThrow(/added/);
   });
+
+  it("problems-объекты демона ({line_index, message}, {index, message}) → строки", async () => {
+    const { transport } = transportOf({
+      "/control/proxies": {
+        status: 200,
+        body: JSON.stringify({
+          added: 1,
+          skipped: 2,
+          problems: [
+            { line_index: 1, message: "нет порта" },
+            { index: 0, message: "дубликат" },
+            "уже готовая строка",
+          ],
+        }),
+      },
+      "/control/proxies/import": {
+        status: 200,
+        body: JSON.stringify({
+          added: 0,
+          skipped: 1,
+          problems: [{ line_index: 3, message: "некорректный адрес" }],
+        }),
+      },
+    });
+    const api = createProxiesApi(transport);
+
+    const added = await api.add(["host-only"]);
+    const imported = await api.importFile();
+
+    // Раньше filter(typeof string) выбрасывал объекты — «пропущено 2» без причин.
+    expect(added.problems).toEqual([
+      "строка 2: нет порта",
+      "запись 1: дубликат",
+      "уже готовая строка",
+    ]);
+    expect(imported.problems).toEqual(["строка 4: некорректный адрес"]);
+  });
 });
 
 describe("createProxiesApi: удаление и проверка", () => {

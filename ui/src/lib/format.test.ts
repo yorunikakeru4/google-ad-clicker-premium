@@ -5,6 +5,7 @@ import {
   formatLastError,
   formatLocalDateTime,
   formatPid,
+  formatProblems,
   formatUptime,
   formatClockTime,
   formatLastUsed,
@@ -135,5 +136,56 @@ describe("formatDuration", () => {
     expect(formatDuration(400)).toBe("0.4 с");
     expect(formatDuration(10_000)).toBe("10.0 с");
     expect(formatDuration(0)).toBe("0.0 с");
+  });
+});
+
+describe("formatProblems", () => {
+  it("строки проходят как есть — так их шлёт демон для delete", () => {
+    expect(
+      formatProblems(["id=5: назначен воркеру br-1", "id=6: профиль не найден"]),
+    ).toEqual(["id=5: назначен воркеру br-1", "id=6: профиль не найден"]);
+  });
+
+  it("{line_index, message} → «строка N» с 1-based нумерацией", () => {
+    expect(
+      formatProblems([{ line_index: 0, message: "дубликат: user_agent уже есть" }]),
+    ).toEqual(["строка 1: дубликат: user_agent уже есть"]);
+    expect(formatProblems([{ line_index: 52, message: "пусто" }])).toEqual([
+      "строка 53: пусто",
+    ]);
+  });
+
+  it("{index, message} → «запись N» с 1-based нумерацией", () => {
+    expect(formatProblems([{ index: 0, message: "имя уже занято" }])).toEqual([
+      "запись 1: имя уже занято",
+    ]);
+    expect(formatProblems([{ index: 12, message: "дубликат" }])).toEqual([
+      "запись 13: дубликат",
+    ]);
+  });
+
+  it("мусор отбрасывается, а не превращается в [object Object]", () => {
+    expect(
+      formatProblems([
+        null,
+        42,
+        true,
+        { message: "без индекса" },
+        { line_index: "2", message: "строка не число" },
+        { index: 1 },
+        {},
+      ]),
+    ).toEqual([]);
+  });
+
+  it("смешанный список сохраняет порядок и отбрасывает только мусор", () => {
+    expect(
+      formatProblems([
+        "готовая строка",
+        { line_index: 1, message: "нет порта" },
+        null,
+        { index: 3, message: "дубликат" },
+      ]),
+    ).toEqual(["готовая строка", "строка 2: нет порта", "запись 4: дубликат"]);
   });
 });

@@ -47,6 +47,7 @@ from engine.control_plane.supervisor import (
 from engine.diagnostics import request_signal
 from engine.profile_pool import (
     ProfileError,
+    ProfileImportError,
     ProfileInUseError,
     ProfileInvalidError,
     ProfileNotFoundError,
@@ -124,6 +125,9 @@ _ERROR_STATUS = {
     ProfileInUseError: ("profile_in_use", 409),
     ProfileNotFoundError: ("profile_not_found", 404),
     ProfileInvalidError: ("invalid_request", 400),
+    # Ошибка импорта из файла: путь не задан, файла нет или он не читается —
+    # как у прокси (proxy_import_failed), только для user_agents.
+    ProfileImportError: ("profile_import_failed", 400),
 }
 
 
@@ -439,6 +443,16 @@ class ControlPlaneHandler(BaseHTTPRequestHandler):
         """
         return str(self.config.get("paths.proxy_file") or "")
 
+    def _user_agents_file_setting(self) -> str:
+        """``paths.user_agents`` из конфига; пустая строка — значение не задано.
+
+        Тот же приём, что у ``_proxy_file_setting``: единственный источник
+        пути — конфиг, запрос не может подсунуть свой. Пустое значение не
+        поднимает исключение здесь — его превращает в ``profile_import_failed``
+        уже вызывающий код импорта.
+        """
+        return str(self.config.get("paths.user_agents") or "")
+
     def _handle_proxies_delete(self) -> None:
         """Одиночное удаление — строго, батч и «всё» — best-effort с отчётом.
 
@@ -450,7 +464,7 @@ class ControlPlaneHandler(BaseHTTPRequestHandler):
         можно, и увидеть, что мешало. Тело на «всё» не растёт с размером
         пула: список id собирает демон, а не UI (MAX_BODY_BYTES — 64 КБ).
         """
-        ids, mode = self._requested_proxy_ids()
+        ids, mode = self._requested_delete_ids()
         if mode == "single":
             self.proxy_pool.delete(ids[0])
             # Счётчик, а не булево: UI (как и add/import) ждёт число.
@@ -660,14 +674,47 @@ class ControlPlaneHandler(BaseHTTPRequestHandler):
         self._send_json(200, self.profile_pool.add_profiles(self._requested_profiles()))
 
     def _handle_profiles_import(self) -> None:
-        # Формат строки (key_ref либо "key_ref | name") и генерация имени
-        # живут в ProfilePool.import_lines — здесь только проверка тела.
-        self._send_json(200, self.profile_pool.import_lines(self._requested_lines()))
+        """Импорт строк из тела либо файла из ``paths.user_agents``.
+
+        Формат строки (key_ref, ``key_ref | name`` или User-Agent) и
+        генерация имени живут в ``ProfilePool.import_lines`` — здесь только
+        чтение тела и выбор ветки. ``{"file": true}`` читает файл, путь
+        которого берётся исключительно из конфига (как у прокси), — запрос
+        не может указать свой путь. Тело читается ровно один раз.
+        """
+        body = self._read_optional_object()
+        if body.get("file") is True:
+            path = self._user_agents_file_setting()
+            if not path:
+                raise ProfileImportError(
+                    "paths.user_agents не задан в конфиге — импорт из файла невозможен"
+                )
+            self._send_json(200, self.profile_pool.import_file(path))
+            return
+        if "lines" in body:
+            self._send_json(200, self.profile_pool.import_lines(self._lines_from(body)))
+            return
+        raise InvalidRequestError('ожидается объект с полем lines либо {"file": true}')
 
     def _handle_profiles_delete(self) -> None:
-        # ProfileNotFoundError → 404, ProfileInUseError → 409 profile_in_use.
-        self.profile_pool.delete(self._requested_id())
-        self._send_json(200, {"deleted": True})
+        """Одиночное удаление — строго, батч и «всё» — best-effort с отчётом.
+
+        Ровно тот же контракт, что у ``_handle_proxies_delete``: ``{"id": n}``
+        сохраняет 404/409 (одна строка, которую держит воркер, — понятная и
+        нужная ошибка), а ``{"ids": [...]}`` и ``{"all": true}`` занятые и
+        отсутствующие строки не роняют — оператор ждёт «удалить всё, что
+        можно, и увидеть, что мешало». Счётчик ``deleted`` в одиночном
+        режиме — число, а не булево: UI ждёт число (FIX B).
+        """
+        ids, mode = self._requested_delete_ids()
+        if mode == "single":
+            self.profile_pool.delete(ids[0])
+            self._send_json(200, {"deleted": 1})
+            return
+        if mode == "all":
+            self._send_json(200, self.profile_pool.delete_all())
+            return
+        self._send_json(200, self.profile_pool.delete_many(ids))
 
     def _handle_profiles_assign(self) -> None:
         # Границы диапазона валидирует пул: единый источник правил, а ошибка
@@ -808,6 +855,14 @@ class ControlPlaneHandler(BaseHTTPRequestHandler):
         raw = self._read_json_body()
         if not isinstance(raw, dict):
             raise InvalidRequestError("ожидается объект с полем lines")
+        return self._lines_from(raw)
+
+    def _lines_from(self, raw: dict[str, Any]) -> list[str]:
+        """Поле ``lines`` уже прочитанного тела — та же проверка, что выше.
+
+        Вынесено, чтобы импорт профилей мог прочитать тело один раз и
+        выбрать ветку (``lines`` либо ``file``), не читая его повторно.
+        """
         lines = raw.get("lines")
         if not isinstance(lines, list):
             raise InvalidRequestError("поле lines должно быть списком строк")
@@ -833,24 +888,14 @@ class ControlPlaneHandler(BaseHTTPRequestHandler):
             raise InvalidRequestError("поле profiles должно быть списком объектов")
         return records
 
-    def _requested_id(self) -> int:
-        """Поле ``id`` из тела: удаление прокси, удаление профиля, статус."""
-        raw = self._read_json_body()
-        if not isinstance(raw, dict):
-            raise InvalidRequestError("ожидается объект с полем id")
-        profile_id = raw.get("id")
-        # bool — подкласс int: JSON true не должно пройти как id=1.
-        if isinstance(profile_id, bool) or not isinstance(profile_id, int):
-            raise InvalidRequestError("поле id должно быть целым числом")
-        return profile_id
-
-    def _requested_proxy_ids(self) -> tuple[list[int], str]:
+    def _requested_delete_ids(self) -> tuple[list[int], str]:
         """Что удалить: ``(ids, режим)``, режим — ``single`` / ``batch`` / ``all``.
 
-        ``{"id": 7}`` — одиночное удаление (строгие 404/409),
-        ``{"ids": [...]}`` — батч best-effort, ``{"all": true}`` — весь пул.
-        В батче дубли схлопываются с сохранением порядка: повтор в списке
-        не должен удалить строку, а потом пожаловаться, что её уже нет.
+        Общий парсер удаления для прокси и профилей. ``{"id": 7}`` —
+        одиночное удаление (строгие 404/409), ``{"ids": [...]}`` — батч
+        best-effort, ``{"all": true}`` — весь пул. В батче дубли
+        схлопываются с сохранением порядка: повтор в списке не должен
+        удалить строку, а потом пожаловаться, что её уже нет.
 
         ``all`` проверяется первым и не смешивается с остальными: запрос
         «удалить всё» не должен зависеть от того, есть ли в нём случайно

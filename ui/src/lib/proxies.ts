@@ -12,6 +12,7 @@
 
 import { apiErrorMessage, proxiesRequest, type ProxiesAction } from "./control";
 import { tauriTransport, type Transport } from "./daemonApi";
+import { formatProblems } from "./format";
 
 /** Строка списка прокси — контракт GET /control/proxies без кредов. */
 export interface ProxyRow {
@@ -193,7 +194,10 @@ function pickChangeResult(raw: unknown, path: string): ProxyChangeResult {
   return {
     added,
     skipped,
-    problems: problems.filter((problem): problem is string => typeof problem === "string"),
+    // Демон шлёт причины объектами ({line_index, message} у импорта,
+    // {index, message} у add): без нормализации в строки UI терял бы их
+    // («пропущено 3» без объяснения, план §1 п.4).
+    problems: formatProblems(problems),
   };
 }
 
@@ -202,7 +206,9 @@ function pickChangeResult(raw: unknown, path: string): ProxyChangeResult {
  *
  * Причины — строки (так их и шлёт демон), поэтому в отличие от
  * [`pickChangeResult`] они доходят до алерта целиком: без них «пропущено 3»
- * ничего не объясняет.
+ * ничего не объясняет. Прогон через [`formatProblems`] нужен для
+ * единообразия: строки проходят как есть, а объекты (если демон когда-нибудь
+ * начнёт их слать) не превратились бы в `[object Object]`.
  */
 function pickDeleteResult(raw: unknown, path: string): ProxyDeleteResult {
   if (typeof raw !== "object" || raw === null) {
@@ -220,7 +226,7 @@ function pickDeleteResult(raw: unknown, path: string): ProxyDeleteResult {
   return {
     deleted,
     skipped,
-    problems: problems.filter((problem): problem is string => typeof problem === "string"),
+    problems: formatProblems(problems),
   };
 }
 

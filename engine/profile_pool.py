@@ -28,10 +28,12 @@
    (``starting|running|backoff|degraded``) — тот же список, что в
    ``proxy_pool``: строка ``stopped``/``circuit_open`` ничего не держит.
 4. **Импорт — построчный, а не «всё или ничего».** Формат строки
-   ``key_ref`` либо ``key_ref | name``: простейший случай (одна строка =
-   ключ) заводит профиль с уникально сгенерированным именем, дубликаты и
-   кривые строки уходят в ``problems`` и не роняют пачку из 300+ строк —
-   та же политика, что у импорта прокси.
+   ``key_ref`` либо ``key_ref | name``, а строка, значение которой
+   начинается с ``Mozilla/``, — это User-Agent: она заводит профиль с
+   колонкой ``user_agent`` (``key_ref`` остаётся NULL) и именем ``UA-N``.
+   Простейший случай (одна строка = ключ) заводит профиль с уникально
+   сгенерированным именем, дубликаты и кривые строки уходят в ``problems``
+   и не роняют пачку из 300+ строк — та же политика, что у импорта прокси.
 
 ``key_ref`` — ссылка на ключ, а не секрет: он присутствует в HTTP-ответах и
 в ``problems``, но никогда не пишется в ``logs`` (это делает вызывающая
@@ -41,6 +43,7 @@
 from __future__ import annotations
 
 import json
+import re
 import sqlite3
 import threading
 import time
@@ -77,6 +80,11 @@ _ALLOWED_TRANSITIONS: dict[str, frozenset[str]] = {
     "blocked": frozenset({"free", "error"}),
 }
 
+# Имя профиля, сгенерированное импортом User-Agent: ровно «UA-» и число.
+# Суффикс таких имён — верхняя граница для следующего номера: существующее
+# «UA-9» даёт нумерацию с 10, а имя вида «UA-9 backup» не считается.
+_UA_NAME_RE = re.compile(r"UA-(\d+)")
+
 
 class ProfileError(Exception):
     """Базовая ошибка подсистемы профилей.
@@ -102,6 +110,10 @@ class ProfileInvalidError(ProfileError, ValueError):
     чтобы недопустимый переход был ``ValueError``, — а ``ProfileError``
     нужен HTTP-слою, чтобы вместо 500 отдать 400 с текстом ошибки.
     """
+
+
+class ProfileImportError(ProfileError):
+    """Файл для импорта не задан, не найден или не читается (400)."""
 
 
 class ProfilePool:
@@ -178,10 +190,19 @@ class ProfilePool:
 
         * ``key_ref`` — простейший случай: имя генерируется из ``key_ref``
           и при занятости получает суффикс ``-2``, ``-3``...;
-        * ``key_ref | name`` — явное имя, оно должно быть уникальным.
+        * ``key_ref | name`` — явное имя, оно должно быть уникальным;
+        * значение, начинающееся с ``Mozilla/``, — User-Agent: в профиль
+          уходит колонка ``user_agent`` (``key_ref`` остаётся NULL), а имя —
+          явное после ``|`` либо следующий свободный номер ``UA-N``
+          (``n = 1 + max`` суффиксов имён, целиком состоящих из ``UA-`` и
+          числа, дальше только растёт: пока имя ``UA-n`` занято — ``n += 1``).
 
-        Дубликат ``key_ref`` (в БД или внутри пачки) и дубликат явного имени
-        — skip с проблемой; пустые строки не считаются ни добавленными, ни
+        Перед разбором строка режется по первому табу: первая колонка —
+        значение, остальное — хвост из таблицы, вставленной целиком.
+
+        Дубликат ``key_ref`` и дубликат явного имени (в БД или внутри
+        пачки), а для User-Agent — дубликат по ``user_agent``, уходят в
+        ``problems``; пустые строки не считаются ни добавленными, ни
         пропущенными. Возвращает ``{"added", "skipped", "problems":
         [{"line_index", "message"}]}``.
         """
@@ -189,6 +210,12 @@ class ProfilePool:
         skipped = 0
         problems: list[dict[str, Any]] = []
         seen_keys: set[str] = set()
+        seen_user_agents: set[str] = set()
+        # Номер UA-N считается один раз на пачку при первой же
+        # сгенерированной строке и дальше отслеживается здесь: БД в этой же
+        # транзакции видит уже вставленные имена, но пересчитывать максимум
+        # на каждую строку — лишний проход по всей таблице.
+        ua_number: int | None = None
 
         with self._lock, self._connect() as conn:
             try:
@@ -201,35 +228,84 @@ class ProfilePool:
                         continue
                     if not line.strip():
                         continue
-                    key_ref, explicit_name, error = parse_import_line(line)
-                    if error is not None or not key_ref:
+                    value, explicit_name, error = parse_import_line(line)
+                    if error is not None or not value:
                         problems.append(
                             {"line_index": index, "message": error or "строка пустая"}
                         )
                         skipped += 1
                         continue
-                    if key_ref in seen_keys or self._key_ref_exists(conn, key_ref):
+                    if value.startswith("Mozilla/"):
+                        if value in seen_user_agents or self._user_agent_exists(conn, value):
+                            # Полный User-Agent в сообщение не попадает: оно
+                            # уходит в HTTP-ответ, а строка — идентификатор
+                            # аккаунта, цитировать её целиком незачем.
+                            problems.append(
+                                {
+                                    "line_index": index,
+                                    "message": "дубликат: user_agent уже есть",
+                                }
+                            )
+                            skipped += 1
+                            continue
+                        # Номер израсходован только на успешно вставленной
+                        # строке: упавшая вставка оставляет его текущим.
+                        taken_number: int | None = None
+                        if explicit_name is None:
+                            if ua_number is None:
+                                ua_number = _next_ua_number(conn)
+                            while self._name_exists(conn, f"UA-{ua_number}"):
+                                ua_number += 1
+                            name = f"UA-{ua_number}"
+                            taken_number = ua_number
+                        else:
+                            name = explicit_name
+                            if self._name_exists(conn, name):
+                                problems.append(
+                                    {
+                                        "line_index": index,
+                                        "message": f"дубликат: имя {name!r} уже есть",
+                                    }
+                                )
+                                skipped += 1
+                                continue
+                        if not self._insert(conn, {"name": name, "user_agent": value}):
+                            problems.append(
+                                {"line_index": index, "message": "не удалось вставить запись"}
+                            )
+                            skipped += 1
+                            continue
+                        if taken_number is not None:
+                            ua_number = taken_number + 1
+                        seen_user_agents.add(value)
+                        added += 1
+                        continue
+
+                    if value in seen_keys or self._key_ref_exists(conn, value):
                         problems.append(
-                            {"line_index": index, "message": f"дубликат: key_ref {key_ref!r} уже есть"}
+                            {
+                                "line_index": index,
+                                "message": f"дубликат: key_ref {value!r} уже есть",
+                            }
                         )
                         skipped += 1
                         continue
                     name = explicit_name
                     if name is None:
-                        name = self._unique_name(conn, key_ref)
+                        name = self._unique_name(conn, value)
                     elif self._name_exists(conn, name):
                         problems.append(
                             {"line_index": index, "message": f"дубликат: имя {name!r} уже есть"}
                         )
                         skipped += 1
                         continue
-                    if not self._insert(conn, {"name": name, "key_ref": key_ref}):
+                    if not self._insert(conn, {"name": name, "key_ref": value}):
                         problems.append(
                             {"line_index": index, "message": "не удалось вставить запись"}
                         )
                         skipped += 1
                         continue
-                    seen_keys.add(key_ref)
+                    seen_keys.add(value)
                     added += 1
                 conn.commit()
             except BaseException:
@@ -237,6 +313,25 @@ class ProfilePool:
                 raise
 
         return {"added": added, "skipped": skipped, "problems": problems}
+
+    def import_file(self, path: str | Path) -> dict[str, Any]:
+        """Импортирует файл со списком User-Agent/key_ref.
+
+        Путь приходит только из конфига (``paths.user_agents``) — запрос его
+        передавать не может, иначе файловым полём открыли бы чтение чего
+        угодно. Относительные пути разрешаются от текущего каталога, как в
+        ``proxy_pool.import_file``.
+        """
+        source = Path(path)
+        if not source.is_file():
+            raise ProfileImportError(f"файл user_agents не найден: {source}")
+        try:
+            text = source.read_text(encoding="utf-8")
+        except UnicodeDecodeError as exc:
+            raise ProfileImportError(f"файл user_agents не в кодировке UTF-8: {source}") from exc
+        except OSError as exc:
+            raise ProfileImportError(f"не удалось прочитать файл user_agents: {source}") from exc
+        return self.import_lines(text.splitlines())
 
     def _prepare_record(
         self, conn: sqlite3.Connection, record: dict[str, Any]
@@ -318,6 +413,16 @@ class ProfilePool:
     def _key_ref_exists(conn: sqlite3.Connection, key_ref: str) -> bool:
         return (
             conn.execute("SELECT 1 FROM profiles WHERE key_ref = ?", (key_ref,)).fetchone()
+            is not None
+        )
+
+    @staticmethod
+    def _user_agent_exists(conn: sqlite3.Connection, user_agent: str) -> bool:
+        """Есть ли профиль с таким User-Agent — дедуп импорта по ``user_agent``."""
+        return (
+            conn.execute(
+                "SELECT 1 FROM profiles WHERE user_agent = ?", (user_agent,)
+            ).fetchone()
             is not None
         )
 
@@ -405,24 +510,87 @@ class ProfilePool:
                 ).fetchone()
                 if row is None:
                     raise ProfileNotFoundError(f"профиль id={profile_id} не найден")
-                holder = conn.execute(
-                    f"""
-                    SELECT w.browser_id FROM workers w
-                    WHERE w.profile_id = ? AND w.status IN ({_status_list()})
-                    ORDER BY w.id LIMIT 1
-                    """,
-                    (profile_id,),
-                ).fetchone()
+                holder = _holder(conn, profile_id)
                 if holder is not None:
                     raise ProfileInUseError(
                         f"профиль id={profile_id} назначен воркеру "
-                        f"{holder['browser_id']} и не может быть удалён"
+                        f"{holder} и не может быть удалён"
                     )
                 conn.execute("DELETE FROM profiles WHERE id = ?", (profile_id,))
                 conn.commit()
             except BaseException:
                 conn.rollback()
                 raise
+
+    def delete_many(self, profile_ids: Sequence[Any]) -> dict[str, Any]:
+        """Удаляет несколько профилей за одну транзакцию, не падая на занятых.
+
+        Семантика — как у импорта и у ``proxy_pool.delete_many``:
+        назначенные живому воркеру и отсутствующие строки не роняют
+        операцию, а попадают в ``skipped``/``problems``. Иначе один занятый
+        профиль заблокировал бы «удалить все с ошибкой». Проверка
+        назначения и удаление каждого id идут в одной транзакции — воркер
+        не успеет получить профиль между ними.
+
+        Дубли схлопываются с сохранением порядка: повторно запрошенный id
+        не обязан исчезнуть из отчёта как «не найден». Пустой список —
+        no-op, валидация тела (непустой список целых чисел) живёт в
+        HTTP-слое.
+        """
+        if not profile_ids:
+            return {"deleted": 0, "skipped": 0, "problems": []}
+
+        deleted = 0
+        problems: list[str] = []
+        seen: set[int] = set()
+
+        with self._lock, self._connect() as conn:
+            try:
+                for profile_id in profile_ids:
+                    if isinstance(profile_id, bool) or not isinstance(profile_id, int):
+                        problems.append(f"id={profile_id!r}: неверный идентификатор")
+                        continue
+                    if profile_id in seen:
+                        continue
+                    seen.add(profile_id)
+                    row = conn.execute(
+                        "SELECT 1 FROM profiles WHERE id = ?", (profile_id,)
+                    ).fetchone()
+                    if row is None:
+                        problems.append(f"id={profile_id}: профиль не найден")
+                        continue
+                    holder = _holder(conn, profile_id)
+                    if holder is not None:
+                        problems.append(f"id={profile_id}: назначен воркеру {holder}")
+                        continue
+                    conn.execute("DELETE FROM profiles WHERE id = ?", (profile_id,))
+                    deleted += 1
+                conn.commit()
+            except BaseException:
+                conn.rollback()
+                raise
+
+        return {"deleted": deleted, "skipped": len(problems), "problems": problems}
+
+    def all_ids(self) -> list[int]:
+        """Все id пула по возрастанию — для удаления целиком.
+
+        Отдельный запрос, а не ``list_profiles``: тому нужны воркер, поля и
+        ``fields``, а для удаления нужен ровно список id.
+        """
+        with self._connect() as conn:
+            rows = conn.execute("SELECT id FROM profiles ORDER BY id").fetchall()
+        return [int(row["id"]) for row in rows]
+
+    def delete_all(self) -> dict[str, Any]:
+        """Удаляет весь пул; занятые живым воркером уходят в ``skipped``.
+
+        Тот же best-effort, что и у батча (``delete_many``): удаление
+        «всего» не должно падать из-за одного назначенного профиля —
+        оператору важен и результат, и список того, что осталось. Пустой
+        пул — no-op, а не ошибка: кнопка может быть нажата дважды.
+        """
+        return self.delete_many(self.all_ids())
 
     # --- машина статусов -------------------------------------------------
 
@@ -622,15 +790,8 @@ class ProfilePool:
         """
         if row["status"] not in ("free", "assigned", "active"):
             return False
-        holder = conn.execute(
-            f"""
-            SELECT w.browser_id FROM workers w
-            WHERE w.profile_id = ? AND w.status IN ({_status_list()})
-            ORDER BY w.id LIMIT 1
-            """,
-            (row["id"],),
-        ).fetchone()
-        return holder is None or holder["browser_id"] == browser_id
+        holder = _holder(conn, row["id"])
+        return holder is None or holder == browser_id
 
     @staticmethod
     def _claim(
@@ -859,24 +1020,30 @@ class ProfilePool:
 
 
 def parse_import_line(line: str) -> tuple[str | None, str | None, str | None]:
-    """Разбирает строку импорта: ``(key_ref, явное имя | None, ошибка | None)``.
+    """Разбирает строку импорта: ``(значение, явное имя | None, ошибка | None)``.
 
-    ``ValueError`` здесь не используется: строка целиком может быть ключом,
-    поэтому текст ошибки не должен её цитировать — он уходит в ``problems``.
+    Строка сначала режется по первому табу (первая колонка — значение,
+    остальное — хвост вставленной таблицы), потом разбирается на значение и
+    имя по ``|``. Значение может оказаться User-Agentом — решает вызывающий
+    код (:meth:`ProfilePool.import_lines`), здесь только разбор.
+
+    ``ValueError`` здесь не используется: строка целиком может быть ключом
+    либо User-Agentом, поэтому текст ошибки не должен её цитировать — он
+    уходит в ``problems``.
     """
     if not isinstance(line, str):
         return None, None, "строка должна быть текстом"
-    text = line.strip()
+    text = line.split("\t", 1)[0].strip()
     if "|" not in text:
         return (text, None, None) if text else (None, None, "строка пустая")
-    key_ref, _, name = text.partition("|")
-    key_ref = key_ref.strip()
+    value, _, name = text.partition("|")
+    value = value.strip()
     name = name.strip()
-    if not key_ref:
+    if not value:
         return None, None, "в строке не задан key_ref"
     if not name:
         return None, None, "пустое имя после знака |"
-    return key_ref, name, None
+    return value, name, None
 
 
 def _row_to_dict(row: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
@@ -898,6 +1065,42 @@ def _row_to_dict(row: sqlite3.Row | dict[str, Any]) -> dict[str, Any]:
         return data
     data["fields"] = decoded if isinstance(decoded, dict) else {}
     return data
+
+
+def _next_ua_number(conn: sqlite3.Connection) -> int:
+    """Первый свободный номер для имени ``UA-N``: ``1 + max`` суффиксов.
+
+    Считаются имена, целиком состоящие из ``UA-`` и числа: имя ``UA-9``
+    даёт нумерацию с 10, а чужое (``alice``, ``UA-9 backup``) на границу
+    не влияет. Пустой пул начинается с 1. Вызывается один раз на пачку —
+    дальше номер растёт в :meth:`ProfilePool.import_lines`.
+    """
+    top = 0
+    for row in conn.execute("SELECT name FROM profiles"):
+        match = _UA_NAME_RE.fullmatch(row["name"] or "")
+        if match is not None:
+            top = max(top, int(match.group(1)))
+    return top + 1
+
+
+def _holder(conn: sqlite3.Connection, profile_id: int) -> str | None:
+    """``browser_id`` живого воркера, держащего профиль, либо ``None``.
+
+    Общая проверка для ``delete``/``delete_many`` и выдачи: все места
+    обязаны считать профиль «занятым» одинаково, иначе одиночное удаление,
+    батч и выдача разъезжались бы на одних и тех же данных. Вызывается
+    внутри открытой транзакции — так проверка и удаление не расходятся по
+    времени.
+    """
+    row = conn.execute(
+        f"""
+        SELECT w.browser_id FROM workers w
+        WHERE w.profile_id = ? AND w.status IN ({_status_list()})
+        ORDER BY w.id LIMIT 1
+        """,
+        (profile_id,),
+    ).fetchone()
+    return None if row is None else str(row["browser_id"])
 
 
 def _status_list() -> str:

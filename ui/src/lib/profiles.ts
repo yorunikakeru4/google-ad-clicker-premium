@@ -21,6 +21,7 @@ import {
   type WritableProfileStatus,
 } from "./control";
 import { tauriTransport, type Transport } from "./daemonApi";
+import { formatProblems } from "./format";
 import { createProxiesApi, type ProxyRow } from "./proxies";
 
 export type { NewProfile, WritableProfileStatus } from "./control";
@@ -48,6 +49,22 @@ export interface ProfileChangeResult {
   problems: string[];
 }
 
+/**
+ * Итог батчевого удаления — ответ `{"ids": [...]}` / `{"all": true}` на
+ * /control/profiles/delete.
+ *
+ * Форма намеренно совпадает с импортом и с `ProxyDeleteResult` из
+ * proxies.ts (счётчик + причины): демон отвечает best-effort, и оператору
+ * нужны обе половины — сколько удалилось и почему остальное осталось
+ * (занят воркером, не найден).
+ */
+export interface ProfileDeleteResult {
+  deleted: number;
+  skipped: number;
+  /** Текст причины по каждому пропущенному id: занят воркером, не найден. */
+  problems: string[];
+}
+
 /** Итог назначения диапазона: сколько назначено и сколько свободно осталось. */
 export interface AssignResult {
   assigned: number;
@@ -65,8 +82,14 @@ export interface ProfilesApi {
   listProxies(): Promise<ProxyRow[]>;
   add(profiles: NewProfile[]): Promise<ProfileChangeResult>;
   importLines(lines: string[]): Promise<ProfileChangeResult>;
+  /** Импорт из user_agents.txt: путь демон берёт из конфига (paths.user_agents). */
+  importFile(): Promise<ProfileChangeResult>;
   /** Возвращает `deleted` из ответа демона. */
   remove(id: number): Promise<number>;
+  /** Батч best-effort: занятые и не найденные идут в skipped/problems. */
+  removeMany(ids: number[]): Promise<ProfileDeleteResult>;
+  /** Весь пул; занятые живым воркером — в skipped/problems. */
+  removeAll(): Promise<ProfileDeleteResult>;
   assign(startId: number, endId: number): Promise<AssignResult>;
   unassign(): Promise<UnassignResult>;
   setStatus(id: number, status: WritableProfileStatus): Promise<void>;
@@ -205,9 +228,38 @@ function pickChangeResult(raw: unknown, path: string): ProfileChangeResult {
   return {
     added,
     skipped,
-    problems: problems.filter(
-      (problem): problem is string => typeof problem === "string",
-    ),
+    // Демон шлёт причины объектами ({line_index, message} у импорта,
+    // {index, message} у add): без нормализации в строки UI терял бы их
+    // («пропущено 3» без объяснения, план §1 п.4).
+    problems: formatProblems(problems),
+  };
+}
+
+/**
+ * Разбор итога батчевого удаления.
+ *
+ * Причины нормализуются тем же [`formatProblems`], что и у импорта: строки
+ * проходят как есть (так их и шлёт демон для delete), а объекты, если
+ * демон когда-нибудь начнёт их слать, дошли бы до алерта текстом, а не
+ * `[object Object]`.
+ */
+function pickDeleteResult(raw: unknown, path: string): ProfileDeleteResult {
+  if (typeof raw !== "object" || raw === null) {
+    throw new Error(`не-JSON ответ демона на ${path}`);
+  }
+  const source = raw as Record<string, unknown>;
+  const { deleted, skipped, problems } = source;
+  if (
+    typeof deleted !== "number" ||
+    typeof skipped !== "number" ||
+    !Array.isArray(problems)
+  ) {
+    throw new Error(`ответ демона без deleted/skipped/problems на ${path}`);
+  }
+  return {
+    deleted,
+    skipped,
+    problems: formatProblems(problems),
   };
 }
 
@@ -286,10 +338,33 @@ export function createProfilesApi(transport: Transport): ProfilesApi {
       );
     },
 
+    async importFile() {
+      // Тот же endpoint, что и импорт строк, но с флагом file: демон сам
+      // читает paths.user_agents из конфига.
+      return pickChangeResult(
+        await send({ kind: "importFile" }),
+        "/control/profiles/import",
+      );
+    },
+
     async remove(id) {
       return pickNumberField(
         await send({ kind: "delete", id }),
         "deleted",
+        "/control/profiles/delete",
+      );
+    },
+
+    async removeMany(ids) {
+      return pickDeleteResult(
+        await send({ kind: "deleteMany", ids }),
+        "/control/profiles/delete",
+      );
+    },
+
+    async removeAll() {
+      return pickDeleteResult(
+        await send({ kind: "deleteAll" }),
         "/control/profiles/delete",
       );
     },

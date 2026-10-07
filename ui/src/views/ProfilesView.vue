@@ -237,6 +237,45 @@ async function confirmDelete(): Promise<void> {
   await profiles.remove(target.id);
 }
 
+// --- удаление всех -------------------------------------------------------
+
+/** Цель подтверждения «Удалить все»: тексты по снимку строк; null — закрыт. */
+interface DeleteAllTarget {
+  title: string;
+  text: string;
+}
+
+const deleteAllTarget = ref<DeleteAllTarget | null>(null);
+
+const deleteAllDialog = computed({
+  get: () => deleteAllTarget.value !== null,
+  set: (open: boolean) => {
+    if (!open) deleteAllTarget.value = null;
+  },
+});
+
+function askDeleteAll(): void {
+  const count = tableRows.value.length;
+  if (count === 0) return;
+  // Итог прошлой операции не должен пережить новое подтверждение.
+  profiles.deleteResult.value = null;
+  deleteAllTarget.value = {
+    title: `Удалить все профили (${count})?`,
+    text:
+      `Из списка уйдут ${count} профилей. Назначенные живому воркеру останутся — ` +
+      'они попадут в отчёт под таблицей; чтобы удалить и их, сначала нажмите „Сбросить назначения".',
+  };
+}
+
+async function confirmDeleteAll(): Promise<void> {
+  const target = deleteAllTarget.value;
+  deleteAllTarget.value = null;
+  if (target === null) return;
+  // Занятые живым воркером останутся: их причины придут в отчёт
+  // profiles-delete-result над таблицей.
+  await profiles.removeAll();
+}
+
 // --- меню статуса строки -------------------------------------------------
 
 /** Действия меню: только те статусы, которые принимает API. */
@@ -281,6 +320,44 @@ function applyStatus(row: ProfileTableRow, status: "blocked" | "error" | "free")
       {{ profiles.unassignResult.value.released }}.
     </v-alert>
 
+    <v-alert
+      v-if="profiles.importResult.value"
+      type="success"
+      variant="tonal"
+      class="mb-4"
+      closable
+      data-test="profiles-import-result"
+      @click:close="profiles.importResult.value = null"
+    >
+      Импорт: добавлено {{ profiles.importResult.value.added }}, пропущено
+      {{ profiles.importResult.value.skipped }}.
+      <div
+        v-for="problem in profiles.importResult.value.problems"
+        :key="problem"
+      >
+        {{ problem }}
+      </div>
+    </v-alert>
+
+    <v-alert
+      v-if="profiles.deleteResult.value"
+      type="success"
+      variant="tonal"
+      class="mb-4"
+      closable
+      data-test="profiles-delete-result"
+      @click:close="profiles.deleteResult.value = null"
+    >
+      Удалено {{ profiles.deleteResult.value.deleted }}, пропущено
+      {{ profiles.deleteResult.value.skipped }}.
+      <div
+        v-for="problem in profiles.deleteResult.value.problems"
+        :key="problem"
+      >
+        {{ problem }}
+      </div>
+    </v-alert>
+
     <DataTablePage
       :headers="headers"
       :items="tableRows"
@@ -290,7 +367,7 @@ function applyStatus(row: ProfileTableRow, status: "blocked" | "error" | "free")
       :show-search="false"
       empty-icon="mdi-account-plus"
       empty-title="Добавьте первый профиль"
-      empty-hint="Создайте профиль вручную или импортируйте key_ref списком"
+      empty-hint="Создайте профиль вручную или импортируйте список User-Agent/key_ref"
       data-test="profiles-table"
       @retry="profiles.tick()"
     >
@@ -347,12 +424,38 @@ function applyStatus(row: ProfileTableRow, status: "blocked" | "error" | "free")
         <v-btn
           size="small"
           variant="outlined"
+          color="error"
+          prepend-icon="mdi-delete-sweep"
+          class="mr-2"
+          :disabled="tableRows.length === 0"
+          :loading="profiles.pending.value === 'delete'"
+          data-test="profiles-delete-all"
+          @click="askDeleteAll"
+        >
+          Удалить все ({{ tableRows.length }})
+        </v-btn>
+
+        <v-btn
+          size="small"
+          variant="outlined"
           prepend-icon="mdi-import"
           class="mr-2"
           data-test="profiles-import"
           @click="openImport"
         >
           Импорт
+        </v-btn>
+
+        <v-btn
+          size="small"
+          variant="outlined"
+          prepend-icon="mdi-file-import-outline"
+          class="mr-2"
+          :loading="profiles.pending.value === 'import'"
+          data-test="profiles-import-file"
+          @click="void profiles.importFile()"
+        >
+          Импорт из user_agents.txt
         </v-btn>
 
         <v-btn
@@ -370,7 +473,7 @@ function applyStatus(row: ProfileTableRow, status: "blocked" | "error" | "free")
         <div class="empty-state" data-test="profiles-empty">
           <v-icon icon="mdi-account-plus" size="40px" />
           <div class="empty-state__title">Добавьте первый профиль</div>
-          <div>Создайте профиль вручную или импортируйте key_ref списком</div>
+          <div>Создайте профиль вручную или импортируйте список User-Agent/key_ref</div>
           <v-btn
             color="primary"
             prepend-icon="mdi-plus"
@@ -560,8 +663,8 @@ function applyStatus(row: ProfileTableRow, status: "blocked" | "error" | "free")
         <v-card-text class="px-4 pb-2">
           <v-textarea
             v-model="importText"
-            label="key_ref, по одному в строке"
-            hint="Одна строка = один key_ref; пустые строки и # — комментарии"
+            label="User-Agent или key_ref, по одному в строке"
+            hint='Одна строка = один User-Agent (Mozilla/…) или key_ref; "значение | имя" задаёт имя; пустые строки и # — комментарии'
             rows="8"
             auto-grow
             data-test="profiles-import-text"
@@ -716,6 +819,16 @@ function applyStatus(row: ProfileTableRow, status: "blocked" | "error" | "free")
       destructive
       data-test="profiles-delete-dialog"
       @confirm="confirmDelete"
+    />
+
+    <ConfirmDialog
+      v-model="deleteAllDialog"
+      :title="deleteAllTarget?.title ?? 'Удалить все профили?'"
+      :text="deleteAllTarget?.text"
+      confirm-label="Удалить"
+      destructive
+      data-test="profiles-delete-all-dialog"
+      @confirm="confirmDeleteAll"
     />
   </PageLayout>
 </template>

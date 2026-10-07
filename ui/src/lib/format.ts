@@ -93,3 +93,42 @@ export function formatDuration(ms: number | null | undefined): string {
   if (ms == null || !Number.isFinite(ms) || ms < 0) return EM_DASH;
   return `${(ms / 1000).toFixed(1)} с`;
 }
+
+/**
+ * Причины пропуска из `problems` ответа демона в строки для алерта.
+ *
+ * Демон шлёт причины объектами: `{line_index, message}` у импорта из файла
+ * (номер строки файла, 0-based) и `{index, message}` у add/импорта пачкой
+ * (номер записи, 0-based). UI же показывает списком строки — раньше вызывающий
+ * код отфильтровывал только строки и молча терял причины («пропущено 3» без
+ * объяснения, план §1 п.4). Здесь объекты переводятся в читаемый текст с
+ * 1-based нумерацией, как её и читает человек; строка проходит как есть
+ * (delete и wordlist шлют строки), прочее — отбрасывается, показывать нечего.
+ *
+ * Контракт демона не меняется: нормализация живёт на стороне UI.
+ */
+export function formatProblems(raw: unknown[]): string[] {
+  const problems: string[] = [];
+  for (const item of raw) {
+    if (typeof item === "string") {
+      problems.push(item);
+      continue;
+    }
+    if (typeof item !== "object" || item === null) continue;
+    const source = item as {
+      message?: unknown;
+      line_index?: unknown;
+      index?: unknown;
+    };
+    if (typeof source.message !== "string") continue;
+    if (typeof source.line_index === "number") {
+      problems.push(`строка ${source.line_index + 1}: ${source.message}`);
+      continue;
+    }
+    if (typeof source.index === "number") {
+      problems.push(`запись ${source.index + 1}: ${source.message}`);
+      continue;
+    }
+  }
+  return problems;
+}

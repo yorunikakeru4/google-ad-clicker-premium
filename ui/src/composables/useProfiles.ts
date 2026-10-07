@@ -20,6 +20,10 @@ import {
   type UnassignResult,
   type WritableProfileStatus,
 } from "../lib/profiles";
+// ProfileDeleteResult появляется в lib/profiles.ts по контракту §3.2 (агент B):
+// только type-only импорт — он стирается при транспиляции, поэтому vitest его
+// не видит. typecheck полного набора — на интеграции после мержа (§5.4).
+import type { ProfileDeleteResult } from "../lib/profiles";
 import type { ProxyRow } from "../lib/proxies";
 
 /** Интервал обновления списка: 4 с — живо, но без ДДОСа БД и демона. */
@@ -47,8 +51,10 @@ export interface ProfilesState {
   pending: Ref<ProfilesPending | null>;
   /** Итог последнего добавления: added/skipped/problems. */
   addResult: Ref<ProfileChangeResult | null>;
-  /** Итог последнего импорта из textarea. */
+  /** Итог последнего импорта: textarea и файл делят один ref. */
   importResult: Ref<ProfileChangeResult | null>;
+  /** Итог последнего батчевого удаления: deleted/skipped/problems. */
+  deleteResult: Ref<ProfileDeleteResult | null>;
   /** Итог последнего назначения диапазона: assigned/available. */
   assignResult: Ref<AssignResult | null>;
   /** Итог последнего сброса назначений: released. */
@@ -60,7 +66,13 @@ export interface ProfilesState {
   tick(): Promise<void>;
   add(profiles: NewProfile[]): Promise<boolean>;
   importLines(lines: string[]): Promise<boolean>;
+  /** Импорт из user_agents.txt; итог — тот же importResult, что у списочного. */
+  importFile(): Promise<boolean>;
   remove(id: number): Promise<boolean>;
+  /** Батчевое удаление: success — в deleteResult уходит отчёт демона. */
+  removeMany(ids: number[]): Promise<boolean>;
+  /** Удалить весь пул; отчёт — тот же deleteResult. */
+  removeAll(): Promise<boolean>;
   assign(startId: number, endId: number): Promise<boolean>;
   unassign(): Promise<boolean>;
   setStatus(id: number, status: WritableProfileStatus): Promise<boolean>;
@@ -78,6 +90,7 @@ export function createProfiles(
   const pending = ref<ProfilesPending | null>(null);
   const addResult = ref<ProfileChangeResult | null>(null);
   const importResult = ref<ProfileChangeResult | null>(null);
+  const deleteResult = ref<ProfileDeleteResult | null>(null);
   const assignResult = ref<AssignResult | null>(null);
   const unassignResult = ref<UnassignResult | null>(null);
 
@@ -170,10 +183,54 @@ export function createProfiles(
     );
   }
 
+  async function importFile(): Promise<boolean> {
+    return act(
+      "import",
+      async () => {
+        // api.importFile — контракт §3.2: POST /control/profiles/import {"file":true}.
+        importResult.value = await api.importFile();
+      },
+      () => {
+        importResult.value = null;
+      },
+    );
+  }
+
   async function remove(id: number): Promise<boolean> {
     return act("delete", async () => {
       await api.remove(id);
     });
+  }
+
+  /**
+   * Батчевое удаление: отчёт демона уходит в deleteResult, как у прокси.
+   * Пустой список — no-op без запроса; api.removeMany/removeAll и тип
+   * ProfileDeleteResult появляются после мержа контракта §3.2.
+   */
+  async function removeMany(ids: number[]): Promise<boolean> {
+    if (ids.length === 0) return false;
+    return act(
+      "delete",
+      async () => {
+        deleteResult.value = await api.removeMany(ids);
+      },
+      () => {
+        deleteResult.value = null;
+      },
+    );
+  }
+
+  /** Удаление всего пула; отчёт — тот же deleteResult, что у removeMany. */
+  async function removeAll(): Promise<boolean> {
+    return act(
+      "delete",
+      async () => {
+        deleteResult.value = await api.removeAll();
+      },
+      () => {
+        deleteResult.value = null;
+      },
+    );
   }
 
   async function assign(startId: number, endId: number): Promise<boolean> {
@@ -233,6 +290,7 @@ export function createProfiles(
     pending,
     addResult,
     importResult,
+    deleteResult,
     assignResult,
     unassignResult,
     start,
@@ -240,7 +298,10 @@ export function createProfiles(
     tick,
     add,
     importLines,
+    importFile,
     remove,
+    removeMany,
+    removeAll,
     assign,
     unassign,
     setStatus,

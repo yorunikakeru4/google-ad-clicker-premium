@@ -276,6 +276,9 @@ export type ProfilesAction =
   | { kind: "add"; profiles: NewProfile[] }
   | { kind: "import"; lines: string[] }
   | { kind: "delete"; id: number }
+  | { kind: "deleteMany"; ids: number[] }
+  | { kind: "deleteAll" }
+  | { kind: "importFile" }
   | { kind: "assign"; start_id: number; end_id: number }
   | { kind: "unassign" }
   | { kind: "status"; id: number; status: WritableProfileStatus };
@@ -291,9 +294,9 @@ export interface ProfilesRequest {
  * Билдер запросов к API профилей.
  *
  * Тот же принцип, что у [`proxiesRequest`]: контракт (`{"profiles": [...]}`,
- * `{"lines": [...]}`, `{"start_id", "end_id"}`, `{"id", "status"}`) живёт
- * здесь, а не в вызывающем коде, — тесты видят ровно то, что уйдёт в
- * control_request.
+ * `{"lines": [...]}`, `{"id"}` / `{"ids"}` / `{"all"}`, `{"file": true}`,
+ * `{"start_id", "end_id"}`, `{"id", "status"}`) живёт здесь, а не в
+ * вызывающем коде, — тесты видят ровно то, что уйдёт в control_request.
  */
 export function profilesRequest(action: ProfilesAction): ProfilesRequest {
   switch (action.kind) {
@@ -317,6 +320,24 @@ export function profilesRequest(action: ProfilesAction): ProfilesRequest {
         path: "/control/profiles/delete",
         body: JSON.stringify({ id: action.id }),
       };
+    case "deleteMany":
+      // Батч: демон отвечает best-effort {deleted, skipped, problems}, а не
+      // одним кодом — занятый живым воркером профиль не должен ронять весь
+      // запрос (парсер тела общий с прокси).
+      return {
+        method: "POST",
+        path: "/control/profiles/delete",
+        body: JSON.stringify({ ids: action.ids }),
+      };
+    case "deleteAll":
+      // Список id собирает демон, а не UI: тело запроса не растёт с
+      // размером пула (у демона лимит 64 КБ на запрос).
+      return { method: "POST", path: "/control/profiles/delete", body: '{"all":true}' };
+    case "importFile":
+      // Путь к user_agents.txt демон резолвит сам из конфига (paths.user_agents):
+      // у UI каталога данных демона нет. Флаг file отличает режим от импорта
+      // строк — путь тот же, тело разное.
+      return { method: "POST", path: "/control/profiles/import", body: '{"file":true}' };
     case "assign":
       return {
         method: "POST",

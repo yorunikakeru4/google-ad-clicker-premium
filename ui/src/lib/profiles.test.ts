@@ -281,6 +281,173 @@ describe("createProfilesApi: добавление и импорт", () => {
 
     await expect(api.add([{ name: "alpha" }])).rejects.toThrow(/added/);
   });
+
+  it("problems-объекты демона ({line_index, message}, {index, message}) → строки", async () => {
+    const { transport } = transportOf({
+      "/control/profiles/import": {
+        status: 200,
+        body: JSON.stringify({
+          added: 1,
+          skipped: 2,
+          problems: [
+            { line_index: 2, message: "дубликат: user_agent уже есть" },
+            { index: 0, message: "пустая строка" },
+            "уже готовая строка",
+          ],
+        }),
+      },
+    });
+    const api = createProfilesApi(transport);
+
+    const result = await api.importLines(["a", "b"]);
+
+    expect(result.problems).toEqual([
+      "строка 3: дубликат: user_agent уже есть",
+      "запись 1: пустая строка",
+      "уже готовая строка",
+    ]);
+  });
+
+  it("add с problems-объектами тоже доходит до UI строками", async () => {
+    const { transport } = transportOf({
+      "/control/profiles": {
+        status: 200,
+        body: JSON.stringify({
+          added: 0,
+          skipped: 1,
+          problems: [{ index: 4, message: "имя уже занято" }],
+        }),
+      },
+    });
+    const api = createProfilesApi(transport);
+
+    const result = await api.add([{ name: "alpha" }]);
+
+    expect(result).toEqual({
+      added: 0,
+      skipped: 1,
+      problems: ["запись 5: имя уже занято"],
+    });
+  });
+});
+
+describe("createProfilesApi: батчевое удаление и импорт из файла", () => {
+  it("removeMany шлёт ids и возвращает deleted/skipped/problems", async () => {
+    const { transport, calls } = transportOf({
+      "/control/profiles/delete": {
+        status: 200,
+        body: JSON.stringify({
+          deleted: 2,
+          skipped: 1,
+          problems: ["id=3: назначен воркеру br-1"],
+        }),
+      },
+    });
+    const api = createProfilesApi(transport);
+
+    const result = await api.removeMany([1, 2, 3]);
+
+    expect(calls).toEqual([
+      { path: "/control/profiles/delete", method: "POST", body: '{"ids":[1,2,3]}' },
+    ]);
+    expect(result).toEqual({
+      deleted: 2,
+      skipped: 1,
+      problems: ["id=3: назначен воркеру br-1"],
+    });
+  });
+
+  it("removeAll шлёт all и возвращает отчёт целиком", async () => {
+    const { transport, calls } = transportOf({
+      "/control/profiles/delete": {
+        status: 200,
+        body: JSON.stringify({
+          deleted: 50,
+          skipped: 3,
+          problems: ["id=7: назначен воркеру br-1", "id=8: профиль не найден"],
+        }),
+      },
+    });
+    const api = createProfilesApi(transport);
+
+    const result = await api.removeAll();
+
+    expect(calls).toEqual([
+      { path: "/control/profiles/delete", method: "POST", body: '{"all":true}' },
+    ]);
+    expect(result).toEqual({
+      deleted: 50,
+      skipped: 3,
+      problems: ["id=7: назначен воркеру br-1", "id=8: профиль не найден"],
+    });
+  });
+
+  it("ответ без deleted/skipped/problems — ошибка, а не нули", async () => {
+    const { transport } = transportOf({
+      "/control/profiles/delete": { status: 200, body: '{"deleted":true}' },
+    });
+    const api = createProfilesApi(transport);
+
+    await expect(api.removeMany([1])).rejects.toThrow(
+      /deleted\/skipped\/problems/,
+    );
+    await expect(api.removeAll()).rejects.toThrow(/deleted\/skipped\/problems/);
+  });
+
+  it("importFile шлёт флаг file в /control/profiles/import и разбирает итог", async () => {
+    const { transport, calls } = transportOf({
+      "/control/profiles/import": {
+        status: 200,
+        body: JSON.stringify({
+          added: 53,
+          skipped: 0,
+          problems: [],
+        }),
+      },
+    });
+    const api = createProfilesApi(transport);
+
+    const result = await api.importFile();
+
+    expect(calls).toEqual([
+      { path: "/control/profiles/import", method: "POST", body: '{"file":true}' },
+    ]);
+    expect(result).toEqual({ added: 53, skipped: 0, problems: [] });
+  });
+
+  it("повторный импорт файла: skipped и проблемы-объекты доходят строками", async () => {
+    const { transport } = transportOf({
+      "/control/profiles/import": {
+        status: 200,
+        body: JSON.stringify({
+          added: 0,
+          skipped: 53,
+          problems: [{ line_index: 0, message: "дубликат: user_agent уже есть" }],
+        }),
+      },
+    });
+    const api = createProfilesApi(transport);
+
+    const result = await api.importFile();
+
+    expect(result.added).toBe(0);
+    expect(result.skipped).toBe(53);
+    expect(result.problems).toEqual([
+      "строка 1: дубликат: user_agent уже есть",
+    ]);
+  });
+
+  it("400 profile_import_failed с сообщением демона → его текст", async () => {
+    const { transport } = transportOf({
+      "/control/profiles/import": {
+        status: 400,
+        body: errorBody("profile_import_failed", "файл user_agents.txt не найден"),
+      },
+    });
+    const api = createProfilesApi(transport);
+
+    await expect(api.importFile()).rejects.toThrow("файл user_agents.txt не найден");
+  });
 });
 
 describe("createProfilesApi: удаление, назначение и статус", () => {

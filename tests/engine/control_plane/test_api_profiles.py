@@ -5,6 +5,8 @@
 
 - семь маршрутов ``/control/profiles*`` с форматами ответов из контракта;
 - тела запросов: валидация полей до записи, кривые значения — 400;
+- удаление в трёх режимах (``{"id"}`` / ``{"ids"}`` / ``{"all"}``) и импорт
+  строк либо файла из ``paths.user_agents``;
 - ``409 profile_in_use`` — живой воркер не даёт удалить профиль;
 - массовые операции (диапазон, сброс) возвращают счётчики, а не список.
 """
@@ -387,6 +389,115 @@ class TestProfileImport:
 
         assert status == 401
 
+    @pytest.mark.parametrize("body", [{}, {"file": False}, {"foo": 1}, ["lines"], "мусор"])
+    def test_body_without_lines_or_file_true_is_invalid_request(self, server, body):
+        """Ни lines, ни file: true — не импорт, а ошибка тела запроса."""
+        status, payload, _ = call(server, "/control/profiles/import", method="POST", body=body)
+
+        assert status == 400
+        assert payload["error"]["code"] == "invalid_request"
+
+    def test_ua_lines_are_imported_through_the_same_route(self, server, db_path):
+        status, body, _ = call(
+            server,
+            "/control/profiles/import",
+            method="POST",
+            body={"lines": ["Mozilla/5.0 (Windows NT 10.0) Chrome/120.0", "key-001"]},
+        )
+
+        assert status == 200
+        assert body == {"added": 2, "skipped": 0, "problems": []}
+        rows = profile_rows(db_path)
+        assert [row["name"] for row in rows] == ["UA-1", "key-001"]
+        assert rows[0]["key_ref"] is None
+        assert rows[0]["user_agent"] == "Mozilla/5.0 (Windows NT 10.0) Chrome/120.0"
+
+
+class TestProfileImportFile:
+    """``{"file": true}`` — путь только из конфига, как у прокси."""
+
+    @pytest.fixture
+    def user_agents_file(self, tmp_path):
+        path = tmp_path / "user_agents.txt"
+        path.write_text(
+            "Mozilla/5.0 (Windows NT 10.0) Chrome/120.0\n"
+            "\n"
+            "key-001 | Имя\n"
+            "| nope\n"
+            "Mozilla/5.0 (Windows NT 10.0) Chrome/120.0\n",
+            encoding="utf-8",
+        )
+        return path
+
+    @pytest.fixture
+    def import_server(self, make_server, user_agents_file):
+        config = Config.from_dict(config_module.default_config()).patch(
+            {"paths": {"user_agents": str(user_agents_file)}}
+        )
+        return make_server(config_instance=config)
+
+    def test_imports_from_configured_file(self, import_server, db_path):
+        status, body, _ = call(
+            import_server, "/control/profiles/import", method="POST", body={"file": True}
+        )
+
+        assert status == 200
+        assert body["added"] == 2
+        assert body["skipped"] == 2
+        assert [problem["line_index"] for problem in body["problems"]] == [3, 4]
+        assert all(problem["message"] for problem in body["problems"])
+        assert [row["name"] for row in profile_rows(db_path)] == ["UA-1", "Имя"]
+
+    def test_request_path_is_ignored(self, import_server, tmp_path, db_path):
+        """Path traversal закрыт: путь из тела запроса не читается вовсе."""
+        other = tmp_path / "other.txt"
+        other.write_text("Mozilla/5.0 (чужой) Chrome/99.0\n", encoding="utf-8")
+
+        status, body, _ = call(
+            import_server,
+            "/control/profiles/import",
+            method="POST",
+            body={"file": True, "path": str(other)},
+        )
+
+        assert status == 200
+        assert body["added"] == 2
+        names = {row["name"] for row in profile_rows(db_path)}
+        assert "UA-2" not in names, "UA-2 появился бы только из чужого файла"
+
+    def test_without_configured_file_is_400(self, make_server):
+        config = Config.from_dict(config_module.default_config()).patch(
+            {"paths": {"user_agents": ""}}
+        )
+        instance = make_server(config_instance=config)
+
+        status, body, _ = call(
+            instance, "/control/profiles/import", method="POST", body={"file": True}
+        )
+
+        assert status == 400
+        assert body["error"]["code"] == "profile_import_failed"
+
+    def test_missing_file_is_400(self, make_server, tmp_path):
+        config = Config.from_dict(config_module.default_config()).patch(
+            {"paths": {"user_agents": str(tmp_path / "nope.txt")}}
+        )
+        instance = make_server(config_instance=config)
+
+        status, body, _ = call(
+            instance, "/control/profiles/import", method="POST", body={"file": True}
+        )
+
+        assert status == 400
+        assert body["error"]["code"] == "profile_import_failed"
+
+    def test_import_requires_token(self, import_server):
+        status, _, _ = call(
+            import_server, "/control/profiles/import", method="POST", token=None, body={"file": True}
+        )
+
+        assert status == 401
+
 
 class TestProfileDelete:
     def test_deletes_a_profile(self, server, profiles, db_path):
@@ -402,7 +513,7 @@ class TestProfileDelete:
         )
 
         assert status == 200
-        assert body == {"deleted": True}
+        assert body == {"deleted": 1}, "счётчик, а не булево: UI ждёт число"
         assert profile_rows(db_path) == []
 
     def test_in_use_returns_409(self, server, profiles, db_path):
@@ -427,7 +538,7 @@ class TestProfileDelete:
         )
 
         assert status == 200
-        assert body == {"deleted": True}
+        assert body == {"deleted": 1}
 
     def test_unknown_id_is_404(self, server):
         status, body, _ = call(
@@ -458,6 +569,126 @@ class TestProfileDelete:
 
         assert status == 405
         assert body["error"]["code"] == "method_not_allowed"
+
+
+class TestProfileDeleteMany:
+    """Батч ``{"ids": [...]}`` — best-effort: занятые не роняют операцию.
+
+    Контракт ответа тот же, что у прокси: ``deleted`` / ``skipped`` /
+    ``problems`` — оператор видит и результат, и причину, почему профиль
+    остался в списке.
+    """
+
+    def test_deletes_every_listed_profile(self, server, profiles, db_path):
+        profiles.add_profiles([{"name": "p1"}, {"name": "p2"}, {"name": "p3"}])
+        ids = [row["id"] for row in profiles.list_profiles()]
+
+        status, body, _ = call(
+            server, "/control/profiles/delete", method="POST", body={"ids": ids}
+        )
+
+        assert status == 200
+        assert body == {"deleted": 3, "skipped": 0, "problems": []}
+        assert profile_rows(db_path) == []
+
+    def test_in_use_and_missing_are_skipped_but_others_go(self, server, profiles, db_path):
+        profiles.add_profiles([{"name": "p1"}, {"name": "p2"}])
+        busy_id, free_id = [row["id"] for row in profiles.list_profiles()]
+        hold_profile(db_path, busy_id, "br-1", status="running")
+
+        status, body, _ = call(
+            server,
+            "/control/profiles/delete",
+            method="POST",
+            body={"ids": [busy_id, free_id, 424242]},
+        )
+
+        assert status == 200, "занятая строка не должна ронять весь батч"
+        assert body["deleted"] == 1
+        assert body["skipped"] == 2
+        assert f"id={busy_id}: назначен воркеру br-1" in body["problems"]
+        assert "id=424242: профиль не найден" in body["problems"]
+        assert [row["id"] for row in profile_rows(db_path)] == [busy_id]
+
+    def test_duplicate_ids_delete_once_without_a_ghost_problem(self, server, profiles, db_path):
+        profiles.add_profiles([{"name": "p1"}])
+
+        status, body, _ = call(
+            server, "/control/profiles/delete", method="POST", body={"ids": [1, 1]}
+        )
+
+        assert status == 200
+        assert body == {"deleted": 1, "skipped": 0, "problems": []}
+        assert profile_rows(db_path) == []
+
+    @pytest.mark.parametrize("value", [[], "5", 5, None, [True], ["5"], {"id": 1}])
+    def test_malformed_ids_is_invalid_request(self, server, value):
+        status, body, _ = call(
+            server, "/control/profiles/delete", method="POST", body={"ids": value}
+        )
+
+        assert status == 400
+        assert body["error"]["code"] == "invalid_request"
+
+    def test_body_without_id_ids_or_all_is_invalid_request(self, server):
+        status, body, _ = call(
+            server, "/control/profiles/delete", method="POST", body={"foo": 1}
+        )
+
+        assert status == 400
+        assert body["error"]["code"] == "invalid_request"
+
+
+class TestProfileDeleteAll:
+    """``{"all": true}`` — весь пул одним запросом, best-effort с отчётом."""
+
+    @staticmethod
+    def _add(profiles, count):
+        profiles.add_profiles([{"name": f"p{index}"} for index in range(count)])
+        return [row["id"] for row in profiles.list_profiles()]
+
+    def test_all_deletes_every_profile(self, server, profiles, db_path):
+        self._add(profiles, 3)
+
+        status, body, _ = call(
+            server, "/control/profiles/delete", method="POST", body={"all": True}
+        )
+
+        assert status == 200
+        assert body == {"deleted": 3, "skipped": 0, "problems": []}
+        assert profile_rows(db_path) == []
+
+    def test_all_keeps_assigned_profile_and_reports_it(self, server, profiles, db_path):
+        busy_id, free_id = self._add(profiles, 2)
+        hold_profile(db_path, busy_id, "br-1", status="running")
+
+        status, body, _ = call(
+            server, "/control/profiles/delete", method="POST", body={"all": True}
+        )
+
+        assert status == 200, "назначенный профиль не должен ронять запрос"
+        assert body["deleted"] == 1
+        assert body["skipped"] == 1
+        assert f"id={busy_id}: назначен воркеру br-1" in body["problems"]
+        assert [row["id"] for row in profile_rows(db_path)] == [busy_id]
+
+    def test_all_on_empty_pool_is_a_noop(self, server):
+        status, body, _ = call(
+            server, "/control/profiles/delete", method="POST", body={"all": True}
+        )
+
+        assert status == 200
+        assert body == {"deleted": 0, "skipped": 0, "problems": []}
+
+    @pytest.mark.parametrize("value", [False, "yes", 1, None])
+    def test_all_must_be_true(self, server, value):
+        """Непустое, но не True — не «удалить всё», а ошибка тела."""
+        status, body, _ = call(
+            server, "/control/profiles/delete", method="POST", body={"all": value}
+        )
+
+        assert status == 400
+        assert body["error"]["code"] == "invalid_request"
 
 
 class TestProfileAssign:

@@ -255,6 +255,8 @@ describe("экраны на шаблоне", () => {
     for (const hook of [
       "profiles-add",
       "profiles-import",
+      "profiles-import-file",
+      "profiles-delete-all",
       "profiles-assign",
       "profiles-unassign",
       "profiles-filter-status",
@@ -271,6 +273,10 @@ describe("экраны на шаблоне", () => {
     expect(html).not.toContain("profiles-assign-dialog");
     expect(html).not.toContain("profiles-delete-dialog");
     expect(html).not.toContain("profiles-unassign-dialog");
+    // подтверждение «Удалить все» и алерты итогов — только после действия
+    expect(html).not.toContain("profiles-delete-all-dialog");
+    expect(html).not.toContain("profiles-delete-result");
+    expect(html).not.toContain("profiles-import-result");
     // без данных таблица не показывает статусы и прочерки строк
     expect(html).not.toContain("profiles-status-free");
   });

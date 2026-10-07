@@ -6,7 +6,12 @@
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { createProfiles, PROFILES_POLL_MS } from "./useProfiles";
-import type { ProfilesApi, ProfileChangeResult, ProfileRow } from "../lib/profiles";
+import type {
+  ProfileChangeResult,
+  ProfileDeleteResult,
+  ProfileRow,
+  ProfilesApi,
+} from "../lib/profiles";
 import type { WritableProfileStatus } from "../lib/control";
 import type { ProxyRow } from "../lib/proxies";
 
@@ -56,6 +61,8 @@ function fakeApi(initial: ProfileRow[] = []) {
     importError: null as Error | null,
     removed: 1,
     removeError: null as Error | null,
+    deleteResult: { deleted: 0, skipped: 0, problems: [] } as ProfileDeleteResult,
+    deleteError: null as Error | null,
     assignResult: { assigned: 0, available: 0 },
     assignError: null as Error | null,
     unassignResult: { released: 0 },
@@ -80,9 +87,22 @@ function fakeApi(initial: ProfileRow[] = []) {
       if (state.importError) throw state.importError;
       return state.importResult;
     }),
+    // Контракт §3.2: importFile читает user_agents.txt на стороне демона.
+    importFile: vi.fn(async () => {
+      if (state.importError) throw state.importError;
+      return state.importResult;
+    }),
     remove: vi.fn(async () => {
       if (state.removeError) throw state.removeError;
       return state.removed;
+    }),
+    removeMany: vi.fn(async () => {
+      if (state.deleteError) throw state.deleteError;
+      return { ...state.deleteResult };
+    }),
+    removeAll: vi.fn(async () => {
+      if (state.deleteError) throw state.deleteError;
+      return { ...state.deleteResult };
     }),
     assign: vi.fn(async () => {
       if (state.assignError) throw state.assignError;
@@ -349,6 +369,134 @@ describe("createProfiles: импорт и удаление", () => {
     expect(ok).toBe(false);
     expect(profiles.actionError.value).toContain("назначен потоку");
     expect(profiles.rows.value, "неудача не чистит список").toHaveLength(1);
+    profiles.stop();
+  });
+
+  it("удаление всех: отчёт в deleteResult, прошлая ошибка снята", async () => {
+    const fake = fakeApi([profileRow({ id: 1 }), profileRow({ id: 2 })]);
+    const profiles = createProfiles(fake.api);
+    await profiles.start();
+    fake.state.rows = [];
+    fake.state.deleteResult = {
+      deleted: 1,
+      skipped: 1,
+      problems: ["id=2: назначен воркеру br-1"],
+    };
+    profiles.actionError.value = "старая ошибка";
+
+    const ok = await profiles.removeAll();
+
+    expect(ok).toBe(true);
+    expect(fake.api.removeAll).toHaveBeenCalledTimes(1);
+    expect(profiles.deleteResult.value).toEqual({
+      deleted: 1,
+      skipped: 1,
+      problems: ["id=2: назначен воркеру br-1"],
+    });
+    expect(profiles.actionError.value).toBeNull();
+    expect(profiles.rows.value).toEqual([]);
+    profiles.stop();
+  });
+
+  it("ошибка удаления всех видна в actionError, отчёт не появляется", async () => {
+    const fake = fakeApi([profileRow({ id: 1 })]);
+    const profiles = createProfiles(fake.api);
+    await profiles.start();
+    fake.state.deleteError = new Error("HTTP 400: invalid_request");
+
+    const ok = await profiles.removeAll();
+
+    expect(ok).toBe(false);
+    expect(profiles.actionError.value).toContain("HTTP 400");
+    expect(profiles.deleteResult.value).toBeNull();
+    profiles.stop();
+  });
+
+  it("батчевое удаление уходит списком ids и кладёт тот же отчёт", async () => {
+    const fake = fakeApi([profileRow({ id: 1 }), profileRow({ id: 3 })]);
+    const profiles = createProfiles(fake.api);
+    await profiles.start();
+    fake.state.rows = [];
+    fake.state.deleteResult = { deleted: 2, skipped: 0, problems: [] };
+
+    const ok = await profiles.removeMany([1, 3]);
+
+    expect(ok).toBe(true);
+    expect(fake.api.removeMany).toHaveBeenCalledWith([1, 3]);
+    expect(profiles.deleteResult.value).toEqual({
+      deleted: 2,
+      skipped: 0,
+      problems: [],
+    });
+    expect(profiles.actionError.value).toBeNull();
+    profiles.stop();
+  });
+
+  it("пустой список ids — no-op без запроса", async () => {
+    const fake = fakeApi();
+    const profiles = createProfiles(fake.api);
+    await profiles.start();
+
+    expect(await profiles.removeMany([])).toBe(false);
+    expect(fake.api.removeMany).not.toHaveBeenCalled();
+    profiles.stop();
+  });
+
+  it("импорт из файла: added/skipped/problems ложатся в importResult", async () => {
+    const fake = fakeApi();
+    const profiles = createProfiles(fake.api);
+    await profiles.start();
+    fake.state.importResult = {
+      added: 53,
+      skipped: 2,
+      problems: ["строка 4: дубликат"],
+    };
+
+    const ok = await profiles.importFile();
+
+    expect(ok).toBe(true);
+    expect(fake.api.importFile).toHaveBeenCalledTimes(1);
+    expect(profiles.importResult.value).toEqual({
+      added: 53,
+      skipped: 2,
+      problems: ["строка 4: дубликат"],
+    });
+    expect(profiles.actionError.value).toBeNull();
+    profiles.stop();
+  });
+
+  it("ошибка импорт-файла попадает в actionError, итог не остаётся", async () => {
+    const fake = fakeApi();
+    const profiles = createProfiles(fake.api);
+    await profiles.start();
+    profiles.importResult.value = { added: 1, skipped: 0, problems: [] };
+    fake.state.importError = new Error(
+      "HTTP 400: файл user_agents.txt не найден",
+    );
+
+    const ok = await profiles.importFile();
+
+    expect(ok).toBe(false);
+    expect(profiles.actionError.value).toContain("user_agents.txt");
+    expect(profiles.importResult.value).toBeNull();
+    profiles.stop();
+  });
+
+  it("импорт из файла блокирует параллельное удаление всех", async () => {
+    const fake = fakeApi();
+    const profiles = createProfiles(fake.api);
+    await profiles.start();
+    const gate = deferred<ProfileChangeResult>();
+    vi.mocked(fake.api.importFile).mockImplementationOnce(() => gate.promise);
+
+    const first = profiles.importFile();
+    const second = profiles.removeAll();
+
+    expect(await second, "второе действие отклоняется без запроса").toBe(false);
+    expect(fake.api.removeAll).not.toHaveBeenCalled();
+
+    gate.resolve({ added: 1, skipped: 0, problems: [] });
+    expect(await first).toBe(true);
     profiles.stop();
   });
 });

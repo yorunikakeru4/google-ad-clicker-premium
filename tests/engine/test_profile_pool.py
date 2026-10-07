@@ -10,7 +10,8 @@
 - **выдача** — ``take_for_worker`` отдаёт профиль по одному на воркера, в
   детерминированном порядке, с приоритетом прошлого назначения, и никогда
   не выдаёт профиль, который держит живой воркер;
-- **импорт** — одна строка = ``key_ref`` (необязательно ``key_ref | name``),
+- **импорт** — одна строка = ``key_ref`` (необязательно ``key_ref | name``)
+  либо User-Agent (``Mozilla/...`` → колонка ``user_agent`` и имя ``UA-N``),
   300+ строк одной операцией, дубликаты и кривые строки уходят в
   ``problems`` и не роняют пачку.
 """
@@ -24,6 +25,7 @@ from engine.db import migrations
 from engine.profile_pool import (
     OPERATOR_STATUSES,
     PROFILE_STATUSES,
+    ProfileImportError,
     ProfileInUseError,
     ProfileInvalidError,
     ProfileNotFoundError,
@@ -338,6 +340,175 @@ class TestImportLines:
         ]
 
 
+class TestImportUserAgents:
+    """Строка ``Mozilla/...`` — профиль с ``user_agent`` и именем ``UA-N``."""
+
+    UA_ONE = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120.0"
+    UA_TWO = "Mozilla/5.0 (X11; Linux x86_64) Chrome/121.0"
+
+    def test_ua_line_becomes_a_profile_without_key_ref(self, pool, db_path):
+        result = pool.import_lines([self.UA_ONE])
+
+        assert result == {"added": 1, "skipped": 0, "problems": []}
+        row = table_rows(db_path, "profiles")[0]
+        assert row["name"] == "UA-1"
+        assert row["user_agent"] == self.UA_ONE
+        assert row["key_ref"] is None, "у User-Agent нет key_ref — колонка «Ключ» покажет «—»"
+        assert row["status"] == "free"
+
+    def test_names_follow_sequential_ua_numbers(self, pool, db_path):
+        result = pool.import_lines([self.UA_ONE, self.UA_TWO])
+
+        assert result["added"] == 2
+        rows = table_rows(db_path, "profiles")
+        assert [row["name"] for row in rows] == ["UA-1", "UA-2"]
+        assert [row["user_agent"] for row in rows] == [self.UA_ONE, self.UA_TWO]
+
+    def test_numbering_continues_after_an_existing_ua_9(self, pool, db_path):
+        pool.add_profiles([{"name": "UA-9", "user_agent": "Mozilla/5.0 старый"}])
+
+        result = pool.import_lines([self.UA_ONE, self.UA_TWO])
+
+        assert result["added"] == 2
+        assert [row["name"] for row in table_rows(db_path, "profiles")] == [
+            "UA-9",
+            "UA-10",
+            "UA-11",
+        ]
+
+    def test_generated_name_skips_a_name_taken_mid_batch(self, pool, db_path):
+        """Явное имя UA-2 занято уже в пачке — следующий номер обязан его обойти."""
+        result = pool.import_lines([self.UA_ONE, "some-key | UA-2", self.UA_TWO])
+
+        assert result["added"] == 3
+        assert [row["name"] for row in table_rows(db_path, "profiles")] == [
+            "UA-1",
+            "UA-2",
+            "UA-3",
+        ]
+
+    def test_explicit_name_wins_over_the_number(self, pool, db_path):
+        result = pool.import_lines([f"{self.UA_ONE} | alice"])
+
+        assert result == {"added": 1, "skipped": 0, "problems": []}
+        row = table_rows(db_path, "profiles")[0]
+        assert row["name"] == "alice"
+        assert row["user_agent"] == self.UA_ONE
+        assert row["key_ref"] is None
+
+    def test_duplicate_user_agent_in_the_database_is_skipped(self, pool, db_path):
+        pool.import_lines([self.UA_ONE])
+
+        result = pool.import_lines([self.UA_ONE, self.UA_TWO])
+
+        assert result["added"] == 1
+        assert result["skipped"] == 1
+        assert result["problems"] == [
+            {"line_index": 0, "message": "дубликат: user_agent уже есть"}
+        ]
+        assert len(table_rows(db_path, "profiles")) == 2
+
+    def test_duplicate_user_agent_inside_one_batch_is_skipped(self, pool, db_path):
+        result = pool.import_lines([self.UA_ONE, self.UA_TWO, self.UA_ONE])
+
+        assert result["added"] == 2
+        assert result["skipped"] == 1
+        assert result["problems"][0]["line_index"] == 2
+        assert result["problems"][0]["message"] == "дубликат: user_agent уже есть"
+        assert self.UA_ONE not in result["problems"][0]["message"], (
+            "полный User-Agent не должен цитироваться в ответе"
+        )
+
+    def test_first_tab_column_is_the_value(self, pool, db_path):
+        result = pool.import_lines(
+            [f"{self.UA_ONE}\thвост из таблицы", "key-001\tвторая колонка"]
+        )
+
+        assert result == {"added": 2, "skipped": 0, "problems": []}
+        rows = table_rows(db_path, "profiles")
+        assert [(row["name"], row["key_ref"], row["user_agent"]) for row in rows] == [
+            ("UA-1", None, self.UA_ONE),
+            ("key-001", "key-001", None),
+        ]
+
+    def test_a_line_without_the_mozilla_prefix_stays_a_key_ref(self, pool, db_path):
+        result = pool.import_lines(["Chrome/5.0 (Windows)"])
+
+        assert result["added"] == 1
+        row = table_rows(db_path, "profiles")[0]
+        assert row["name"] == "Chrome/5.0 (Windows)"
+        assert row["key_ref"] == "Chrome/5.0 (Windows)"
+        assert row["user_agent"] is None
+
+    def test_mixed_batch_keeps_key_ref_lines_unchanged(self, pool, db_path):
+        result = pool.import_lines(["key-001 | Имя", self.UA_ONE, "key-002"])
+
+        assert result == {"added": 3, "skipped": 0, "problems": []}
+        rows = table_rows(db_path, "profiles")
+        assert [(row["name"], row["key_ref"], row["user_agent"]) for row in rows] == [
+            ("Имя", "key-001", None),
+            ("UA-1", None, self.UA_ONE),
+            ("key-002", "key-002", None),
+        ]
+
+    @pytest.mark.parametrize("line", ["", "   ", "\t\t"])
+    def test_blank_lines_are_ignored_entirely(self, pool, line):
+        result = pool.import_lines([line, self.UA_ONE])
+
+        assert result == {"added": 1, "skipped": 0, "problems": []}
+
+    @pytest.mark.parametrize(
+        "line",
+        [
+            "| Mozilla/5.0 x",  # пустое значение до |
+            "Mozilla/5.0 x |",  # пустое имя после |
+            "\tMozilla/5.0 x",  # пустая первая колонка после нарезки по табу
+            7,  # не текст
+            None,
+        ],
+    )
+    def test_broken_lines_go_to_problems_and_do_not_fail_the_batch(self, pool, line):
+        result = pool.import_lines([line, "key-001"])
+
+        assert result["added"] == 1
+        assert result["skipped"] == 1
+        assert result["problems"][0]["line_index"] == 0
+        assert result["problems"][0]["message"]
+
+
+class TestImportFile:
+    """Путь приходит только из конфига — тот же контракт, что у прокси."""
+
+    def test_imports_ua_and_key_ref_lines_from_a_file(self, pool, tmp_path, db_path):
+        source = tmp_path / "user_agents.txt"
+        source.write_text(
+            "Mozilla/5.0 (Windows NT 10.0) Chrome/120.0\n"
+            "\n"
+            "key-001 | Имя\n"
+            "Mozilla/5.0 (Windows NT 10.0) Chrome/120.0\n",
+            encoding="utf-8",
+        )
+
+        result = pool.import_file(source)
+
+        assert result["added"] == 2
+        assert result["skipped"] == 1
+        assert result["problems"][0]["line_index"] == 3
+        rows = table_rows(db_path, "profiles")
+        assert [(row["name"], row["user_agent"] is not None) for row in rows] == [
+            ("UA-1", True),
+            ("Имя", False),
+        ]
+
+    def test_missing_file_is_rejected(self, pool, tmp_path):
+        with pytest.raises(ProfileImportError):
+            pool.import_file(tmp_path / "nope.txt")
+
+    def test_directory_is_rejected(self, pool, tmp_path):
+        with pytest.raises(ProfileImportError):
+            pool.import_file(tmp_path)
+
+
 class TestListProfiles:
     """GET /control/profiles: ровно поля контракта, fields — объект."""
 
@@ -489,6 +660,95 @@ class TestDelete:
         assert worker_row(db_path, "br-1")["profile_id"] is None, (
             "внешний ключ должен обнулить ссылку воркера"
         )
+
+
+class TestDeleteMany:
+    """Батчевое удаление: ни одно исключение не должно ронять весь запрос."""
+
+    def test_deletes_all_listed(self, pool, db_path):
+        ids = add_free_profiles(pool, 3)
+
+        result = pool.delete_many(ids)
+
+        assert result == {"deleted": 3, "skipped": 0, "problems": []}
+        assert table_rows(db_path, "profiles") == []
+
+    def test_busy_and_missing_are_reported_not_raised(self, pool, db_path):
+        busy_id, free_id = add_free_profiles(pool, 2)
+        make_worker(db_path, "br-1", status="running")
+        bind(db_path, "br-1", busy_id)
+
+        result = pool.delete_many([busy_id, free_id, 424242])
+
+        assert result["deleted"] == 1
+        assert result["skipped"] == 2
+        assert f"id={busy_id}: назначен воркеру br-1" in result["problems"]
+        assert "id=424242: профиль не найден" in result["problems"]
+        assert [row["id"] for row in table_rows(db_path, "profiles")] == [busy_id]
+
+    def test_duplicate_ids_count_once(self, pool, db_path):
+        (profile_id,) = add_free_profiles(pool, 1)
+
+        result = pool.delete_many([profile_id, profile_id])
+
+        assert result == {"deleted": 1, "skipped": 0, "problems": []}
+        assert table_rows(db_path, "profiles") == []
+
+    def test_empty_list_is_a_noop(self, pool):
+        assert pool.delete_many([]) == {"deleted": 0, "skipped": 0, "problems": []}
+
+    @pytest.mark.parametrize("value", ["5", True, None, 1.5])
+    def test_non_integer_entry_is_a_problem_not_an_exception(self, pool, db_path, value):
+        (profile_id,) = add_free_profiles(pool, 1)
+
+        result = pool.delete_many([value, profile_id])
+
+        assert result["deleted"] == 1
+        assert result["skipped"] == 1
+        assert "неверный идентификатор" in result["problems"][0]
+        assert table_rows(db_path, "profiles") == []
+
+    def test_dead_worker_does_not_block_the_batch(self, pool, db_path):
+        (profile_id,) = add_free_profiles(pool, 1)
+        make_worker(db_path, "br-1", status="stopped", pid=None)
+        bind(db_path, "br-1", profile_id)
+
+        result = pool.delete_many([profile_id])
+
+        assert result == {"deleted": 1, "skipped": 0, "problems": []}
+        assert table_rows(db_path, "profiles") == []
+
+
+class TestDeleteAll:
+    """«Удалить всё» — тот же best-effort, что и у батча."""
+
+    def test_removes_the_whole_pool(self, pool, db_path):
+        add_free_profiles(pool, 3)
+
+        result = pool.delete_all()
+
+        assert result == {"deleted": 3, "skipped": 0, "problems": []}
+        assert table_rows(db_path, "profiles") == []
+
+    def test_assigned_profile_is_reported_not_raised(self, pool, db_path):
+        busy_id, free_id = add_free_profiles(pool, 2)
+        make_worker(db_path, "br-1", status="running")
+        bind(db_path, "br-1", busy_id)
+
+        result = pool.delete_all()
+
+        assert result["deleted"] == 1
+        assert result["skipped"] == 1
+        assert f"id={busy_id}: назначен воркеру br-1" in result["problems"]
+        assert [row["id"] for row in table_rows(db_path, "profiles")] == [busy_id]
+
+    def test_empty_pool_is_a_noop(self, pool):
+        assert pool.delete_all() == {"deleted": 0, "skipped": 0, "problems": []}
+
+    def test_all_ids_returns_rows_in_order(self, pool):
+        ids = add_free_profiles(pool, 3)
+
+        assert pool.all_ids() == ids
 
 
 class TestStatusMachine:

@@ -230,6 +230,21 @@ describe("profilesRequest", () => {
       path: "/control/profiles/delete",
       body: '{"id":7}',
     });
+    expect(profilesRequest({ kind: "deleteMany", ids: [3, 7, 9] })).toEqual({
+      method: "POST",
+      path: "/control/profiles/delete",
+      body: '{"ids":[3,7,9]}',
+    });
+    expect(profilesRequest({ kind: "deleteAll" })).toEqual({
+      method: "POST",
+      path: "/control/profiles/delete",
+      body: '{"all":true}',
+    });
+    expect(profilesRequest({ kind: "importFile" })).toEqual({
+      method: "POST",
+      path: "/control/profiles/import",
+      body: '{"file":true}',
+    });
     expect(profilesRequest({ kind: "assign", start_id: 1, end_id: 10 })).toEqual({
       method: "POST",
       path: "/control/profiles/assign",
