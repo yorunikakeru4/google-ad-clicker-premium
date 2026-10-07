@@ -476,6 +476,39 @@ def browser_version(capabilities: Any, user_agent: str | None) -> str | None:
 # --- fetcher'ы: сеть только за пределами тестов -----------------------------------
 
 
+def _echo_needs_isolated_context(driver: Any) -> bool:
+    """Страница, у которой Chrome запрещает сетевые запросы из JS.
+
+    Первый чекпоинт снимается сразу после создания драйвера, когда открыт
+    ``chrome://new-tab-page/``: у chrome:// origin нет network access, и
+    ``fetch`` оттуда всегда падает с «TypeError: Failed to fetch» — так и
+    рождался флаг «внешний echo-запрос не выполнен» при живом прокси.
+    """
+    try:
+        url = str(getattr(driver, "current_url", "") or "")
+    except Exception:
+        # Нет данных о странице — пусть echo попробует как есть: отказ
+        # драйвера и так становится EchoResult(error=...), не исключением.
+        return False
+    return url.startswith(("chrome://", "devtools://"))
+
+
+def _execute_in_blank_tab(driver: Any, snippet: str, *args: Any) -> Any:
+    """Выполнить асинхронный сниппет в временной вкладке ``about:blank``.
+
+    Вкладка создаётся с исходным URL Chrome (blank), после выполнения
+    закрывается, фокус возвращается на исходную — состояние сессии (которая
+    снимок и так заканчивает) не меняется.
+    """
+    original = driver.current_window_handle
+    driver.switch_to.new_window("tab")
+    try:
+        return driver.execute_async_script(snippet, *args)
+    finally:
+        driver.close()
+        driver.switch_to.window(original)
+
+
 def fetch_echo(
     driver: Any,
     *,
@@ -485,12 +518,18 @@ def fetch_echo(
     """Запрос echo **из контекста страницы**: те же заголовки, тот же прокси.
 
     ``urls`` пробуются по порядку (см. :data:`ECHO_URLS`) — общий таймаут на
-    всю цепочку. Не бросает: отказ драйвера или таймаут — это
+    всю цепочку. На ``chrome://``-страницах (см.
+    :func:`_echo_needs_isolated_context`) запрос уходит из временной вкладки
+    ``about:blank`` — иначе Chrome блокирует сеть и снимок всегда падал бы
+    с флагом «echo не выполнен». Не бросает: отказ драйвера или таймаут — это
     ``EchoResult(error=...)``, по которому колонки останутся NULL, а причина
     уйдёт в suspicion_flags.
     """
     try:
-        raw = driver.execute_async_script(ECHO_SNIPPET, list(urls), timeout_ms)
+        if _echo_needs_isolated_context(driver):
+            raw = _execute_in_blank_tab(driver, ECHO_SNIPPET, list(urls), timeout_ms)
+        else:
+            raw = driver.execute_async_script(ECHO_SNIPPET, list(urls), timeout_ms)
     except Exception as exc:
         return EchoResult(None, None, f"{type(exc).__name__}: {exc}")
     return parse_echo_payload(raw)

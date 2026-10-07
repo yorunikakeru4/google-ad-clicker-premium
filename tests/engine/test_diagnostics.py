@@ -106,6 +106,43 @@ class FakeDriver:
         return self.async_payload
 
 
+class TabFakeDriver(FakeDriver):
+    """Драйвер с вкладками: ``switch_to.new_window``/``close`` как у Selenium.
+
+    ``current_url`` по умолчанию — chrome://-страница (прод-состояние первого
+    чекпоинта); тесты обычных страниц перезаписывают атрибут.
+    """
+
+    current_url = "chrome://new-tab-page/"
+
+    def __init__(self, **kwargs) -> None:
+        super().__init__(**kwargs)
+        self.current_window_handle = "main-window"
+        self.tabs_opened = 0
+        self.tabs_closed = 0
+        self.switch_to = _FakeSwitchTo(self)
+
+    def close(self):
+        self.tabs_closed += 1
+        self.current_window_handle = "main-window"
+
+
+class _FakeSwitchTo:
+    """Имитация ``driver.switch_to``: новая вкладка и возврат фокуса."""
+
+    def __init__(self, driver: TabFakeDriver) -> None:
+        self._driver = driver
+
+    def new_window(self, kind: str):
+        self._driver.tabs_opened += 1
+        self._driver.current_window_handle = f"{kind}-blank"
+        return None
+
+    def window(self, handle: str):
+        self._driver.current_window_handle = handle
+        return None
+
+
 @pytest.fixture
 def db_path(tmp_path):
     path = tmp_path / "adclicker.db"
@@ -357,6 +394,35 @@ class TestFetchers:
 
         assert echo.headers is None and echo.ip is None
         assert "browser is gone" in echo.error
+
+    def test_echo_on_chrome_page_runs_in_a_temporary_blank_tab(self):
+        # Прод-симптом: первый чекпоинт снимается на chrome://new-tab-page/,
+        # где Chrome запрещает сети — fetch всегда падал с Failed to fetch.
+        driver = TabFakeDriver(async_payload={"ok": True, "body": dict(FULL_ECHO_BODY)})
+
+        echo = fetch_echo(driver)
+
+        assert driver.tabs_opened == 1 and driver.tabs_closed == 1
+        assert driver.current_window_handle == "main-window", "фокус должен вернуться"
+        assert driver.scripts[-1][1][0] == list(ECHO_URLS)
+        assert echo.error is None and echo.ip == "203.0.113.7"
+
+    @pytest.mark.parametrize("url", ["https://www.google.com/search?q=x", "about:blank"])
+    def test_echo_on_normal_page_keeps_the_current_tab(self, url):
+        driver = TabFakeDriver(async_payload={"ok": True, "body": dict(FULL_ECHO_BODY)})
+        driver.current_url = url
+
+        fetch_echo(driver)
+
+        assert driver.tabs_opened == 0, "вкладка нужна только для chrome://-страниц"
+
+    def test_tab_failure_still_becomes_an_error_not_an_exception(self):
+        driver = TabFakeDriver(async_error=RuntimeError("cannot switch window"))
+
+        echo = fetch_echo(driver)
+
+        assert echo.headers is None and echo.ip is None
+        assert "cannot switch window" in echo.error
 
     def test_local_ip_snippet_returns_the_candidate(self):
         driver = FakeDriver(async_payload="192.168.1.42")
