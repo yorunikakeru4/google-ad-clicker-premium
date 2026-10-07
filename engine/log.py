@@ -38,6 +38,12 @@ f-строка раскладывается так: статическая ча�
 ``quit()`` браузера оставлено сообщением: именно его ищут в файловом логе,
 а тип уходит в отдельное поле.
 
+Значения полей длиннее ``FIELD_VALUE_LIMIT`` обрезаются централизованно в
+санитайзере ``_safe_value`` с маркером «... [+N символов]»: так стек-трейс
+Selenium (~2КБ) не превращает запись в нечитаемую кашу ни в таблице, ни в
+файловом зеркале. Обрезка едина для обоих путей, ``message`` и ``exc_info``
+не трогаются.
+
 Маппинг категорий (зафиксирован, новые вызовы выбирают из него)
 ---------------------------------------------------------------
 
@@ -97,8 +103,30 @@ DEFAULT_DB_NAME = "adclicker.db"
 
 _UNREPRESENTABLE = "<unrepresentable>"
 
+# Порог обрезки длинных строковых значений полей. Стек-трейс из прода
+# (~2КБ: первая строка ошибки + 17 фреймов undetected_chromedriver) целиком
+# уходил в поле ``error`` и делал запись нечитаемой в UI и в файловом
+# зеркале. Лимит покрывает первую строку ошибки («Message: element not
+# interactable») и контекст сессии — ровно то, что нужно для диагностики.
+FIELD_VALUE_LIMIT = 300
+
 # Зеркало: (level, message, *, exc_info, extra) -> None.
 Mirror = Callable[..., None]
+
+
+def _truncate_value(value: str) -> str:
+    """Обрезать слишком длинное строковое значение поля с явным маркером.
+
+    Маркер сообщает, сколько символов отброшено, поэтому потеря видна,
+    а не молчаливая. Обрезка выполняется только здесь — в санитайзере
+    ``_safe_value``, — поэтому БД и файловое зеркало обязаны получить
+    одно и то же значение.
+    """
+
+    if len(value) <= FIELD_VALUE_LIMIT:
+        return value
+    hidden = len(value) - FIELD_VALUE_LIMIT
+    return f"{value[:FIELD_VALUE_LIMIT]}... [+{hidden} символов]"
 
 
 def _safe_key(key: Any) -> str:
@@ -127,8 +155,17 @@ def _safe_str(value: Any) -> str:
 
 
 def _safe_value(value: Any) -> Any:
-    if value is None or isinstance(value, (bool, int, str)):
+    """Санитайзер одного значения поля: обрезка строк и замена несериализуемого.
+
+    Единая точка обрезки длинных значений — её проходят и ``encode_fields``
+    (БД), и ``render_mirror_message`` (файловое зеркало), поэтому два пути
+    не могут расходиться. ``message`` через этот санитайзер не идёт.
+    """
+
+    if value is None or isinstance(value, (bool, int)):
         return value
+    if isinstance(value, str):
+        return _truncate_value(value)
     if isinstance(value, float):
         # NaN/Inf — не валидный JSON для читателя на другой стороне (UI),
         # поэтому только конечные числа идут как есть.
@@ -141,11 +178,15 @@ def _safe_value(value: Any) -> Any:
         json.dumps(value, ensure_ascii=False)
         return value
     except (TypeError, ValueError):
-        return _safe_repr(value)
+        return _truncate_value(_safe_repr(value))
 
 
 def encode_fields(fields: Any) -> str | None:
-    """fields в JSON-строку для колонки logs.fields. Тотальная функция."""
+    """fields в JSON-строку для колонки logs.fields. Тотальная функция.
+
+    Длинные строковые значения обрезаются по ``FIELD_VALUE_LIMIT`` — так же,
+    как в :func:`render_mirror_message`.
+    """
     if fields is None:
         return None
     safe = _safe_value(fields)
@@ -162,7 +203,9 @@ def render_mirror_message(message: Any, fields: Any) -> str:
     """Сообщение с приклеенными полями — вид записи в legacy-файловом логе.
 
     Поля идут через тот же санитайзер, что и в таблицу, поэтому зеркало не
-    может упасть на ядовитом значении и показывает ровно то, что ушло в БД.
+    может упасть на ядовитом значении и показывает ровно то, что ушло в БД —
+    включая обрезку длинных значений по ``FIELD_VALUE_LIMIT``. ``message``
+    не обрезается: он уже читаемый, длинным бывает только значение поля.
     """
 
     text = _safe_str(message)

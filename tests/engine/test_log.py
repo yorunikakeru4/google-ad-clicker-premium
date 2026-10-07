@@ -5,6 +5,9 @@
 - категории и уровни — закрытый словарь, неизвестная категория/уровень —
   ошибка программирования (ValueError);
 - fields уходят в БД JSON-строкой, несериализуемое превращается в repr;
+- слишком длинные строковые значения полей обрезаются по
+  ``FIELD_VALUE_LIMIT`` одинаково и в БД, и в файловое зеркало: message
+  и ``exc_info`` при этом не трогаются;
 - запись метрики ``network_requests`` идёт через тот же store и биндинг
   ``browser_id``, ошибки гасятся так же, а в зеркало не дублируется;
 - путь логгирования никогда не бросает исключений: сломанный store под
@@ -21,7 +24,15 @@ from typing import Any
 import pytest
 
 from engine.db import migrations
-from engine.log import CATEGORIES, LEVELS, StructuredLogger, legacy_mirror
+from engine.log import (
+    CATEGORIES,
+    FIELD_VALUE_LIMIT,
+    LEVELS,
+    StructuredLogger,
+    encode_fields,
+    legacy_mirror,
+    render_mirror_message,
+)
 from engine.store import StoreWriter
 
 
@@ -229,6 +240,80 @@ class TestFieldsSanitization:
         writer.flush()
 
         assert json.loads(_logs(db_path)[0]["fields"]) == payload
+
+
+class TestFieldTruncation:
+    """Длинные значения полей обрезаются одинаково в БД и в зеркале.
+
+    Стек-трейс из прода (~2КБ) целиком уходил в поле ``error`` и делал
+    запись нечитаемой. Лимит берётся такой, чтобы первая строка ошибки —
+    она и есть суть — проходила целиком.
+    """
+
+    STACK_TRACE = (
+        "Message: element not interactable\n"
+        "(Session info: chrome=153.0.8010.55)\n" + "0 undetected_chromedriver 0x0000000103306b4a\n" * 50
+    )
+
+    @staticmethod
+    def _truncated(value: str) -> str:
+        return value[:FIELD_VALUE_LIMIT] + f"... [+{len(value) - FIELD_VALUE_LIMIT} символов]"
+
+    def test_stack_trace_fixture_is_longer_than_limit(self):
+        assert len(self.STACK_TRACE) > FIELD_VALUE_LIMIT
+
+    def test_long_field_is_truncated_in_encode_fields(self):
+        parsed = json.loads(encode_fields({"error": self.STACK_TRACE}))
+
+        assert parsed["error"] == self._truncated(self.STACK_TRACE)
+        assert parsed["error"].startswith("Message: element not interactable\n")
+
+    def test_long_field_is_truncated_in_render_mirror_message(self):
+        rendered = render_mirror_message("Direct typing failed", {"error": self.STACK_TRACE})
+
+        assert rendered.startswith("Direct typing failed ")
+        # Зеркало печатает значение через repr — маркер обязан совпасть с БД.
+        assert f"error={self._truncated(self.STACK_TRACE)!r}" in rendered
+
+    def test_truncation_is_identical_in_db_and_mirror(self):
+        # Одиночная строка без кавычек и переводов: repr совпадает со значением,
+        # и маркер можно сравнивать напрямую.
+        value = "element not interactable " + "x" * 500
+        in_db = json.loads(encode_fields({"error": value}))["error"]
+        in_mirror = render_mirror_message("m", {"error": value})
+
+        assert in_db == self._truncated(value)
+        assert f"error={in_db!r}" in in_mirror
+
+    def test_short_field_is_not_truncated(self):
+        fields = {"error": "element not interactable", "n": 3, "ok": True}
+
+        assert json.loads(encode_fields(fields)) == fields
+        assert "error='element not interactable'" in render_mirror_message("m", fields)
+
+    def test_field_exactly_at_limit_is_not_truncated(self):
+        value = "y" * FIELD_VALUE_LIMIT
+
+        assert json.loads(encode_fields({"e": value})) == {"e": value}
+
+    def test_nested_long_value_is_truncated(self):
+        value = "z" * (FIELD_VALUE_LIMIT + 10)
+
+        parsed = json.loads(encode_fields({"nested": {"error": value}}))
+
+        assert parsed["nested"]["error"] == self._truncated(value)
+
+    def test_message_stays_intact_while_field_value_is_cut(self, writer, db_path):
+        logger = StructuredLogger(writer, browser_id="br-1")
+        message = "m" * (FIELD_VALUE_LIMIT * 2)
+        error = "e" * (FIELD_VALUE_LIMIT + 5)
+
+        logger.info("click", message, fields={"error": error})
+        writer.flush()
+
+        row = _logs(db_path)[0]
+        assert row["message"] == message
+        assert json.loads(row["fields"])["error"] == self._truncated(error)
 
 
 class TestNeverRaises:
