@@ -649,7 +649,7 @@ class TestConfigEndpoint:
         status, body, _ = request(server, "/control/config")
 
         assert status == 200
-        assert set(body["config"]) == {"paths", "webdriver", "behavior"}
+        assert set(body["config"]) == {"paths", "webdriver", "behavior", "export"}
 
     def test_get_masks_secret(self, server, supervisor, config, tmp_path):
         config = config_module.Config.from_dict(

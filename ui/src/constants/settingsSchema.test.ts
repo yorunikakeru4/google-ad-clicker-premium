@@ -77,10 +77,20 @@ const ENGINE_SCHEMA: Record<string, Record<string, EngineField>> = {
     cleanup_time: { type: "str", default: "04:00" },
     cleanup_interval_days: { type: "int", default: 1 },
   },
+  export: {
+    enabled: { type: "bool", default: false },
+    host: { type: "str", default: "127.0.0.1" },
+    port: { type: "int", default: 5432 },
+    dbname: { type: "str", default: "adclicker_export" },
+    user: { type: "str", default: "adclicker" },
+    password: { type: "str", default: "" },
+    sslmode: { type: "str", default: "prefer" },
+    batch_size: { type: "int", default: 500 },
+  },
 };
 
 /** Копия _SECRET_FIELDS: поля, которые движок отдаёт замаскированными. */
-const ENGINE_SECRETS = ["behavior.2captcha_apikey", "webdriver.proxy"];
+const ENGINE_SECRETS = ["behavior.2captcha_apikey", "webdriver.proxy", "export.password"];
 
 /** Копия _numeric_limits: поля, у которых есть границы в движке. */
 const ENGINE_LIMITS: Record<string, { min: number; max: number }> = {
@@ -97,6 +107,8 @@ const ENGINE_LIMITS: Record<string, { min: number; max: number }> = {
   "behavior.log_retention_days": { min: 1, max: 3650 },
   "behavior.db_size_limit_mb": { min: 0, max: 102400 },
   "behavior.cleanup_interval_days": { min: 1, max: 30 },
+  "export.port": { min: 1, max: 65535 },
+  "export.batch_size": { min: 50, max: 5000 },
 };
 
 /** Какие типы формы допустимы для типа движка (enum — тоже свой тип). */
@@ -155,11 +167,12 @@ describe("settingsSchema: секции и поля против _SCHEMA", () => 
   // Счётчик — смотри на сумму ключей _SCHEMA, а не на него самого: он ловит
   // потерю поля и дубль пути разом. Меняется только вместе с _SCHEMA
   // (36 полей до политики CAPTCHA + 3 под неё + 3 про хранение логов = 42
-  // + 2 про очистку профилей = 44 + 1 про наш домен = 45).
-  it("в форме ровно 45 полей, без повторов пути", () => {
+  // + 2 про очистку профилей = 44 + 1 про наш домен = 45
+  // + 8 полей экспорта в PostgreSQL = 53).
+  it("в форме ровно 53 поля, без повторов пути", () => {
     const paths = allFields().map((row) => row.path);
     expect(new Set(paths).size, "пути полей повторяются").toBe(paths.length);
-    expect(paths).toHaveLength(45);
+    expect(paths).toHaveLength(53);
   });
 
   it("типы формы соответствуют типам движка", () => {

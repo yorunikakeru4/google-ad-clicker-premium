@@ -337,6 +337,67 @@ Apply the following steps for once to enable Telegram notifications.
 
 <br>
 
+### Экспорт в PostgreSQL
+
+Демон может постоянно выгружать данные `adclicker.db` во внешнюю PostgreSQL.
+Схема целевой БД — корневой `init.sql`, контейнер — `docker-compose.yml`.
+
+1. Поднимите БД (`--wait` ждёт healthcheck):
+
+    ```bash
+    docker compose up -d --wait
+    ```
+
+2. Дефолтные креды из compose: `127.0.0.1:5432`, база `adclicker_export`,
+   пользователь `adclicker`, пароль `adclicker`. Свой пароль задайте перед
+   запуском:
+
+    ```bash
+    EXPORT_DB_PASSWORD='секрет' docker compose up -d --wait
+    ```
+
+3. Включите экспорт секцией `export` в `config.json`:
+
+    ```json
+    "export": {
+        "enabled": true,
+        "host": "127.0.0.1",
+        "port": 5432,
+        "dbname": "adclicker_export",
+        "user": "adclicker",
+        "password": "adclicker",
+        "sslmode": "prefer",
+        "batch_size": 500
+    }
+    ```
+
+    `enabled: false` (дефолт) — тик ничего не делает, соединение не открывается.
+    `batch_size` — размер пачки (50..5000); `sslmode`: `disable|allow|prefer|
+    require|verify-ca|verify-full`.
+
+4. Период выгрузки — переменная окружения `ADCLICKER_EXPORT_INTERVAL`
+   (секунды, дефолт 60; `0` — экспорт выключен):
+
+    ```bash
+    ADCLICKER_EXPORT_INTERVAL=30 python -m engine.control_plane.daemon
+    ```
+
+**Что экспортируется.** Полными снимками каждый тик: `proxies`, `profiles`,
+`workers`, `metrics_hourly`. Инкрементально, курсором по `id`: `runs`, `logs`,
+`clicks`, `network_requests`, `captcha_events`, `diagnostics`, `proxy_usage`.
+Служебная `kv` не экспортируется. Запись идемпотентна
+(`INSERT ... ON CONFLICT ... DO UPDATE`) — повторные тики не плодят дубли.
+
+**Пароли прокси не покидают машину**: колонки `username`/`password` в таблице
+`proxies` оставлены ради совместимости схемы, экспортер всегда пишет туда
+`NULL`.
+
+**Важно про схему.** `init.sql` исполняется только при первом создании тома
+`export-pgdata`. Изменения схемы в уже работающей БД: либо
+`docker compose down -v` (том и все данные удаляются), либо ручные `ALTER`.
+
+<br>
+
 ## Execution Example
 
 [Watch recording of an execution](https://vimeo.com/1072188364)

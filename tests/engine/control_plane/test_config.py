@@ -435,7 +435,7 @@ class TestPatch:
 
         assert updated.get("behavior.query") == SECRET_MASK
         assert config_module._SECRET_FIELDS == frozenset(
-            {"behavior.2captcha_apikey", "webdriver.proxy"}
+            {"behavior.2captcha_apikey", "webdriver.proxy", "export.password"}
         )
 
 
@@ -453,7 +453,7 @@ class TestSerialization:
         dumped = cfg.to_dict()
 
         assert dumped["behavior"]["browser_count"] == 3
-        assert set(dumped) == {"paths", "webdriver", "behavior"}
+        assert set(dumped) == {"paths", "webdriver", "behavior", "export"}
 
     def test_round_trip_through_dict_preserves_non_secret_values(self):
         original = Config.from_dict(_raw(behavior__browser_count=3, behavior__click_order=7))
@@ -940,6 +940,90 @@ class TestLogRetentionSettings:
         assert repo_config["behavior"]["log_retention_days"] == 30
         assert repo_config["behavior"]["log_file_level"] == "INFO"
         assert repo_config["behavior"]["db_size_limit_mb"] == 0
+
+
+class TestExportSection:
+    """Секция ``export`` — настройки выгрузки в PostgreSQL (план §9, §13.1).
+
+    Контракт тройной: ``_SCHEMA`` демона, ``config.json`` корня и копия в
+    settingsSchema.ts обязаны совпадать, поэтому здесь фиксируются и дефолты,
+    и границы полей, и маскирование пароля БД.
+    """
+
+    def test_defaults_match_the_contract(self):
+        assert config_module.default_config()["export"] == {
+            "enabled": False,
+            "host": "127.0.0.1",
+            "port": 5432,
+            "dbname": "adclicker_export",
+            "user": "adclicker",
+            "password": "",
+            "sslmode": "prefer",
+            "batch_size": 500,
+        }
+
+    def test_disabled_by_default_so_a_clean_install_stays_offline(self):
+        cfg = Config.from_dict({"behavior": {"browser_count": 2}})
+
+        assert cfg.get("export.enabled") is False
+
+    def test_default_batch_size_is_the_exporter_constant(self):
+        from engine.exporter import DEFAULT_BATCH_SIZE
+
+        assert config_module.default_config()["export"]["batch_size"] == DEFAULT_BATCH_SIZE
+
+    @pytest.mark.parametrize(
+        "value", ["disable", "allow", "prefer", "require", "verify-ca", "verify-full"]
+    )
+    def test_accepts_every_known_sslmode(self, value):
+        cfg = Config.from_dict(_raw(export__sslmode=value))
+
+        assert cfg.get("export.sslmode") == value
+
+    def test_unknown_sslmode_is_a_readable_problem(self):
+        with pytest.raises(ConfigError) as excinfo:
+            Config.from_dict(_raw(export__sslmode="maybe"))
+
+        assert "export.sslmode" in str(excinfo.value)
+
+    @pytest.mark.parametrize("value", [1, 5432, 65535])
+    def test_accepts_ports_within_the_range(self, value):
+        cfg = Config.from_dict(_raw(export__port=value))
+
+        assert cfg.get("export.port") == value
+
+    @pytest.mark.parametrize("value", [0, -1, 65536])
+    def test_rejects_ports_outside_the_range(self, value):
+        with pytest.raises(ConfigError) as excinfo:
+            Config.from_dict(_raw(export__port=value))
+
+        assert "export.port" in str(excinfo.value)
+
+    @pytest.mark.parametrize("value", [50, 500, 5000])
+    def test_accepts_batch_sizes_within_the_range(self, value):
+        cfg = Config.from_dict(_raw(export__batch_size=value))
+
+        assert cfg.get("export.batch_size") == value
+
+    @pytest.mark.parametrize("value", [49, 5001])
+    def test_rejects_batch_sizes_outside_the_range(self, value):
+        with pytest.raises(ConfigError) as excinfo:
+            Config.from_dict(_raw(export__batch_size=value))
+
+        assert "export.batch_size" in str(excinfo.value)
+
+    def test_password_is_masked_on_the_way_out(self):
+        cfg = Config.from_dict(_raw(export__password="PG-SECRET"))
+
+        assert cfg.to_dict()["export"]["password"] == SECRET_MASK
+        assert cfg.as_dict()["export"]["password"] == "PG-SECRET"
+
+    def test_repository_config_json_carries_the_export_section(self):
+        repo_config = json.loads(
+            (Path(__file__).resolve().parents[3] / "config.json").read_text(encoding="utf-8")
+        )
+
+        assert repo_config["export"] == config_module.default_config()["export"]
 
 
 class TestImportHasNoSideEffects:

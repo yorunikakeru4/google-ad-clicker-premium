@@ -10,6 +10,9 @@
 - [x] Фикс гонки `thread.start()` в `engine/control_plane/daemon.py::_on_signal`
       (порядок «ссылка → start → флаг»); закоммичено в `609856f`; тесты
       `TestOwnerWatch` + `TestDaemonLifecycle` прошли 15×15 повторов.
+- [x] **Задача экспорта в PostgreSQL ВЫПОЛНЕНА (2026-10-07), изменения НЕ закоммичены** —
+      §9–§16: постоянный экспорт логов/метрик/событий/справочников из локальной
+      SQLite в внешнюю PostgreSQL; docker-compose.yml + init.sql в корне; 3 агента.
 - [x] **Задача профилей ВЫПОЛНЕНА (2026-10-06), изменения НЕ закоммичены** (16 файлов,
       см. §0.1): 3 агента отработали в worktrees, патчи применены к develop,
       интеграция + e2e зелёные. Worktrees/ветки удалены.
@@ -305,4 +308,294 @@ git branch -D agent/backend agent/tsapi agent/ui
   - Замечание агента A учтено: в e2e строка-дубль UA — `UA\tколонка2`
     (срез по табу до strip; `\tUA` дал бы «строка пустая») — §0.2.
   - Изменения НЕ закоммичены (коммит — по явной команде пользователя).
+- `2026-10-07` — добавлена задача экспорта в PostgreSQL (§9–§16).
+- `2026-10-07` (вечер) — **задача экспорта ВЫПОЛНЕНА**:
+  - 3 агента в worktrees отработали параллельно, свои тесты каждого зелёные;
+    патчи (pA/pB/pC) применены к develop без конфликтов, worktrees/ветки удалены;
+  - состав: `engine/exporter.py` (курсорный SQLite→PG, 11 таблиц, psycopg v3
+    лениво), export-job в `daemon.py` (env `ADCLICKER_EXPORT_INTERVAL`,
+    дефолт 60с), секция `export` в `_SCHEMA`/`config.json` (пароль — секрет),
+    категория `export` в `engine/log.py`, `docker-compose.yml` + `init.sql`
+    в корне (postgres:16-alpine, 12 таблиц без FK), psycopg во
+    `flake.nix`/`pyproject.toml`/`requirements.txt`, секция README,
+    `settingsSchema.ts` (8 полей, секрет export.password);
+  - интеграция: `ruff check engine tests` OK; `pytest test_exporter.py +
+    test_export_job.py + test_config.py` → **256 passed**; vitest
+    `settingsSchema.test.ts` → **10 passed**; `vue-tsc --noEmit` → exit 0;
+    регресс `pytest tests/engine/control_plane + test_log + test_log_access +
+    legacy/test_config_reader` → **1090 passed**; vitest
+    `src/constants + lib/settings + composables/useSettings + views/screens`
+    → **68 passed**;
+  - e2e `/tmp/opencode/e2e_export.py` → **19/19 OK**: compose healthy, все 11
+    таблиц наполнились, `proxies.username/password` в PG = NULL,
+    `export_state` заполнен (11), повторные тики идемпотентны, SIGTERM → exit 0.
+  - Замечания агентов учтены: CATEGORIES в `engine/log.py` — `export` (в
+    `metrics` не было); в `test_log.py`/`test_api.py` поправлены по строке
+    (новая категория/секция ломали точные ассерты); UI-фильтр логов
+    (`logFilters.ts`) категорию `export` не предлагает — как и `metrics`,
+    вне объёма.
+  - Изменения НЕ закоммичены (коммит — по явной команде пользователя).
+
+---
+
+## 9. Задача: постоянный экспорт данных во внешнюю PostgreSQL (решения приняты)
+
+Заказчик: «постоянный экспорт логов, метрик и прочего — максимально возможной
+информации — на внешнюю БД по хосту/паролю и т.д.; в корне docker-compose.yml
+с init.sql для этой БД».
+
+### 9.1 Что экспортируем (всё из adclicker.db, кроме kv-мусора)
+
+Инкрементально-append таблицы (курсор по `id`):
+
+| таблица | содержимое |
+|---|---|
+| `logs` | структурированные логи (ts, day, level, browser_id, category, message, fields) |
+| `clicks` | клики (url, query, category, browser_id, proxy_id, http_status) |
+| `network_requests` | CDP-запросы |
+| `captcha_events` | события капчи |
+| `diagnostics` | снимки отпечатков сессий |
+| `proxy_usage` | выдачи прокси |
+| `runs` | запуски (append + догоняющее обновление изменённых строк) |
+
+Полные снимки (upsert целиком каждый тик — таблицы маленькие):
+
+| таблица | содержимое |
+|---|---|
+| `workers` | воркеры (по browser_id) |
+| `proxies` | пул прокси (**без** `username`/`password` — секреты не покидают машину, как в schema.sql:37) |
+| `profiles` | профили (без секретов; `key_ref` — только имя ссылки) |
+| `metrics_hourly` | часовые агрегаты (по bucket) |
+
+`kv` — служебное, НЕ экспортируем. Legacy `clicklogs.db`/`geolocation.db` —
+НЕ экспортируем (источник истины уже в `adclicker.db`).
+
+### 9.2 Куда и как
+
+- Целевая БД: **PostgreSQL 16**, поднимается `docker-compose.yml` в корне репо
+  (сервис `export-db`), схема — корневой `init.sql` (зеркало колонок SQLite с
+  типами PG: `REAL→double precision`, `INTEGER→bigint`, `TEXT→text`), плюс
+  таблица курсоров `export_state(table_name text PK, last_id bigint, updated_at
+  double precision)`. Все таблицы целевой БД — `INSERT ... ON CONFLICT ... DO
+  UPDATE` (идемпотентно, повторный тик не плодит дубли).
+- Драйвер: **psycopg (v3)**, lazy-импорт внутри `engine/exporter.py`
+  (проект без export-секции или без psycopg не должен падать на импорте).
+- Куда подключаться/что экспортировать — **секция `export` в config.json**
+  (см. §13.1), пароль в `_SECRET_FIELDS`.
+- Интервал — **env `ADCLICKER_EXPORT_INTERVAL`** (сек, дефолт 60, 0 = job
+  выключен), как у остальных job'ов демона (конвенция daemon.py:99-103:
+  частота — env, настройки — config.json, читаются на каждом тике).
+- Пишет только демон (один процесс, control plane); воркеры экспорт не делают.
+- Сбой сети/БД не роняет тик: `ExportError` логируется через
+  `store.log(..., category="export")`, курсор не двигается, следующий тик
+  повторяет. Курсор двигается ТОЛЬКО после успешного upsert батча.
+
+### 9.3 Батчинг и порядок
+
+- Батч: `LIMIT batch_size` (конфиг `export.batch_size`, дефолт 500, 50..5000)
+  по таблице за проход, таблиц — за тик, пока не отработают все или не
+  выйдет бюджет итераций (≤ 20 батчей на таблицу за тик, остальное — со следующим).
+- Порядок таблиц за тик: снимки справочников первыми (`proxies`, `profiles`,
+  `workers`, `metrics_hourly`), потом append-таблицы (`runs`, `logs`, `clicks`,
+  `network_requests`, `captcha_events`, `diagnostics`, `proxy_usage`) — чтобы
+  FK-ссылки (proxy_id, profile_id, worker_id) уже существовали в PG.
+- `runs`: инкремент по курсору `id`, плюс повторный upsert «живых» строк
+  (`status='running'`) — их `ended_at` дописывается позже.
+
+---
+
+## 10. Разбивка на 3 агента (файлы не пересекаются)
+
+| | Агент A — backend (Python) | Агент B — infra | Агент C — UI |
+|---|---|---|---|
+| worktree | `.worktrees/agent-export-backend` | `.worktrees/agent-export-infra` | `.worktrees/agent-export-ui` |
+| ветка | `agent/export-backend` | `agent/export-infra` | `agent/export-ui` |
+| файлы | `engine/exporter.py` (новый), `engine/control_plane/daemon.py`, `engine/control_plane/config.py`, `engine/log.py`, `config.json`, `tests/engine/test_exporter.py` (новый), `tests/engine/control_plane/test_export_job.py` (новый), правки `tests/engine/control_plane/test_config.py` | `docker-compose.yml` (новый, корень), `init.sql` (новый, корень), `README.md` (секция «Экспорт в PostgreSQL»), `flake.nix` (+psycopg), `pyproject.toml` (+psycopg), `requirements.txt` (+psycopg) | `ui/src/constants/settingsSchema.ts`, `ui/src/constants/settingsSchema.test.ts` |
+| тесты | `nix develop -c python -m pytest tests/engine/test_exporter.py tests/engine/control_plane/test_export_job.py tests/engine/control_plane/test_config.py -q` + `nix develop -c ruff check engine tests` | валидация `docker compose config` (без поднятия БД) | `cd ui && npx vitest run src/constants/settingsSchema.test.ts` |
+
+A владеет `config.json` и `_SCHEMA` — C повторяет их в settingsSchema.ts
+(тест полноты требует синхронности, контракт §13.1). B владеет зависимостями,
+чтобы A не трогал flake/pyproject; psycopg в nixpkgs называется `psycopg`
+(python312, v3).
+
+## 11. Подготовка workspaces
+
+```bash
+git worktree prune
+git worktree add .worktrees/agent-export-backend -b agent/export-backend
+git worktree add .worktrees/agent-export-infra   -b agent/export-infra
+git worktree add .worktrees/agent-export-ui      -b agent/export-ui
+cp -al ui/node_modules .worktrees/agent-export-ui/ui/node_modules
+```
+
+Сбор патчей — по схеме §4 (агенты не коммитят; untracked-файлы через
+`git add -N`).
+
+---
+
+## 12. Интеграция (после сбора патчей, вне агентов)
+
+1. `nix develop -c ruff check engine tests`
+2. `nix develop -c python -m pytest tests/engine/test_exporter.py tests/engine/control_plane/test_export_job.py tests/engine/control_plane/test_config.py -q`
+3. `cd ui && npx vitest run src/constants/settingsSchema.test.ts`
+4. `cd ui && npx vue-tsc --noEmit`
+5. E2E с реальной БД (§14).
+
+---
+
+## 13. Контракты
+
+### 13.1 Секция конфига `export`
+
+`_SCHEMA` (engine/control_plane/config.py), config.json, settingsSchema.ts —
+в трёх местах одинаково:
+
+```python
+"export": {
+    "enabled":     (bool,   False),     # False — тик no-op, соединение не открывается
+    "host":        (str,    "127.0.0.1"),
+    "port":        (int,    5432),
+    "dbname":      (str,    "adclicker_export"),
+    "user":        (str,    "adclicker"),
+    "password":    (str,    ""),        # _SECRET_FIELDS: "export.password"
+    "sslmode":     (str,    "prefer"),  # _ENUM_FIELDS: disable|allow|prefer|require|verify-ca|verify-full
+    "batch_size":  (int,    500),       # _numeric_limits: 50..5000
+}
+```
+
+В `config.json` корня — секция с дефолтами (enabled=false). В
+`config_reader.py` НЕ добавляется (воркерам экспорт не нужен; legacy-читатель
+секции не видит — `for section in ("paths", "webdriver", "behavior")` не
+трогаем).
+
+### 13.2 API модуля engine/exporter.py
+
+```python
+DEFAULT_BATCH_SIZE = 500
+EXPORT_TABLES: tuple[str, ...]  # порядок экспорта, §9.3
+
+@dataclass(frozen=True)
+class ExportSettings:
+    enabled: bool; host: str; port: int; dbname: str
+    user: str; password: str; sslmode: str; batch_size: int
+
+class Exporter:
+    def __init__(self, db_path: str | Path, settings: ExportSettings): ...
+    def export_pass(self, *, now: float | None = None) -> dict[str, int]:
+        """Один проход: возвращает {таблица: сколько строк записано}.
+
+        enabled=False → {}. Сетевые/SQL-ошибки → ExportError (не глотать:
+        тик демона логирует и продолжает). Курсор в export_state двигается
+        после успешного батча каждой таблицы.
+        """
+    def close(self) -> None: ...
+
+class ExportError(Exception): ...
+```
+
+psycopg импортируется лениво внутри `Exporter.__init__` (при enabled=False
+импорт не нужен); DSN собирается из settings, `connect_timeout=5`.
+
+### 13.3 Job в daemon.py
+
+По образцу metrics-job (daemon.py:1278-1332):
+
+```python
+EXPORT_THREAD_NAME = "export"
+DEFAULT_EXPORT_INTERVAL_SECONDS = 60.0
+# env ADCLICKER_EXPORT_INTERVAL, парсер export_interval_from_environ()
+# (общий _seconds_from_environ: 0/минус = выкл, мусор = ValueError)
+
+def _export_tick(self, now: float | None = None) -> None:
+    # config = self._current_config(); settings = ExportSettings(**config.export)
+    # if not settings.enabled: return
+    # self._exporter.export_pass(now=now); лог INFO category="export" со сводкой
+# + _start_export_loop / _run_export_loop; в build_daemon — интервал из env;
+# в Daemon.__init__ — ленивый Exporter; в shutdown() — close()
+```
+
+Категория `"export"` добавляется в `_CATEGORIES` engine/log.py (рядом с
+`metrics`). Сводка тика — `store.log(INFO, "export", "export tick", fields={"rows": {...}})`.
+
+### 13.4 init.sql (корень, монтируется в /docker-entrypoint-initdb.d/)
+
+- `CREATE TABLE IF NOT EXISTS` для 11 таблиц-зеркал (§9.1) + `export_state`;
+- типы: `double precision` (REAL), `bigint` (INTEGER id/счётчики), `text`;
+- PK `id bigint PRIMARY KEY` (id-таблицы), `bucket bigint PRIMARY KEY`
+  (metrics_hourly), `browser_id text PRIMARY KEY` (workers), `key text PRIMARY KEY` НЕТ — kv не экспортируем;
+- без FK (упорядоченная вставка делает их избыточными, а PG-зеркало —
+  не операционная БД); индексы по `ts` и `browser_id` как в schema.sql;
+- колонки `username`/`password` в таблице `proxies` — ЕСТЬ (совместимость
+  схемы), но экспортер их всегда пишет NULL (секреты не покидают машину).
+
+### 13.5 docker-compose.yml (корень)
+
+```yaml
+services:
+  export-db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: adclicker_export
+      POSTGRES_USER: adclicker
+      POSTGRES_PASSWORD: ${EXPORT_DB_PASSWORD:-adclicker}
+    ports: ["5432:5432"]
+    volumes:
+      - export-pgdata:/var/lib/postgresql/data
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U adclicker -d adclicker_export"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+volumes:
+  export-pgdata:
+```
+
+### 13.6 settingsSchema.ts (агент C)
+
+Секция `export` с 8 полями по образцу существующих; секрет `export.password`
+в `ENGINE_SECRETS` теста; лимиты `export.port` 1..65535,
+`export.batch_size` 50..5000; enum sslmode. Тест полноты против своей копии
+`ENGINE_SCHEMA` обновляется синхронно.
+
+---
+
+## 14. E2E (вне агентов) — `/tmp/opencode/e2e_export.py`
+
+1. `docker compose up -d --wait` (healthcheck `pg_isready`).
+2. tempdir: config.json с `export.enabled=true`, host=127.0.0.1, dbname/user/password
+   как в compose; свежий adclicker.db; PYTHONPATH=<repo>.
+3. Старт демона (`nix develop -c python -m engine.control_plane.daemon ... --port 8792`),
+   env `ADCLICKER_EXPORT_INTERVAL=2`.
+4. Накрутить данные: пару `store.log`, `record_click`, `record_captcha_event`,
+   `record_network_request`, `start_run`/`finish_run`.
+5. Ждать ≤ 15 с, затем `psql` (через `docker compose exec export-db psql -U adclicker -d adclicker_export -tAc`):
+   counts по logs/clicks/captcha_events/network_requests/runs ≥ вставленного;
+   `export_state` заполнен; повторный тик не раздувает counts (идемпотентность).
+6. SIGTERM, код 0; `docker compose down` (volume сохранить можно, неважно).
+
+---
+
+## 15. Риски / заметки
+
+- psycopg в flake: nixpkgs `psycopg` (v3) для python312 — если в закреплённом
+  flake.lock нет, B ставит `psycopg` через uv-слой или фиксит lock (обсудить).
+- export-секция ломает `TestDefaults` (сравнение default_config с config.json) —
+  A правит оба, C — копию в тесте UI.
+- Миграции целевой БД: init.sql выполняется только при первом создании volume —
+  изменения схемы PG = `docker compose down -v` или ручные ALTER (в README).
+- Параллельные демоны на одной PG: upsert идемпотентен, `export_state` может
+  гоняться — приемлемо (одна БД — один демон, документируем).
+- Курсор по `id` append-таблиц корректен только при монотонных id (SQLite
+  AUTOINCREMENT-подобный rowid — растёт всегда; DELETE не делаем).
+
+## 16. E2E-чек-лист (для §14)
+
+- [ ] compose поднялся, healthcheck healthy
+- [ ] демон пишет export-сводки в store.log
+- [ ] все 11 таблиц наполнились
+- [ ] `proxies.username/password` в PG — NULL
+- [ ] повторный тик — counts не растут
+- [ ] enabled=false — соединение не открывается (psql log пуст)
+- [ ] SIGTERM — чистая остановка, exporter.close() без ошибок
 

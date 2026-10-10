@@ -172,7 +172,7 @@ class TestCategories:
     def test_all_spec_categories_accepted(self, writer, db_path):
         logger = StructuredLogger(writer, browser_id="br-1")
 
-        for category in ("proxy", "browser", "captcha", "click", "cleanup", "scheduler"):
+        for category in ("proxy", "browser", "captcha", "click", "cleanup", "scheduler", "export"):
             logger.info(category, "ok")
         writer.flush()
 
@@ -181,6 +181,7 @@ class TestCategories:
             "captcha",
             "cleanup",
             "click",
+            "export",
             "proxy",
             "scheduler",
         ]
@@ -193,6 +194,7 @@ class TestCategories:
             "click",
             "cleanup",
             "scheduler",
+            "export",
         }
 
     def test_unknown_category_raises(self, writer):

@@ -22,7 +22,7 @@ export interface SettingFieldDef {
 }
 
 export interface SettingSection {
-  key: "paths" | "webdriver" | "behavior";
+  key: "paths" | "webdriver" | "behavior" | "export";
   title: string;
   fields: SettingFieldDef[];
 }
@@ -392,6 +392,78 @@ export const settingsSections: SettingSection[] = [
         max: 30,
         hint: "Периодичность очистки профилей, дней: 1 — каждый день, до 30",
         default: 1,
+      },
+    ],
+  },
+  // Экспорт данных во внешнюю PostgreSQL (план §13.1): тик демона читает
+  // секцию на каждом проходе, enabled=false — соединение не открывается.
+  // Состав, типы и дефолты — копия _SCHEMA движка, границы — из
+  // _numeric_limits, пароль — из _SECRET_FIELDS; держит в согласии тест
+  // settingsSchema.test.ts.
+  {
+    key: "export",
+    title: "Экспорт в PostgreSQL",
+    fields: [
+      {
+        key: "enabled",
+        type: "bool",
+        hint: "Экспорт данных во внешнюю PostgreSQL",
+        default: false,
+      },
+      {
+        key: "host",
+        type: "string",
+        hint: "Хост внешней БД",
+        default: "127.0.0.1",
+      },
+      {
+        key: "port",
+        type: "int",
+        min: 1,
+        max: 65535,
+        hint: "Порт внешней БД",
+        default: 5432,
+      },
+      {
+        key: "dbname",
+        type: "string",
+        hint: "Имя базы данных",
+        default: "adclicker_export",
+      },
+      {
+        key: "user",
+        type: "string",
+        hint: "Пользователь",
+        default: "adclicker",
+      },
+      {
+        key: "password",
+        type: "string",
+        hint: "Пароль",
+        default: "",
+        secret: true,
+      },
+      {
+        key: "sslmode",
+        type: "enum",
+        options: [
+          { title: "Без SSL", value: "disable" },
+          { title: "SSL допускается", value: "allow" },
+          { title: "Предпочесть SSL (по умолчанию)", value: "prefer" },
+          { title: "Требовать SSL", value: "require" },
+          { title: "SSL + проверка сертификата CA", value: "verify-ca" },
+          { title: "SSL + полная проверка сертификата", value: "verify-full" },
+        ],
+        hint: "Режим SSL",
+        default: "prefer",
+      },
+      {
+        key: "batch_size",
+        type: "int",
+        min: 50,
+        max: 5000,
+        hint: "Размер батча экспорта (строк за проход)",
+        default: 500,
       },
     ],
   },

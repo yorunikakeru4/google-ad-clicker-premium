@@ -1,14 +1,15 @@
 """Конфигурация control plane: загрузка, валидация, частичное обновление.
 
 Формат взят из config.json в корне репозитория — тем же набором секций
-``paths`` / ``webdriver`` / ``behavior``, чтобы демон и UI говорили о
-настройках на одном языке, а не заводили второй, параллельный.
+``paths`` / ``webdriver`` / ``behavior`` / ``export``, чтобы демон и UI
+говорили о настройках на одном языке, а не заводили второй, параллельный.
 
 Два решения, которые стоит знать:
 
-1. **Секреты маскируются только наружу.** ``behavior.2captcha_apikey`` и
-   ``webdriver.proxy`` (там может быть логин:пароль) не попадают в
-   ``to_dict()``/``to_json()`` — в HTTP-ответах уходит ``SECRET_MASK``.
+1. **Секреты маскируются только наружу.** ``behavior.2captcha_apikey``,
+   ``webdriver.proxy`` (там может быть логин:пароль) и ``export.password``
+   не попадают в ``to_dict()``/``to_json()`` — в HTTP-ответах уходит
+   ``SECRET_MASK``.
    Маска значима ровно для полей из ``_SECRET_FIELDS``: пришла она в
    ``patch()`` — поле «не менять», поэтому ``GET`` + ``POST`` того же
    конфига не затирает ключ. Файл при этом хранит настоящие значения
@@ -40,6 +41,7 @@ from engine.cleanup import (
     MAX_CLEANUP_INTERVAL_DAYS,
     MIN_CLEANUP_INTERVAL_DAYS,
 )
+from engine.exporter import DEFAULT_BATCH_SIZE
 from engine.log_rotation import (
     DEFAULT_DB_SIZE_LIMIT_MB,
     DEFAULT_LOG_FILE_LEVEL,
@@ -128,10 +130,29 @@ _SCHEMA: dict[str, dict[str, tuple[type | tuple[type, ...], Any]]] = {
         "cleanup_time": (str, DEFAULT_CLEANUP_TIME),
         "cleanup_interval_days": (int, DEFAULT_CLEANUP_INTERVAL_DAYS),
     },
+    # Постоянный экспорт в PostgreSQL (план §9, контракт §13.1). Частота
+    # job'а — не здесь, а в окружении (ADCLICKER_EXPORT_INTERVAL), как у
+    # остальных фоновых задач демона: секция отвечает за то, КУДА и ЧТО
+    # выгружать, а не за то, как часто это делать. enabled=False по
+    # умолчанию: чистая установка не ходит в сеть и не требует psycopg.
+    "export": {
+        "enabled": (bool, False),
+        "host": (str, "127.0.0.1"),
+        "port": (int, 5432),
+        "dbname": (str, "adclicker_export"),
+        "user": (str, "adclicker"),
+        # Пароль PG — секрет: наружу уходит маской, в файле реальный
+        # (см. модульный докстринг, «Секреты маскируются только наружу»).
+        "password": (str, ""),
+        "sslmode": (str, "prefer"),
+        # Дефолт батча — из engine.exporter, а не своё число: лимит в
+        # _numeric_limits и реальный размер запроса обязаны совпадать.
+        "batch_size": (int, DEFAULT_BATCH_SIZE),
+    },
 }
 
 # Секреты: наружу уходят замаскированными, в patch маска значит «не менять».
-_SECRET_FIELDS = frozenset({"behavior.2captcha_apikey", "webdriver.proxy"})
+_SECRET_FIELDS = frozenset({"behavior.2captcha_apikey", "webdriver.proxy", "export.password"})
 
 # Поля-перечисления: путь поля -> допустимые значения. Своих словарей значений
 # здесь нет намеренно: каждый живёт рядом со своим потребителем
@@ -147,6 +168,11 @@ _ENUM_FIELDS: dict[str, frozenset[str]] = {
     # Уровень файла лога — тот же порядок, по которому export_day отбирает
     # записи в дневной файл: enum и фильтр не могут разойтись.
     "behavior.log_file_level": frozenset(LEVEL_ORDER),
+    # Режим TLS соединения с PostgreSQL: словарь psycopg, не наш. Проверка —
+    # только после проверки типа, поэтому сюда доходит строка.
+    "export.sslmode": frozenset(
+        {"disable", "allow", "prefer", "require", "verify-ca", "verify-full"}
+    ),
 }
 
 # browser_count: legacy трактует 0 как "столько, сколько ядер". Демон держит
@@ -311,6 +337,11 @@ def _numeric_limits(field_path: str) -> tuple[float, float] | None:
             MIN_CLEANUP_INTERVAL_DAYS,
             MAX_CLEANUP_INTERVAL_DAYS,
         ),
+        # Экспорт в PG: порт — весь диапазон TCP (0 не бывает, это не
+        # «выбрать свободный», а адрес БД), батч — план §9.3 (50 — меньше
+        # бессмысленно дробить, 5000 — потолок одного прохода за тик).
+        "export.port": (1, 65535),
+        "export.batch_size": (50, 5000),
     }
     return limits.get(field_path)
 

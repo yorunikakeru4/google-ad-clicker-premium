@@ -1,0 +1,32 @@
+# Целевая БД постоянного экспорта (план.md §9.2, §13.5).
+#
+# Схема накатывается из init.sql в /docker-entrypoint-initdb.d/ — PostgreSQL
+# исполняет этот каталог только при ПЕРВОМ создании тома export-pgdata.
+# Изменения схемы в уже работающей БД: docker compose down -v (том удаляется)
+# или ручные ALTER (см. README, секция «Экспорт в PostgreSQL»).
+#
+# Креды дефолтные: 127.0.0.1:5432, adclicker/adclicker/adclicker_export.
+# Пароль переопределяется переменной окружения EXPORT_DB_PASSWORD.
+services:
+  export-db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_DB: adclicker_export
+      POSTGRES_USER: adclicker
+      POSTGRES_PASSWORD: ${EXPORT_DB_PASSWORD:-adclicker}
+    ports:
+      - "5432:5432"
+    volumes:
+      # Данные переживают docker compose down; удаляются только через -v
+      - export-pgdata:/var/lib/postgresql/data
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    healthcheck:
+      # healthy = сервер принимает соединения для нашей БД и пользователя
+      test: ["CMD-SHELL", "pg_isready -U adclicker -d adclicker_export"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+# Именованный том с данными PostgreSQL.
+volumes:
+  export-pgdata:

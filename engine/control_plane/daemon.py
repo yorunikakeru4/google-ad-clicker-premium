@@ -49,6 +49,7 @@ from engine.control_plane.supervisor import (
     Supervisor,
     SupervisorSettings,
 )
+from engine.exporter import ExportError, ExportSettings, Exporter
 from engine.log_rotation import (
     default_export_dir,
     enforce_db_size_limit,
@@ -342,6 +343,29 @@ def metrics_interval_from_environ(environ: dict[str, str] | None = None) -> floa
     )
 
 
+# Постоянный экспорт в PostgreSQL (план §9, контракт §13.3). Период —
+# окружение, как и у остальных фоновых задач демона: как часто ходить во
+# внешнюю БД, решает systemd/launchd, а сами настройки подключения (host,
+# port, password, batch_size) — секция ``export`` config.json и читаются на
+# каждом тике. Нить запущена — это ещё не выгрузка: сам тик сверяется с
+# ``export.enabled`` и без него не открывает ни psycopg, ни сокет.
+# 0 (и любое отрицательное) выключает job; нечисловое значение — ValueError
+# при сборке демона, а не молчаливый час вместо секунд
+# (контракт _seconds_from_environ).
+EXPORT_INTERVAL_ENV_VAR = "ADCLICKER_EXPORT_INTERVAL"
+DEFAULT_EXPORT_INTERVAL_SECONDS = 60.0
+
+# Имя нити расписания: тесты ищут его при остановке, как "supervisor"/"metrics".
+EXPORT_THREAD_NAME = "export"
+
+
+def export_interval_from_environ(environ: dict[str, str] | None = None) -> float:
+    """Интервал экспорта в PostgreSQL в секундах (см. ``_seconds_from_environ``)."""
+    return _seconds_from_environ(
+        EXPORT_INTERVAL_ENV_VAR, DEFAULT_EXPORT_INTERVAL_SECONDS, environ
+    )
+
+
 def seconds_until_midnight_reexport(now: float) -> float:
     """Секунд до ближайшей допроводки вчерашнего дня — цель 00:00:05.
 
@@ -445,6 +469,12 @@ class Daemon:
         # по сети, ни по временному каталогу, поэтому тестам нечего от него
         # прятать.
         metrics_interval: float = DEFAULT_METRICS_INTERVAL_SECONDS,
+        # Постоянный экспорт в PostgreSQL (план §9): дефолт — раз в минуту,
+        # 0 — выключено. Включённое расписание само по себе ничего не
+        # выгружает: тик сверяется с ``export.enabled`` в config.json и без
+        # него не открывает ни psycopg, ни сокет, поэтому тестам нечего от
+        # него прятать.
+        export_interval: float = DEFAULT_EXPORT_INTERVAL_SECONDS,
     ):
         self.db_path = Path(db_path)
         self.config_path = Path(config_path)
@@ -478,6 +508,8 @@ class Daemon:
         # Часовые метрики: период — своя настройка запуска, чтобы выключить
         # пересчёт можно было, не гася ни ротацию логов, ни очистку.
         self.metrics_interval = metrics_interval
+        # Экспорт в PG — своя настройка запуска по той же причине.
+        self.export_interval = export_interval
         # Пул и проверяющий — свои у демона, а не у HTTP-сервера: та же пара
         # обслуживает и /control/proxies, и расписание, иначе ручная проверка
         # и фоновая не знали бы друг о друге и шли бы параллельно.
@@ -531,6 +563,12 @@ class Daemon:
         self._db_size_thread: threading.Thread | None = None
         self._cleanup_thread: threading.Thread | None = None
         self._metrics_thread: threading.Thread | None = None
+        self._export_thread: threading.Thread | None = None
+        # Экспортёр создаётся лениво при первом включённом тике: так psycopg
+        # и сокет не появляются ни при сборке демона, ни при выключенном
+        # экспорт-секшене. Настройки хранятся внутри экземпляра — тик сверяет
+        # их со свежим конфигом и пересоздаёт соединение при изменении.
+        self._exporter: Exporter | None = None
         # Отметки job'а метрик: импульс считает elapsed от прошлого тика,
         # исторический пересчёт — свой барьер от прошлого окна. 0.0 — «ещё не
         # тикало»: инициализирует догон при старте (и прямой вызов в тестах),
@@ -571,6 +609,7 @@ class Daemon:
         self._db_size_thread = self._start_db_size_loop()
         self._cleanup_thread = self._start_cleanup_loop()
         self._metrics_thread = self._start_metrics_loop()
+        self._export_thread = self._start_export_loop()
         self._started = True
         # Токен в лог не пишется никогда: логи демона читаются из UI и
         # попадают в отчёты о поддержке.
@@ -651,6 +690,17 @@ class Daemon:
             if metrics_thread is not None:
                 metrics_thread.join(timeout=SHUTDOWN_GRACE_SECONDS)
             self._metrics_thread = None
+
+            # Экспорт спит до своего интервала — та же схема, что у метрик.
+            # Соединение с PG закрывается только после join: нить могла бы
+            # достроить тик уже по закрытому сокету.
+            export_thread = self._export_thread
+            if export_thread is not None:
+                export_thread.join(timeout=SHUTDOWN_GRACE_SECONDS)
+            self._export_thread = None
+            if self._exporter is not None:
+                self._exporter.close()
+                self._exporter = None
 
             thread = self._supervisor_thread
             if thread is not None:
@@ -1365,6 +1415,79 @@ class Daemon:
             refresh_range(self.db_path, history_at, now=stamp)
             self._metrics_history_at = stamp
 
+    # --- постоянный экспорт в PostgreSQL (план §9) -------------------------
+
+    def _start_export_loop(self) -> threading.Thread | None:
+        """Поднимает нить экспорта; None — job выключен (интервал <= 0)."""
+        if self.export_interval <= 0:
+            return None
+        thread = threading.Thread(
+            target=self._run_export_loop,
+            kwargs={"stop_event": self._stop_event},
+            name=EXPORT_THREAD_NAME,
+            daemon=True,
+        )
+        thread.start()
+        return thread
+
+    def _run_export_loop(self, stop_event: threading.Event) -> None:
+        """Сразу один проход, затем тик раз в интервал, пока жив демон.
+
+        Первый проход без ожидания — догон за простой демона: строки,
+        накопленные пока процесс не работал, обязаны уехать в PostgreSQL
+        сразу после старта, а не через интервал. Тики идут через
+        ``_run_tick``, поэтому ни сбой сети, ни сбой psycopg не убивают ни
+        нить, ни демон — тот же паттерн, что у метрик и проверки прокси.
+        Остановка по общему ``stop_event``: shutdown не ждёт интервала.
+        """
+        self._run_tick(self._export_tick, "export tick failed", category="export")
+        while True:
+            if stop_event.wait(self.export_interval):
+                return
+            self._run_tick(self._export_tick, "export tick failed", category="export")
+
+    def _export_tick(self, now: float | None = None) -> None:
+        """Один тик: свежие настройки из конфига, затем проход по таблицам.
+
+        Секция ``export`` читается на каждом тике (``_current_config``), как
+        и у остальных job'ов: хост/пароль/размер батча меняются из UI без
+        рестарта. ``enabled=false`` — полный no-op: соединение не открывается
+        и, если оно было открыто раньше, не закрывается здесь (это забота
+        shutdown, тик не тратит время на сеть).
+
+        Изменение настроек при открытом соединении — пересоздание
+        экземпляра: старый закрывается, новый строится с новым DSN. Иначе
+        смена пароля в UI осталась бы незамеченной до рестарта демона.
+        Если конструктор нового экземпляра упал (PG недоступен), ссылка
+        сбрасывается в ``None``: следующий тик построит её заново, а не
+        продолжит пользоваться закрытым соединением прошлых настроек.
+
+        Ошибки ``ExportError`` не перехватываются — их логирует ``_run_tick``
+        (``category="export"``), а курсор в ``export_state`` при этом не
+        двигается: следующий тик повторит батч. Перед тем как поднять
+        ошибку, экземпляр выбрасывается: соединение могло умереть (рестарт
+        PostgreSQL, обрыв TCP), и без нового экземпляра экспорт молчал бы
+        в ошибке до рестарта демона.
+        """
+        config = self._current_config()
+        settings = ExportSettings(**config.as_dict()["export"])
+        if not settings.enabled:
+            return
+        exporter = self._exporter
+        if exporter is None or exporter.settings != settings:
+            if exporter is not None:
+                exporter.close()
+                self._exporter = None
+            exporter = Exporter(self.db_path, settings)
+            self._exporter = exporter
+        try:
+            summary = exporter.export_pass(now=now)
+        except ExportError:
+            self._exporter = None
+            exporter.close()
+            raise
+        self.store.log("INFO", "export", "export tick", {"rows": summary})
+
 
 def supervisor_settings_from_config(config: Config) -> SupervisorSettings:
     """Собирает настройки супервизора из конфига.
@@ -1396,6 +1519,7 @@ def build_daemon(
     db_size_interval: float | None = None,
     cleanup_interval: float | None = None,
     metrics_interval: float | None = None,
+    export_interval: float | None = None,
 ) -> Daemon:
     """Собирает демона для запуска как самостоятельного процесса.
 
@@ -1407,10 +1531,11 @@ def build_daemon(
     соответствующий интервал из окружения; явное значение важнее окружения
     (так тесты и встраиваемый запуск задают своё, не меняя environ). Нечисловое
     значение окружения — ``ValueError``: молчаливый дефолт при опечатке включил
-    бы таймер, который никто не заказывал. То же для пяти интервалов: трёх
+    бы таймер, который никто не заказывал. То же для шести интервалов: трёх
     job'ов ротации логов (``day_close_interval``, ``retention_interval``,
-    ``db_size_interval``), очистки профилей (``cleanup_interval``) и часовых
-    метрик (``metrics_interval``); у закрытия дня и у очистки ``None`` из
+    ``db_size_interval``), очистки профилей (``cleanup_interval``), часовых
+    метрик (``metrics_interval``) и экспорта в PostgreSQL
+    (``export_interval``); у закрытия дня и у очистки ``None`` из
     окружения означает расписание (23:59 и ``behavior.cleanup_time``
     соответственно), а не выключенный job.
 
@@ -1446,6 +1571,9 @@ def build_daemon(
     resolved_metrics = (
         metrics_interval_from_environ() if metrics_interval is None else metrics_interval
     )
+    resolved_export = (
+        export_interval_from_environ() if export_interval is None else export_interval
+    )
     migrations.migrate(db_path)
     config = Config.load(config_path)
     # Уровень файлового лога — поле config.json, и читается конфиг именно
@@ -1471,6 +1599,7 @@ def build_daemon(
         db_size_interval=resolved_db_size,
         cleanup_interval=resolved_cleanup,
         metrics_interval=resolved_metrics,
+        export_interval=resolved_export,
     )
 
 

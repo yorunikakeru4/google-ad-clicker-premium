@@ -64,6 +64,8 @@ Selenium (~2КБ) не превращает запись в нечитаемую
                              воркеров, этапы жизненного цикла сценария,
                              lifecycle Telegram-бота и точки входа без
                              собственного предмета
+``export``                   выгрузка данных во внешнюю PostgreSQL (план §9):
+                             сводки тиков и сбои подключения/SQL
 ===========================  ==================================================
 
 Хук выбирает категорию по своему предмету, а не по файлу: ``captcha_seen``
@@ -92,7 +94,7 @@ from engine.db import migrations
 from engine.log_rotation import LEVEL_ORDER
 from engine.store import StoreWriter
 
-CATEGORIES = frozenset({"proxy", "browser", "captcha", "click", "cleanup", "scheduler"})
+CATEGORIES = frozenset({"proxy", "browser", "captcha", "click", "cleanup", "scheduler", "export"})
 # Уровни структурированного лога — тот же порядок, что и у хранения логов:
 # enum behavior.log_file_level и фильтр дневного экспорта берут его оттуда же.
 LEVELS = frozenset(LEVEL_ORDER)

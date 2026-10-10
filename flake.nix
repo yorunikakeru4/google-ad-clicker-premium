@@ -35,6 +35,9 @@
           pydantic
           cryptography
 
+          # внешний экспорт (engine/exporter.py)
+          psycopg
+
           # сборка sidecar-бинарника (план.md, фаза 11): spec лежит в корне,
           # pyinstaller приходит из той же python.withPackages, что и движок,
           # иначе он собрал бы бинарник под чужой интерпретатор
