@@ -42,6 +42,7 @@ const ENGINE_SCHEMA: Record<string, Record<string, EngineField>> = {
     window_size: { type: "str", default: "" },
     shift_windows: { type: "bool", default: false },
     use_seleniumbase: { type: "bool", default: false },
+    use_selenium_stealth: { type: "bool", default: false },
     proxy_transport: { type: "str", default: "cdp_auth" },
   },
   behavior: {
@@ -168,11 +169,11 @@ describe("settingsSchema: секции и поля против _SCHEMA", () => 
   // потерю поля и дубль пути разом. Меняется только вместе с _SCHEMA
   // (36 полей до политики CAPTCHA + 3 под неё + 3 про хранение логов = 42
   // + 2 про очистку профилей = 44 + 1 про наш домен = 45
-  // + 8 полей экспорта в PostgreSQL = 53).
-  it("в форме ровно 53 поля, без повторов пути", () => {
+  // + 8 полей экспорта в PostgreSQL = 53 + 1 use_selenium_stealth = 54).
+  it("в форме ровно 54 поля, без повторов пути", () => {
     const paths = allFields().map((row) => row.path);
     expect(new Set(paths).size, "пути полей повторяются").toBe(paths.length);
-    expect(paths).toHaveLength(53);
+    expect(paths).toHaveLength(54);
   });
 
   it("типы формы соответствуют типам движка", () => {

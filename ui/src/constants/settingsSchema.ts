@@ -123,6 +123,12 @@ export const settingsSections: SettingSection[] = [
         default: false,
       },
       {
+        key: "use_selenium_stealth",
+        type: "bool",
+        hint: "Применять патчи selenium-stealth при создании браузера (скрытие navigator.webdriver и следов автоматизации). Требует пакет selenium-stealth в окружении",
+        default: false,
+      },
+      {
         key: "proxy_transport",
         type: "enum",
         options: [

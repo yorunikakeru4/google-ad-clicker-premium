@@ -30,6 +30,9 @@ dev = [
 # Нет в nixpkgs, ставится в venv поверх dev-shell. Нужен только для
 # webdriver.use_seleniumbase и интеграционных тестов на стенде.
 seleniumbase = ["seleniumbase>=4.46"]
+# Нет в nixpkgs, ставится в venv поверх dev-shell. Нужен только для
+# webdriver.use_selenium_stealth (патчи при создании драйвера, план §17).
+stealth = ["selenium-stealth>=1.0"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

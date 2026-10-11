@@ -37,6 +37,10 @@ class WebdriverParams:
     window_size: Optional[str] = ""
     shift_windows: Optional[bool] = False
     use_seleniumbase: Optional[bool] = False
+    # Патчи selenium-stealth при создании драйвера (план §17). Дефолт false:
+    # пакет необязателен (нет в nix-среде), поэтому старые конфиги читаются
+    # через .get, как у proxy_transport.
+    use_selenium_stealth: Optional[bool] = False
     # Транспорт прокси (cdp_auth | extension | direct). Дефолт берётся из
     # лёгкого engine.proxy_transport, а не дублируется строкой: словарь
     # значений и "что считается нормой" живут там же, где их проверяет
@@ -165,6 +169,11 @@ class ConfigReader:
             window_size=config["webdriver"]["window_size"],
             shift_windows=config["webdriver"]["shift_windows"],
             use_seleniumbase=config["webdriver"]["use_seleniumbase"],
+            # .get, а не []: config.json прошлой версии без ключа обязан
+            # читаться, дефолт — False (план §17).
+            use_selenium_stealth=config["webdriver"].get(
+                "use_selenium_stealth", False
+            ),
             # .get, а не []: config.json прошлой версии без ключа обязан
             # читаться, дефолт приходит из engine.proxy_transport.
             proxy_transport=config["webdriver"].get(

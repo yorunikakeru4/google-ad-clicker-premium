@@ -74,6 +74,10 @@ _SCHEMA: dict[str, dict[str, tuple[type | tuple[type, ...], Any]]] = {
         "window_size": (str, ""),
         "shift_windows": (bool, False),
         "use_seleniumbase": (bool, False),
+        # Патчи selenium-stealth при создании драйвера (план §17). Пакет
+        # необязателен и вне nixpkgs — включать флаг без него нельзя, но сам
+        # ключ чисто булев, как use_seleniumbase.
+        "use_selenium_stealth": (bool, False),
         # Как креды доходят до Chrome: cdp_auth (дефолт) | extension | direct.
         # Дефолт и словарь значений — из engine.proxy_transport, а не отсюда.
         "proxy_transport": (str, DEFAULT_PROXY_TRANSPORT),

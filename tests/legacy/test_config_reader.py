@@ -72,6 +72,24 @@ def test_proxy_transport_default_is_the_constant_from_proxy_auth(make_config, ba
     assert make_config(base_config).webdriver.proxy_transport == DEFAULT_PROXY_TRANSPORT
 
 
+def test_read_parameters_maps_use_selenium_stealth(make_config, base_config):
+    """Флаг selenium-stealth читается из секции webdriver (план §17)."""
+
+    base_config["webdriver"]["use_selenium_stealth"] = True
+
+    assert make_config(base_config).webdriver.use_selenium_stealth is True
+
+
+def test_use_selenium_stealth_defaults_to_false_when_the_key_is_absent(
+    make_config, base_config
+):
+    """Старый config.json без ключа обязан читаться, дефолт — False."""
+
+    del base_config["webdriver"]["use_selenium_stealth"]
+
+    assert make_config(base_config).webdriver.use_selenium_stealth is False
+
+
 def test_captcha_threshold_defaults_when_the_keys_are_absent(make_config, base_config):
     """Старый config.json без ключей порога обязан читаться, дефолты на месте."""
 

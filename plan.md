@@ -7,6 +7,10 @@
 
 ## 0. Статус
 
+- [x] **Задача SeleniumBase + selenium-stealth (§17–§20, 2026-10-11) ВЫПОЛНЕНА** —
+      флаг `use_selenium_stealth`, `execute_selenium_stealth` в обеих ветках,
+      selenium-stealth 1.0.6 в requirements; e2e 4/4 (UC/SB × off/on), всё
+      закоммичено и смержено в develop.
 - [x] Фикс гонки `thread.start()` в `engine/control_plane/daemon.py::_on_signal`
       (порядок «ссылка → start → флаг»); закоммичено в `609856f`; тесты
       `TestOwnerWatch` + `TestDaemonLifecycle` прошли 15×15 повторов.
@@ -335,6 +339,30 @@ git branch -D agent/backend agent/tsapi agent/ui
     (`logFilters.ts`) категорию `export` не предлагает — как и `metrics`,
     вне объёма.
   - Изменения НЕ закоммичены (коммит — по явной команде пользователя).
+- `2026-10-11` — добавлена задача SeleniumBase + selenium-stealth (§17–§20):
+  решения зафиксированы (флаг `use_selenium_stealth`, поштучные patch-функции
+  selenium-stealth вместо верхнеуровневого `stealth()` из-за isinstance на
+  SeleniumBase-драйвер, без `user_agent_override`/`navigator_languages`,
+  pip-путь зависимостей, локальные прогоны без прокси, merge в develop).
+- `2026-10-11` (вечер) — **задача SeleniumBase + selenium-stealth ВЫПОЛНЕНА**:
+  - `webdriver.execute_selenium_stealth()` (12 патчей, ленивый импорт,
+    RuntimeError без пакета), вызов из обеих веток создания драйвера;
+    флаг `webdriver.use_selenium_stealth` во всех точках синхронизации
+    (config_reader/`_SCHEMA`/config.json/settingsSchema+тест 54 полей/README/
+    sandbox-конфиг); `selenium-stealth==1.0.6` в requirements.txt, extra
+    `stealth` в pyproject, комментарий во flake.nix;
+  - интеграция: `ruff check` OK; `pytest tests/legacy + control_plane/test_config.py`
+    → **797 passed, 5 xfailed** (легаси-баги не тронуты); полный
+    `tests/engine/control_plane` → **986 passed**; vitest
+    `settingsSchema.test.ts` → **10 passed**; `vue-tsc --noEmit` → exit 0;
+  - e2e `/tmp/opencode/e2e_sb_stealth.py` (`.venv` из requirements.txt,
+    nix-школа: venv создан из nix-python + симлинк `_tkinter` в site-packages,
+    LD_LIBRARY_PATH из dev-shell) → **4/4 OK**: UC/SB × stealth off/on,
+    `navigator.webdriver` None при включённом флаге, quit 0; SB-режим
+    поднялся живьём впервые;
+  - поймано живым прогоном и починено: `navigator_vendor()` требует строку
+    вендора — передаётся `"Google Inc."` (добавлен ассерт в тест);
+  - прокси не использовался, все прогоны локальные; коммит + merge в develop.
 
 ---
 
@@ -598,4 +626,113 @@ volumes:
 - [ ] повторный тик — counts не растут
 - [ ] enabled=false — соединение не открывается (psql log пуст)
 - [ ] SIGTERM — чистая остановка, exporter.close() без ошибок
+
+---
+
+## 17. Задача: SeleniumBase (зависимость + рабочий режим) + selenium-stealth (решения приняты)
+
+Заказчик: «добавление selenium base, имплементацию и selenium stealth;
+все решения принимай сам, прокси не используй, прогоны только локальные,
+после замержи в develop».
+
+### 17.1 Что выяснено (не переспрашивать)
+
+- Режим `webdriver.use_seleniumbase` в коде **уже реализован**:
+  `webdriver.create_seleniumbase_driver` (webdriver.py:756-921, PAC + CDP-auth +
+  гео + timezone), переключатель `create_webdriver:502`, `_load` через
+  `uc_open_with_reconnect` (search_controller.py:1409). Но **ни разу не
+  проверен живым браузером**: только заглушечные тесты; `.venv-sb` (seleniumbase
+  4.41.1) существует «для пробы», прод-пин `requirements.txt` — 4.46.0.
+- seleniumbase и selenium-stealth **нет в nixpkgs** (`nix eval` обе попытки —
+  attribute missing). Seleniumbase уже вынесен из flake осознанно (flake.nix:23-24);
+  оба идут только pip-путём (requirements.txt + extra в pyproject).
+- selenium-stealth в репозитории **отсутствует полностью**: stealth сейчас —
+  самописный `execute_stealth_js_code` (webdriver.py:1010-1580, применяется в
+  `click_links`, т.е. ПОСЛЕ загрузки поисковой страницы).
+- PyPI `selenium-stealth` 1.0.6 (Dipraj Patra), depends только от selenium.
+  Его верхнеуровневый `stealth()` делает `isinstance(driver,
+  selenium.webdriver.Chrome)`: UC Chrome — подкласс, проходит; SeleniumBase
+  `DriverMethods` — подкласс remote WebDriver, **НЕ Chrome** → ValueError.
+  Отдельные же patch-функции (`navigator_webdriver` и др.) используют только
+  `driver.execute_cdp_cmd` и к типу драйвера не проверяются.
+- Локальная машина: Chromium 154 (`/run/current-system/sw/bin/chromium*`),
+  DISPLAY есть, UC-режим локально работал (§0 «Хронология»). Прокси в этой
+  задаче не используется вовсе.
+
+### 17.2 Решения
+
+1. **Флаг `webdriver.use_selenium_stealth`** (bool, default `false`) — opt-in,
+   работает в ОБОИХ режимах (UC и SeleniumBase). Дефолт false: поведение
+   существующих установок не меняется молча; включается в UI/конфиге.
+2. **`webdriver.execute_selenium_stealth(driver)`** — ленивый импорт
+   (паттерн `create_seleniumbase_driver`: UC-режим с выключенным флагом пакет
+   не требует; включённый флаг без пакета → RuntimeError с читаемым текстом).
+   Применяемый набор (поштучно, **без** верхнеуровневого `stealth()` — см.
+   isinstance-проблему §17.1): `with_utils`, `chrome_app`, `chrome_runtime`,
+   `iframe_content_window`, `media_codecs`, `navigator_permissions`,
+   `navigator_plugins`, `navigator_vendor`, `navigator_webdriver`,
+   `webgl_vendor_override("Intel Inc.", "Intel Iris OpenGL Engine")`,
+   `window_outerdimensions`, `hairline_fix`.
+   **НЕ** применяем: `user_agent_override` (честная UA-политика: без
+   CDP-override; headless не запускаем) и `navigator_languages` (не рвать
+   связку Accept-Language ← локаль прокси/профиля, её же читает
+   `diagnostics.check_language_vs_country`).
+   Место: сразу после создания драйвера в обеих ветках, до
+   `_log_actual_user_agent` — тогда первый заход на страницу (и снимок
+   диагностики) уже под маскировкой; самописный stealth в `click_links`
+   остаётся как есть (побеждает в конфликтах — применяется позже).
+3. **Зависимости**: `requirements.txt` += `selenium-stealth==1.0.6`; pyproject
+   extra `stealth = ["selenium-stealth>=1.0"]`; flake.nix — только комментарий
+   (оба пакета вне nixpkgs). Локальные живые прогоны — `.venv` через
+   `scripts/bootstrap-venv.sh` (ставит requirements.txt целиком: seleniumbase
+   4.46.0 + selenium-stealth + остальное).
+4. **SB-ветка**: обязательный локальный живой прогон (без прокси). Вскрытые
+   баги SB-создания драйвера фиксятся в этой же задаче.
+5. **Схемы/документация**: ключ во всех точках синхронизации — config_reader
+   (`.get`-дефолт, как у proxy_transport), `_SCHEMA`, config.json,
+   settingsSchema.ts + тест-фикстура (53→54 полей), README, sandbox-конфиг
+   tests/legacy/conftest.py.
+6. **Коммит/merge**: ветка `feat/sb-stealth` → merge в develop (по команде
+   заказчика). Прокси не используется, прогоны только локальные.
+
+**Не входит**: правка самописного stealth; sidecar/PyInstaller-бандл
+(seleniumbase/stealth в бандл не тащим — как и раньше); daemon, кроме
+синхронизации схемы; прокси-ветки.
+
+## 18. Файлы
+
+| Файл | Что |
+|---|---|
+| `webdriver.py` | `execute_selenium_stealth()` + 2 вызова (UC/SB ветки) |
+| `config_reader.py` | `WebdriverParams.use_selenium_stealth` + `.get`-чтение |
+| `engine/control_plane/config.py` | `_SCHEMA.webdriver.use_selenium_stealth` |
+| `config.json` | ключ `false` |
+| `requirements.txt`, `pyproject.toml`, `flake.nix` | зависимость/extra/комментарий |
+| `ui/src/constants/settingsSchema.ts` (+`.test.ts`) | поле формы, счётчик 54 |
+| `README.md` | sample config + bullet |
+| `tests/legacy/conftest.py` | sandbox-конфиг |
+| `tests/legacy/test_selenium_stealth.py` (новый) | ленивый импорт, читаемая ошибка, набор патчей |
+| `tests/legacy/test_webdriver.py` | вызов execute_selenium_stealth из обеих веток при флаге |
+| `tests/legacy/test_config_reader.py` | дефолт false, маппинг true |
+
+## 19. Интеграция + локальный e2e (вне агентов, прокси нет)
+
+1. `nix develop -c ruff check engine tests`
+2. `nix develop -c python -m pytest tests/legacy/test_selenium_stealth.py tests/legacy/test_webdriver.py tests/legacy/test_config_reader.py tests/legacy/test_lazy_seleniumbase.py tests/engine/control_plane/test_config.py -q`
+3. `cd ui && npx vitest run src/constants/settingsSchema.test.ts` + `npx vue-tsc --noEmit`
+4. **E2E** `/tmp/opencode/e2e_sb_stealth.py` на `.venv` (bootstrap-venv):
+   tempdir-конфиг (пути абсолютные, proxy пуст), 4 сценария —
+   UC/SB × `use_selenium_stealth` off/on; проверки на `about:blank`:
+   `navigator.webdriver` — None, `window.chrome` — truthy,
+   `navigator.plugins.length` > 0; quit c кодом 0. Никаких переходов на
+   внешние сайты и никакого прокси.
+
+## 20. E2E-чек-лист (для §19)
+
+- [x] UC + stealth off: драйвер стартует, quit 0
+- [x] UC + stealth on: патчи применены, navigator.webdriver скрыт
+- [x] SB + stealth off: драйвер стартует (первый живой прогон режима)
+- [x] SB + stealth on: патчи применены, navigator.webdriver скрыт
+- [x] флаг off: `import webdriver` работает без пакета selenium_stealth
+- [x] флаг on без пакета: RuntimeError с читаемым текстом
 

@@ -481,6 +481,68 @@ def _log_actual_user_agent(driver) -> None:
     log.debug("browser", "user_agent", fields={"user_agent": actual})
 
 
+def execute_selenium_stealth(driver: Union[undetected_chromedriver.Chrome, seleniumbase.Driver]):
+    """Применить патчи пакета selenium-stealth к драйверу (план §17).
+
+    Пакет — необязательная зависимость флага ``webdriver.use_selenium_stealth``
+    (нет ни в nix-среде, ни в sidecar-бандле), поэтому импорт ленивый и
+    по образцу ``create_seleniumbase_driver``: UC-режим с выключенным флагом
+    пакет не требует, а включённый флаг без пакета падает читаемой ошибкой,
+    а не ``ModuleNotFoundError`` из глубины модуля.
+
+    Верхнеуровневый ``selenium_stealth.stealth()`` здесь сознательно НЕ зовётся:
+    он проверяет ``isinstance(driver, selenium.webdriver.Chrome)``, а драйвер
+    SeleniumBase (``DriverMethods``) подклассом Chrome не является. Отдельные
+    patch-функции используют только ``execute_cdp_cmd`` и совместимы с обоими
+    драйверами.
+
+    Два патча пакета сознательно пропущены (план §17.2):
+
+    * ``user_agent_override`` — честная UA-политика: безусловный CDP-override
+      противоречит снимку диагностики (см. докстринг ``create_webdriver``);
+    * ``navigator_languages`` — Accept-Language задаётся локалью прокси/профиля
+      (``_apply_locale``), подмена ``navigator.languages`` рвала бы связку,
+      которую сверяет ``diagnostics.check_language_vs_country``.
+    """
+
+    try:
+        from selenium_stealth import (
+            chrome_app,
+            chrome_runtime,
+            hairline_fix,
+            iframe_content_window,
+            media_codecs,
+            navigator_permissions,
+            navigator_plugins,
+            navigator_vendor,
+            navigator_webdriver,
+            webgl_vendor_override,
+            with_utils,
+            window_outerdimensions,
+        )
+    except ImportError as exc:
+        raise RuntimeError(
+            "режим use_selenium_stealth требует пакет selenium-stealth: "
+            "установите его (pip install selenium-stealth) или отключите "
+            "webdriver.use_selenium_stealth"
+        ) from exc
+
+    with_utils(driver)
+    chrome_app(driver)
+    chrome_runtime(driver)
+    iframe_content_window(driver)
+    media_codecs(driver)
+    navigator_permissions(driver)
+    navigator_plugins(driver)
+    # vendor — обязательный аргумент пакета (по умолчанию "Google Inc."
+    # у верхнеуровневого stealth(), которого мы не зовём).
+    navigator_vendor(driver, "Google Inc.")
+    navigator_webdriver(driver)
+    webgl_vendor_override(driver, "Intel Inc.", "Intel Iris OpenGL Engine")
+    window_outerdimensions(driver)
+    hairline_fix(driver)
+
+
 def create_webdriver(
     proxy: str, user_agent: Optional[str] = None, plugin_folder_name: Optional[str] = None
 ) -> tuple[undetected_chromedriver.Chrome, Optional[str]]:
@@ -733,6 +795,12 @@ def create_webdriver(
 
     # Обе ветки (с прокси и без): в лог должна идти строка, которую реально
     # видит страница, — честная, если override не применялся, или профильная.
+    if config.webdriver.use_selenium_stealth:
+        # До первого перехода и до снимка диагностики: страница уже должна
+        # видеть маскировку, а не голый navigator.webdriver (план §17).
+        log.debug("browser", "Applying selenium-stealth...")
+        execute_selenium_stealth(driver)
+
     _log_actual_user_agent(driver)
 
     if config.webdriver.window_size:
@@ -849,6 +917,14 @@ def create_seleniumbase_driver(
         locale_code=str(lang) if lang is not None else None,
         user_data_dir=str(profile_dir),
     )
+
+    if config.webdriver.use_selenium_stealth:
+        # Как и в UC-ветке: до первого перехода и до снимка диагностики
+        # (план §17). Верхнеуровневый stealth() пакета тут не годится —
+        # isinstance на Chrome, см. докстринг execute_selenium_stealth.
+        log.debug("browser", "Applying selenium-stealth...")
+        execute_selenium_stealth(driver)
+
     _log_actual_user_agent(driver)
 
     if proxy:

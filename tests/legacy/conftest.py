@@ -88,6 +88,7 @@ def _sandbox_config() -> dict:
             "window_size": "",
             "shift_windows": False,
             "use_seleniumbase": False,
+            "use_selenium_stealth": False,
         },
         "behavior": {
             "query": "",

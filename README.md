@@ -142,7 +142,8 @@ The followings are the default values in the config file.
         "ss_on_exception": false,
         "window_size": "",
         "shift_windows": false,
-        "use_seleniumbase": false
+        "use_seleniumbase": false,
+        "use_selenium_stealth": false
     },
     "behavior": {
         "query": "",
@@ -203,6 +204,8 @@ The followings are the default values in the config file.
     * If a custom `window_size` is given, it is used to determine a new widthxheight for the window. Otherwise, screen resolution is used.
 
 * **use_seleniumbase**: Use SeleniumBase with UC mode instead of undetected_chromedriver.
+
+* **use_selenium_stealth**: Apply the `selenium-stealth` patch set (navigator.webdriver, chrome.runtime, plugins, WebGL vendor, …) right after the browser starts, in both driver modes. Requires the optional `selenium-stealth` package (`pip install selenium-stealth`; it is not part of the nix dev-shell).
 
 * **query**: Search query. The `query_file` and `query` parameters can not have a value at the same time.
     * A query like "wireless speaker@amazon#ebay  # mediamarkt" searches for "wireless speaker" and click links that include the given filter words in url or title.

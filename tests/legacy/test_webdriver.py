@@ -1333,6 +1333,87 @@ class TestProfileSettingsSeleniumBase:
         assert driver._custom_timezone == "Europe/Berlin"
 
 
+class TestSeleniumStealthFlag:
+    """Флаг use_selenium_stealth: вызов execute_selenium_stealth из обеих веток.
+
+    Сам набор патчей и ленивый импорт проверяются в test_selenium_stealth.py;
+    здесь только точки вызова: флаг включён — драйвер получает патчи до первого
+    перехода, флаг выключен (дефолт песочницы) — пакет вообще не трогается.
+    """
+
+    @pytest.fixture
+    def stealth_calls(self, monkeypatch):
+        """Точка применения патчей: записывает вызовы вместо пакета."""
+
+        calls: list = []
+        monkeypatch.setattr(webdriver, "execute_selenium_stealth", calls.append)
+        return calls
+
+    def test_uc_mode_applies_stealth_when_flag_is_on(
+        self,
+        isolated_tempdir,
+        fake_chrome,
+        record_log,
+        transport,
+        stealth_calls,
+        config,
+        monkeypatch,
+    ):
+        transport("cdp_auth")
+        monkeypatch.setattr(config.webdriver, "use_selenium_stealth", True)
+
+        driver, _ = webdriver.create_webdriver("", "Mozilla/5.0", "abcde")
+
+        assert stealth_calls == [driver]
+
+    def test_uc_mode_skips_stealth_when_flag_is_off(
+        self,
+        isolated_tempdir,
+        fake_chrome,
+        record_log,
+        transport,
+        stealth_calls,
+    ):
+        transport("cdp_auth")
+
+        driver, _ = webdriver.create_webdriver("", "Mozilla/5.0", "abcde")
+
+        assert stealth_calls == []
+
+    def test_seleniumbase_mode_applies_stealth_when_flag_is_on(
+        self,
+        isolated_tempdir,
+        seleniumbase_mode,
+        seleniumbase_stub,
+        record_log,
+        transport,
+        stealth_calls,
+        config,
+        monkeypatch,
+    ):
+        transport("cdp_auth")
+        monkeypatch.setattr(config.webdriver, "use_selenium_stealth", True)
+
+        driver, _ = webdriver.create_webdriver("", "Mozilla/5.0", "abcde")
+
+        assert stealth_calls == [driver]
+
+    def test_seleniumbase_mode_skips_stealth_when_flag_is_off(
+        self,
+        isolated_tempdir,
+        seleniumbase_mode,
+        seleniumbase_stub,
+        record_log,
+        transport,
+        stealth_calls,
+    ):
+        transport("cdp_auth")
+
+        driver, _ = webdriver.create_webdriver("", "Mozilla/5.0", "abcde")
+
+        assert stealth_calls == []
+
+
 class _MaximizeProbe:
     """Драйвер-заглушка: фиксирует вызовы maximize/set_window_size."""
 

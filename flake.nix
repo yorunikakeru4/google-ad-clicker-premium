@@ -20,10 +20,13 @@
 
         # Everything the engine and the test suite need, provided by nix.
         #
-        # One legacy dep is absent from nixpkgs and is NOT provided here:
+        # Two legacy deps are absent from nixpkgs and are NOT provided here:
         #   - seleniumbase -> only needed for webdriver.use_seleniumbase mode
-        # The Tk GUI dependency was dropped with the Tk GUI itself: the Tauri
-        # UI replaces it, and neither the code nor the tests import it.
+        #   - selenium-stealth -> only needed for webdriver.use_selenium_stealth
+        # Local runs that need them use the pip venv (scripts/bootstrap-venv.sh,
+        # requirements.txt). The Tk GUI dependency was dropped with the Tk GUI
+        # itself: the Tauri UI replaces it, and neither the code nor the tests
+        # import it.
         pythonDeps = ps: with ps; [
           # engine runtime
           selenium
